@@ -433,21 +433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc-launcher-spike"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "portable-pty",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tiny_http",
-]
-
-[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2086,6 +2071,21 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "muster"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tiny_http",
 ]
 
 [[package]]

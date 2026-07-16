@@ -62,7 +62,7 @@ so it's validated in the running app, not in `-p`.
 ## Run it
 
 ```sh
-cd cc-launcher-spike
+cd muster
 npm install          # first time
 npm run tauri dev
 ```
