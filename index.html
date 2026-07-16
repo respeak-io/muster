@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Muster</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="app" id="app">
+      <header class="top">
+        <div class="brand"><div class="logo"></div><b>Muster</b></div>
+        <div class="kbar" id="kbar"><span>⌕</span><span>Jump to a session, launch a project…</span><span class="kbd"><kbd>⌘</kbd><kbd>K</kbd></span></div>
+        <div class="top-right">
+          <button class="attn-badge" id="attnBadge"><span class="bdot"></span><span id="attnBadgeTxt"></span></button>
+          <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+        </div>
+      </header>
+
+      <aside class="rail">
+        <div class="rail-scroll">
+          <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><span class="count" id="liveCount"></span><button class="rail-add" data-add="1" title="Add a project folder">+</button><button class="rail-collapse" id="railCollapse" title="Collapse sidebar (⌘B)">«</button></div></div>
+          <div id="projects"></div>
+        </div>
+        <div class="railmini" id="railmini"></div>
+      </aside>
+
+      <main class="stage">
+        <div class="stage-head">
+          <div class="st-title">
+            <span class="proj" id="hProj">no session</span><span class="chip" id="hBranch" hidden></span>
+            <span class="stitle" id="hTitle"></span>
+            <span class="path" id="hPath"></span>
+          </div>
+          <div class="st-actions">
+            <button class="act" id="btnWorktree" title="Create git worktree + session">⑃ Worktree</button>
+            <button class="act primary" id="btnNew">＋ Session</button>
+            <button class="act icon" id="btnClose" title="Close session" hidden>✕</button>
+            <button class="act icon" id="inspBtn" title="Toggle inspector (⌘I)">◨</button>
+          </div>
+        </div>
+        <div id="terminals">
+          <div class="empty" id="empty">
+            <div class="empty-card">
+              <div class="empty-logo"></div>
+              <h2>No sessions running</h2>
+              <p>Launch Claude Code in a project from the sidebar, or press <kbd>⌘</kbd><kbd>K</kbd>.</p>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="insp">
+        <div class="insp-head"><span class="label">Session</span><span class="pill idle" id="iPill"><span class="pd"></span><span id="iPillTxt">–</span></span></div>
+        <div class="insp-scroll" id="inspector"></div>
+      </aside>
+
+      <footer class="foot">
+        <span class="fseg"><span class="fdot" id="fDot"></span><b id="fProj">–</b> active</span>
+        <span class="fseg"><span id="fSessions">0</span> sessions</span>
+        <span class="fseg">today <b id="fCost">$0.00</b></span>
+        <span class="fseg">5h <b id="fRl">–</b></span>
+        <span class="fseg">new in <b id="fEngine">embedded</b></span>
+        <span class="spacer"></span>
+        <span class="fseg fk">⌘K · ⌘1–9 switch · ⌘B sidebar · ⌘I inspector · ⌘± font</span>
+      </footer>
+    </div>
+
+    <div class="scrim" id="scrim"></div>
+    <div class="palette" id="palette" role="dialog" aria-modal="true">
+      <input id="palInput" placeholder="Jump to a session, launch a project, or run a command…" autocomplete="off" />
+      <div class="pal-list" id="palList"></div>
+      <div class="pal-foot"><span>↑↓ navigate</span><span>↵ select</span><span>esc close</span></div>
+    </div>
+
+    <div class="wtdlg" id="wtDlg" role="dialog" aria-modal="true">
+      <div class="wt-h">Worktrees</div>
+      <div class="wt-sub" id="wtSub"></div>
+      <div class="wt-list" id="wtList" hidden></div>
+      <label class="wt-lbl" for="wtBranch">New branch</label>
+      <input class="wt-in" id="wtBranch" spellcheck="false" placeholder="feature-x" autocomplete="off" />
+      <div class="wt-btns">
+        <button class="wt-cancel" id="wtCancel">Cancel</button>
+        <button class="wt-alt" id="wtMain" hidden>Launch in main</button>
+        <button class="wt-go" id="wtGo">Create worktree ▸</button>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <div class="colorpop" id="colorPop"></div>
+  </body>
+</html>

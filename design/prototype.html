@@ -1,0 +1,404 @@
+<style>
+  :root {
+    --bg: #100e15; --bg-2: #0b0a10; --panel: #16141d; --surface: #1b1824; --surface-2: #221e2d;
+    --hair: rgba(255,255,255,.07); --hair-strong: rgba(255,255,255,.12); --lift: rgba(255,255,255,.05);
+    --text: #efecf5; --muted: #a49eb4; --muted-2: #736d84; --terminal-bg: #0c0b11; --terminal-text: #dcd8e6;
+    --accent: #a78bfa;
+    --accent-wash: color-mix(in srgb, var(--accent) 9%, transparent);
+    --accent-line: color-mix(in srgb, var(--accent) 34%, transparent);
+    --accent-glow: color-mix(in srgb, var(--accent) 24%, transparent);
+    --accent-ink: color-mix(in srgb, var(--accent) 86%, white 14%);
+    --st-working:#e0a44a; --st-done:#37c98b; --st-attention:#fb6f92; --st-idle:#7b8496; --st-error:#f26d6d;
+    --radius:11px; --radius-sm:8px; --radius-lg:13px;
+    --font-ui: ui-rounded, -apple-system, "SF Pro Rounded", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Berkeley Mono", Menlo, monospace;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg:#f4f2f8; --bg-2:#eceaf2; --panel:#ffffff; --surface:#faf9fc; --surface-2:#f1eff7;
+    --hair:rgba(24,18,40,.09); --hair-strong:rgba(24,18,40,.15); --lift:rgba(255,255,255,.8);
+    --text:#1c1726; --muted:#6a6480; --muted-2:#9a94ab; --terminal-bg:#100e17; --terminal-text:#dcd8e6;
+    --accent-ink: color-mix(in srgb, var(--accent) 80%, black 20%);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  ::selection { background: var(--accent-glow); }
+
+  .app {
+    height: 100dvh; display: grid;
+    grid-template-columns: 232px minmax(0,1fr) 296px;
+    grid-template-rows: 40px minmax(0,1fr) 25px;
+    grid-template-areas: "top top top" "rail stage insp" "foot foot foot";
+    background: radial-gradient(1000px 460px at 80% -10%, var(--accent-wash), transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--font-ui); font-size: 12.5px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased; overflow: hidden; transition: background .5s ease, grid-template-columns .22s ease;
+  }
+  .app.insp-off { grid-template-columns: 232px minmax(0,1fr) 0; }
+  .app.insp-off .insp { display: none; }
+  .app.rail-mini { grid-template-columns: 54px minmax(0,1fr) 296px; }
+  .app.rail-mini.insp-off { grid-template-columns: 54px minmax(0,1fr) 0; }
+
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .label { font-size: 9px; letter-spacing: .11em; text-transform: uppercase; color: var(--muted-2); font-weight: 700; }
+  .lit { background: linear-gradient(180deg, var(--lift), transparent 42%), var(--surface); border: 1px solid var(--hair); box-shadow: inset 0 1px 0 var(--lift); }
+
+  /* ===== TOP BAR ===== */
+  .top { grid-area: top; display: flex; align-items: center; gap: 11px; padding: 0 12px; background: linear-gradient(180deg, var(--lift), transparent 60%), var(--panel); border-bottom: 1px solid var(--hair); }
+  .brand { display: flex; align-items: center; gap: 8px; }
+  .logo { width: 17px; height: 17px; border-radius: 6px; background: conic-gradient(from 210deg, #a78bfa, #38bdf8, #fb923c, #a78bfa); box-shadow: inset 0 0 0 1px rgba(255,255,255,.2); }
+  .brand b { font-weight: 700; letter-spacing: -.01em; font-size: 12.5px; }
+  .kbar { margin: 0 auto; width: min(380px, 40vw); height: 26px; border-radius: 999px; cursor: text; display: flex; align-items: center; gap: 7px; padding: 0 5px 0 11px; background: var(--surface); border: 1px solid var(--hair); color: var(--muted-2); box-shadow: inset 0 1px 0 var(--lift); }
+  .kbar:hover { border-color: var(--hair-strong); }
+  .kbar span { font-size: 11px; }
+  .kbd { margin-left: auto; display: flex; gap: 3px; }
+  .kbd kbd { font-family: var(--font-mono); font-size: 9px; padding: 2px 5px; border-radius: 5px; background: var(--bg-2); border: 1px solid var(--hair); color: var(--muted-2); }
+  .top-right { display: flex; align-items: center; gap: 7px; }
+  .attn-badge { display: none; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 999px; cursor: pointer; font-size: 11px; font-weight: 650; color: var(--st-attention); background: color-mix(in srgb, var(--st-attention) 13%, transparent); border: 1px solid color-mix(in srgb, var(--st-attention) 32%, transparent); }
+  .attn-badge.show { display: flex; }
+  .attn-badge .bdot { width: 5px; height: 5px; border-radius: 50%; background: var(--st-attention); }
+  @media (prefers-reduced-motion: no-preference) { .attn-badge .bdot { animation: pulse 1.5s ease-in-out infinite; } }
+  .ibtn { width: 26px; height: 26px; border-radius: 8px; cursor: pointer; display: grid; place-items: center; font-size: 13px; color: var(--muted); background: var(--surface); border: 1px solid var(--hair); }
+  .ibtn:hover { color: var(--text); border-color: var(--hair-strong); }
+
+  /* ===== LEFT RAIL (grouped by project) ===== */
+  .rail { grid-area: rail; background: linear-gradient(180deg, var(--lift), transparent 22%), var(--panel); border-right: 1px solid var(--hair); display: flex; flex-direction: column; min-height: 0; }
+  .rail-scroll { overflow-y: auto; padding: 11px 9px 12px; display: flex; flex-direction: column; min-height: 0; }
+  .rail-top { display: flex; align-items: center; justify-content: space-between; padding: 2px 6px 10px; }
+  .rail-top .count { font-size: 9.5px; color: var(--muted-2); font-family: var(--font-mono); }
+  .rt-right { display: flex; align-items: center; gap: 8px; }
+  .rail-collapse { width: 20px; height: 20px; border-radius: 6px; border: 1px solid var(--hair); background: var(--surface); color: var(--muted-2); cursor: pointer; font-size: 11px; line-height: 1; display: grid; place-items: center; }
+  .rail-collapse:hover { color: var(--text); border-color: var(--hair-strong); }
+
+  /* minified icon-rail */
+  .railmini { display: none; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; overflow-y: auto; }
+  .app.rail-mini .rail-scroll { display: none; }
+  .app.rail-mini .railmini { display: flex; }
+  .rm-btn, .rm-proj { width: 36px; height: 36px; border-radius: 10px; cursor: pointer; display: grid; place-items: center; position: relative; color: var(--muted); }
+  .rm-btn { border: 1px solid var(--hair); background: var(--surface); font-size: 14px; }
+  .rm-btn:hover { color: var(--text); border-color: var(--hair-strong); }
+  .rm-proj { border: 1px solid transparent; background: transparent; }
+  .rm-proj:hover { background: var(--surface); }
+  .rm-proj.on { background: var(--accent-wash); box-shadow: inset 0 0 0 1px var(--accent-line); }
+  .rm-dot { width: 12px; height: 12px; border-radius: 4px; background: var(--rc); box-shadow: 0 0 8px -1px var(--rc); }
+  .rm-badge { position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 50%; background: var(--st-attention); border: 2px solid var(--panel); }
+  .rm-add { margin-top: auto; }
+
+  .pgroup { margin-bottom: 3px; }
+  .phead { display: flex; align-items: center; gap: 8px; padding: 6px 7px; border-radius: var(--radius-sm); cursor: pointer; }
+  .phead:hover { background: var(--surface); }
+  .pdot { width: 8px; height: 8px; border-radius: 3px; flex: none; box-shadow: 0 0 7px -1px currentColor; }
+  .pname { font-weight: 650; letter-spacing: -.01em; }
+  .pcount { margin-left: auto; font: 600 10px var(--font-mono); color: var(--muted-2); background: var(--surface-2); padding: 1px 6px; border-radius: 6px; }
+  .padd { font-size: 13px; color: var(--muted-2); padding: 0 2px; }
+  .padd:hover { color: var(--text); }
+  .phead.empty .pname { color: var(--muted-2); font-weight: 550; }
+  .phead.empty .pdot { opacity: .5; }
+  .plaunch { margin-left: auto; font-size: 10px; color: var(--muted-2); opacity: 0; transition: opacity .12s; }
+  .phead.empty:hover .plaunch { opacity: 1; }
+
+  .psessions { padding: 1px 0 4px 8px; margin-left: 10px; border-left: 1px solid var(--hair); display: flex; flex-direction: column; gap: 1px; }
+  .srow { display: grid; grid-template-columns: 14px 1fr auto auto; gap: 7px; align-items: center; padding: 5px 8px; border-radius: 7px; cursor: pointer; }
+  .srow:hover { background: var(--surface); }
+  .srow.active { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--hair); }
+  .sglyph { font-size: 10.5px; text-align: center; line-height: 1; }
+  .sbranch { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .srow.active .sbranch { color: var(--accent-ink); font-weight: 600; }
+  .sbranch .wt { opacity: .8; }
+  .sctx, .scost { font: 10px var(--font-mono); color: var(--muted-2); }
+  .srow.active .scost { color: var(--text); }
+
+  .g-work{color:var(--st-working);} .g-attn{color:var(--st-attention);} .g-done{color:var(--st-done);} .g-idle{color:var(--st-idle);}
+  @media (prefers-reduced-motion: no-preference) { .g-work,.g-attn{ animation: pulse 1.5s ease-in-out infinite; } @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}} }
+
+  /* ===== CENTER: TERMINAL ===== */
+  .stage { grid-area: stage; display: flex; flex-direction: column; min-width: 0; }
+  .stage-head { display: flex; align-items: center; gap: 11px; padding: 8px 14px; background: linear-gradient(180deg, var(--accent-wash), transparent 90%), var(--panel); border-bottom: 1px solid var(--hair); }
+  .st-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .st-title .proj { font-size: 13.5px; font-weight: 800; color: var(--accent-ink); letter-spacing: -.02em; }
+  .chip { font-size: 9.5px; color: var(--muted); padding: 2px 7px; border-radius: 6px; background: var(--surface); border: 1px solid var(--hair); font-family: var(--font-mono); }
+  .st-title .path { font-size: 10px; color: var(--muted-2); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .st-actions { margin-left: auto; display: flex; gap: 6px; }
+  .act { height: 27px; padding: 0 10px; border-radius: var(--radius-sm); cursor: pointer; font: 600 11px var(--font-ui); display: inline-flex; align-items: center; gap: 5px; color: var(--muted); background: var(--surface); border: 1px solid var(--hair); box-shadow: inset 0 1px 0 var(--lift); }
+  .act:hover { color: var(--text); border-color: var(--hair-strong); }
+  .act.primary { color: #16121f; background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white 12%), var(--accent)); border-color: transparent; box-shadow: 0 5px 14px -8px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,.3); }
+  .act.icon { width: 27px; padding: 0; justify-content: center; }
+  .act.icon.on { color: var(--accent-ink); border-color: var(--accent-line); background: var(--accent-wash); }
+
+  .terminal { flex: 1; margin: 0; padding: 13px 18px; overflow: auto; min-height: 0; background: var(--terminal-bg); color: var(--terminal-text); font-family: var(--font-mono); font-size: 12px; line-height: 1.7; }
+  .terminal .t-user{color:#9fb8ff;} .terminal .t-accent{color:var(--accent-ink);} .terminal .t-muted{color:#7d7791;}
+  .terminal .t-ok{color:#4fd39b;} .terminal .t-warn{color:#e6b25a;} .terminal .t-dim{color:#b3adc2;} .terminal .glyph{color:var(--accent-ink);}
+  .prompt-row { display: flex; align-items: center; gap: 8px; margin-top: 11px; }
+  .caret { width: 7px; height: 14px; background: var(--accent-ink); display: inline-block; border-radius: 1px; }
+  @media (prefers-reduced-motion: no-preference) { .caret{ animation: blink 1.1s step-end infinite; } @keyframes blink{50%{opacity:0;}} }
+
+  /* ===== RIGHT: INSPECTOR ===== */
+  .insp { grid-area: insp; background: linear-gradient(180deg, var(--lift), transparent 22%), var(--panel); border-left: 1px solid var(--hair); display: flex; flex-direction: column; min-height: 0; }
+  .insp-head { padding: 10px 13px; border-bottom: 1px solid var(--hair); display: flex; align-items: center; gap: 8px; }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 700; background: color-mix(in srgb, var(--pc) 14%, transparent); color: var(--pc); border: 1px solid color-mix(in srgb, var(--pc) 30%, transparent); }
+  .pill .pd { width: 5px; height: 5px; border-radius: 50%; background: var(--pc); }
+  .pill.attention{--pc:var(--st-attention);} .pill.working{--pc:var(--st-working);} .pill.done{--pc:var(--st-done);} .pill.idle{--pc:var(--st-idle);} .pill.error{--pc:var(--st-error);}
+  .insp-scroll { overflow-y: auto; padding: 12px 13px 16px; display: flex; flex-direction: column; gap: 13px; min-height: 0; }
+
+  .attn { border-radius: var(--radius); padding: 11px; display: flex; flex-direction: column; gap: 9px; background: linear-gradient(180deg, color-mix(in srgb, var(--st-attention) 15%, transparent), color-mix(in srgb, var(--st-attention) 6%, transparent)); border: 1px solid color-mix(in srgb, var(--st-attention) 32%, transparent); }
+  .attn-h { display: flex; align-items: center; gap: 7px; font-weight: 700; color: var(--st-attention); font-size: 12px; }
+  .attn code { font-family: var(--font-mono); font-size: 10.5px; background: rgba(0,0,0,.32); color: var(--terminal-text); padding: 7px 9px; border-radius: 7px; display: block; word-break: break-all; }
+  .attn-btns { display: flex; gap: 6px; }
+  .attn-btns button { flex: 1; height: 28px; border-radius: 7px; cursor: pointer; font: 700 11px var(--font-ui); border: 1px solid var(--hair-strong); background: var(--surface); color: var(--text); }
+  .attn-btns .allow { background: linear-gradient(180deg, color-mix(in srgb, var(--st-done) 86%, white), var(--st-done)); color: #07281a; border-color: transparent; }
+  .attn-btns button:hover { filter: brightness(1.06); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat { border-radius: var(--radius); padding: 9px 10px; display: flex; flex-direction: column; gap: 2px; }
+  .stat .v { font: 700 16px var(--font-mono); letter-spacing: -.02em; }
+  .stat .v small { font-size: 10px; font-weight: 600; color: var(--muted); }
+
+  .ring-wrap { display: flex; align-items: center; gap: 12px; border-radius: var(--radius); padding: 11px 12px; }
+  .ring { width: 48px; height: 48px; flex: none; transform: rotate(-90deg); filter: drop-shadow(0 0 5px var(--accent-glow)); }
+  .ring .trk { fill: none; stroke: var(--hair); stroke-width: 3.2; }
+  .ring .fil { fill: none; stroke: var(--accent-ink); stroke-width: 3.4; stroke-linecap: round; transition: stroke-dasharray .55s cubic-bezier(.4,0,.2,1); }
+  .ring-info .big { font: 700 15px var(--font-mono); }
+  .ring-info .sub { font-size: 9.5px; color: var(--muted-2); }
+
+  .meters { display: flex; flex-direction: column; gap: 9px; }
+  .mrow { display: flex; flex-direction: column; gap: 4px; }
+  .mtop { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
+  .mtop b { font-family: var(--font-mono); font-weight: 700; color: var(--text); }
+  .meter { height: 4px; border-radius: 3px; background: var(--hair); overflow: hidden; }
+  .meter > i { display: block; height: 100%; border-radius: 3px; background: var(--st-done); }
+  .meter.warn > i{ background: var(--st-working); } .meter.hot > i{ background: var(--st-attention); }
+
+  .timeline { display: flex; flex-direction: column; }
+  .tl { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--hair); }
+  .tl:last-child { border-bottom: 0; }
+  .tl-ic { font: 11px var(--font-mono); color: var(--accent-ink); text-align: center; }
+  .tl-ic.ok{color:var(--st-done);} .tl-ic.wait{color:var(--st-working);}
+  .tl-t { font-size: 11px; } .tl-t .mono { color: var(--muted); font-size: 10px; }
+  .tl-time { font: 9px var(--font-mono); color: var(--muted-2); }
+
+  /* ===== BOTTOM STATUS BAR ===== */
+  .foot { grid-area: foot; display: flex; align-items: center; gap: 15px; padding: 0 13px; font-family: var(--font-mono); font-size: 10px; color: var(--muted); background: linear-gradient(180deg, transparent, var(--bg-2)); border-top: 1px solid var(--hair); }
+  .foot .fseg { display: flex; align-items: center; gap: 6px; }
+  .foot .fseg b { color: var(--text); font-weight: 700; }
+  .foot .fdot { width: 5px; height: 5px; border-radius: 50%; }
+  .foot .spacer { margin-left: auto; }
+  .foot .fk { color: var(--muted-2); }
+
+  /* ===== ⌘K PALETTE ===== */
+  .scrim { position: fixed; inset: 0; background: rgba(6,5,10,.5); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; transition: opacity .16s; z-index: 40; }
+  .scrim.show { opacity: 1; pointer-events: auto; }
+  .palette { position: fixed; top: 13vh; left: 50%; transform: translateX(-50%) translateY(-8px) scale(.98); width: min(540px, 92vw); z-index: 41; border-radius: var(--radius-lg); overflow: hidden; opacity: 0; pointer-events: none; transition: opacity .16s, transform .16s;
+    background: linear-gradient(180deg, rgba(255,255,255,.06), transparent 40%), color-mix(in srgb, var(--panel) 82%, transparent);
+    backdrop-filter: blur(24px) saturate(1.4); border: 1px solid var(--hair-strong); box-shadow: 0 40px 100px -30px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.08); }
+  .palette.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0) scale(1); }
+  #palInput { width: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font: 14px var(--font-ui); padding: 14px 16px; border-bottom: 1px solid var(--hair); }
+  #palInput::placeholder { color: var(--muted-2); }
+  .pal-list { max-height: 44vh; overflow-y: auto; padding: 6px; }
+  .pal-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; }
+  .pal-item.on { background: var(--accent-wash); box-shadow: inset 0 0 0 1px var(--accent-line); }
+  .pal-ic { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; font-size: 11px; flex: none; background: var(--surface); border: 1px solid var(--hair); color: var(--muted); }
+  .pal-ic .sw { width: 8px; height: 8px; border-radius: 3px; }
+  .pal-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .pal-main .pm { font-size: 12px; font-weight: 600; }
+  .pal-main .ps { font-size: 10px; color: var(--muted-2); font-family: var(--font-mono); }
+  .pal-kind { margin-left: auto; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted-2); }
+  .pal-foot { display: flex; gap: 15px; padding: 7px 13px; border-top: 1px solid var(--hair); font: 9.5px var(--font-mono); color: var(--muted-2); }
+
+  .toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%) translateY(14px); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 9px; font-size: 11.5px; font-weight: 600; box-shadow: 0 18px 46px -20px rgba(0,0,0,.7); opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 50; }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--hair-strong); border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+
+  @media (max-width: 1080px) { .app, .app.insp-off { grid-template-columns: 224px minmax(0,1fr); } .insp { display: none; } }
+  @media (max-width: 680px) { .app { grid-template-columns: minmax(0,1fr); } .rail { display: none; } }
+</style>
+
+<div class="app" id="app">
+  <header class="top">
+    <div class="brand"><div class="logo"></div><b>cc·launcher</b></div>
+    <div class="kbar" onclick="openPalette()"><span>⌕</span><span>Jump to a session, launch a project…</span><span class="kbd"><kbd>⌘</kbd><kbd>K</kbd></span></div>
+    <div class="top-right">
+      <button class="attn-badge" id="attnBadge" onclick="gotoAttention()"><span class="bdot"></span><span id="attnBadgeTxt"></span></button>
+      <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <aside class="rail">
+    <div class="rail-scroll">
+      <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><span class="count" id="liveCount"></span><button class="rail-collapse" onclick="toggleRail()" title="Collapse sidebar (⌘B)">«</button></div></div>
+      <div id="projects"></div>
+    </div>
+    <div class="railmini" id="railmini"></div>
+  </aside>
+
+  <main class="stage">
+    <div class="stage-head">
+      <div class="st-title">
+        <span class="proj" id="hProj">beacon</span><span class="chip" id="hBranch">main</span>
+        <span class="path" id="hPath"></span>
+      </div>
+      <div class="st-actions">
+        <button class="act" onclick="toast('Would create a git worktree + session')">⑃ Worktree</button>
+        <button class="act primary" onclick="toast('Would open a second Claude here')">＋ Session</button>
+        <button class="act icon" id="inspBtn" title="Toggle inspector (⌘I)" onclick="toggleInsp()">◨</button>
+      </div>
+    </div>
+    <pre class="terminal" id="terminal"></pre>
+  </main>
+
+  <aside class="insp">
+    <div class="insp-head"><span class="label">Session</span><span class="pill" id="iPill"><span class="pd"></span><span id="iPillTxt"></span></span></div>
+    <div class="insp-scroll" id="inspector"></div>
+  </aside>
+
+  <footer class="foot">
+    <span class="fseg"><span class="fdot" id="fDot"></span><b id="fProj"></b> active</span>
+    <span class="fseg"><span id="fSessions"></span> sessions</span>
+    <span class="fseg">today <b id="fCost"></b></span>
+    <span class="fseg">5h <b id="fRl"></b></span>
+    <span class="spacer"></span>
+    <span class="fseg fk">⌘K palette · ⌘1–4 switch · ⌘B sidebar · ⌘I inspector</span>
+  </footer>
+</div>
+
+<div class="scrim" id="scrim" onclick="closePalette()"></div>
+<div class="palette" id="palette" role="dialog" aria-modal="true">
+  <input id="palInput" placeholder="Jump to a session, launch a project, or run a command…" autocomplete="off" />
+  <div class="pal-list" id="palList"></div>
+  <div class="pal-foot"><span>↑↓ navigate</span><span>↵ select</span><span>esc close</span></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const A = { aurora:"#5cc2f2", beacon:"#a78bfa", cascade:"#fb923c", meridian:"#34d399", quill:"#f472b6" };
+  const FAVORITES = [ {name:"aurora",path:"~/…/aurora"}, {name:"beacon",path:"~/…/beacon"}, {name:"cascade",path:"~/…/Cascade"}, {name:"meridian",path:"~/…/meridian"}, {name:"quill",path:"~/…/quill"} ];
+  const GLYPH = { attention:"◆", working:"●", done:"✓", idle:"○" };
+  const GCLASS = { attention:"g-attn", working:"g-work", done:"g-done", idle:"g-idle" };
+  const STCOLOR = { attention:"var(--st-attention)", working:"var(--st-working)", done:"var(--st-done)", idle:"var(--st-idle)" };
+
+  const SESSIONS = [
+    { id:"beacon", project:"beacon", accent:A.beacon, branch:"main", worktree:null, path:"~/Documents/code/beacon",
+      status:"attention", statusText:"Needs you", model:"Sonnet 4.5", ctxPct:21, ctxTokens:"42.6k", ctxSize:"200k", cost:"0.44", dur:"12m 30s", rl5h:34, rl7d:41, subagents:0, last:"Waiting for permission · Bash",
+      attention:{ title:"Permission needed", cmd:"npm test -- auth   (Bash)" },
+      activity:[ {ic:"✎",t:"Edit <span class='mono'>src/middleware/auth.ts</span>",time:"12:41",cls:""},{ic:"◈",t:"Read <span class='mono'>src/config.ts</span>",time:"12:40",cls:""},{ic:"▸",t:"Bash <span class='mono'>npm test -- auth</span>",time:"12:41",cls:"wait"} ],
+      term:[ ["● ","t-accent","beacon / main","t-accent"],["> ","t-user","add rate limiting to the auth middleware","t-user"],null,["⏺ ","glyph","I'll add a token-bucket limiter. First, the current middleware.","t-dim"],["  ⎿ ","t-muted","Read src/middleware/auth.ts (142 lines)","t-muted"],null,["⏺ ","glyph","Edit src/middleware/auth.ts","t-dim"],["  ⎿ ","t-muted","added rateLimiter import + guard  (+18 -2)","t-ok"],null,["⏺ ","glyph","Bash  npm test -- auth","t-dim"],["  ⎿ ","t-muted","Permission needed to run this command","t-warn"],["     ","t-muted","▸ waiting for your approval in the inspector …","t-warn"] ] },
+    { id:"aurora", project:"aurora", accent:A.aurora, branch:"main", worktree:null, path:"~/Documents/code/aurora",
+      status:"working", statusText:"Working", model:"Opus 4.8", ctxPct:42, ctxTokens:"84.1k", ctxSize:"200k", cost:"1.87", dur:"27m 04s", rl5h:61, rl7d:44, subagents:1, last:"Running pytest · 148 passed, 2 failed", attention:null,
+      activity:[ {ic:"◻",t:"Subagent <span class='mono'>regression-analyst</span>",time:"13:02",cls:""},{ic:"▸",t:"Bash <span class='mono'>uv run pytest tests/calibration</span>",time:"13:01",cls:""},{ic:"◈",t:"Read <span class='mono'>src/scorer/waves.py</span>",time:"13:00",cls:"ok"} ],
+      term:[ ["● ","t-accent","aurora / main","t-accent"],["> ","t-user","run the calibration suite and summarize regressions","t-user"],null,["⏺ ","glyph","Bash  uv run pytest tests/calibration -q","t-dim"],["  ⎿ ","t-muted","148 passed, 2 failed  (12.4s)","t-warn"],null,["⏺ ","glyph","Analyzing the 2 failures in the wave-detector bands …","t-dim"],["  ⎿ ","t-muted","spawned subagent: regression-analyst","t-dim"] ] },
+    { id:"aurora-wt", project:"aurora", accent:A.aurora, branch:"phase-3-badge", worktree:"phase-3-badge", path:"~/…/.worktrees/aurora-phase-3-badge",
+      status:"done", statusText:"Your turn", model:"Opus 4.8", ctxPct:68, ctxTokens:"136k", ctxSize:"200k", cost:"3.20", dur:"44m 12s", rl5h:61, rl7d:44, subagents:0, last:"Ready for review · badge endpoint", attention:null,
+      activity:[ {ic:"✓",t:"Bash <span class='mono'>curl :8787/badge/…</span> → 200",time:"12:58",cls:"ok"},{ic:"✎",t:"Edit <span class='mono'>src/routes/badge.ts</span>",time:"12:55",cls:""},{ic:"◈",t:"Read <span class='mono'>src/routes/results.ts</span>",time:"12:52",cls:""} ],
+      term:[ ["● ","t-accent","aurora / phase-3-badge  (worktree)","t-accent"],["> ","t-user","implement the badge SVG endpoint","t-user"],null,["⏺ ","glyph","Done. Added /badge/:owner/:repo returning an SVG shield.","t-dim"],["  ⎿ ","t-muted","Edit src/routes/badge.ts  (+64)","t-ok"],["  ⎿ ","t-muted","Bash curl localhost:8787/badge/… → 200 OK","t-ok"],null,["   ","t-dim","Ready for your review — wire it into the results page?","t-dim"] ] },
+    { id:"cascade", project:"cascade", accent:A.cascade, branch:"main", worktree:null, path:"~/Documents/code/Cascade",
+      status:"idle", statusText:"Idle", model:"Haiku 4.5", ctxPct:12, ctxTokens:"24.3k", ctxSize:"200k", cost:"0.09", dur:"3m 41s", rl5h:34, rl7d:41, subagents:0, last:"Idle · waiting for your next prompt", attention:null,
+      activity:[ {ic:"✓",t:"Bash <span class='mono'>swift build</span> → ok",time:"11:20",cls:"ok"},{ic:"◈",t:"Read <span class='mono'>Sources/App/Recorder.swift</span>",time:"11:19",cls:""} ],
+      term:[ ["● ","t-accent","cascade / main","t-accent"],null,["   ","t-dim","Waiting for your next instruction.","t-dim"] ] },
+  ];
+  const PROJECTS = FAVORITES.map(f => ({ name:f.name, accent:A[f.name], path:f.path, sessions:SESSIONS.filter(s=>s.project===f.name) }));
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  let current = "beacon";
+
+  function sessionRow(s, activeId) {
+    return `<div class="srow ${s.id===activeId?'active':''}" onclick="select('${s.id}')">
+      <span class="sglyph ${GCLASS[s.status]}">${GLYPH[s.status]}</span>
+      <span class="sbranch">${s.worktree?`⑃ <span class="wt">${s.branch}</span>`:s.branch}</span>
+      <span class="sctx">${s.ctxPct}%</span><span class="scost">$${s.cost}</span></div>`;
+  }
+  function renderProjects(activeId) {
+    $("liveCount").textContent = SESSIONS.length + " running";
+    $("projects").innerHTML = PROJECTS.map(p => {
+      const rows = p.sessions.map(s => sessionRow(s, activeId)).join("");
+      const head = p.sessions.length
+        ? `<div class="phead" onclick="select('${p.sessions[0].id}')"><span class="pdot" style="background:${p.accent};color:${p.accent}"></span><span class="pname">${p.name}</span><span class="pcount">${p.sessions.length}</span><span class="padd" onclick="event.stopPropagation();toast('Would open another Claude in ${p.name}')">＋</span></div>`
+        : `<div class="phead empty" onclick="toast('Would launch Claude in ${p.name}')"><span class="pdot" style="background:${p.accent};color:${p.accent}"></span><span class="pname">${p.name}</span><span class="plaunch">launch →</span></div>`;
+      return `<div class="pgroup">${head}${rows?`<div class="psessions">${rows}</div>`:""}</div>`;
+    }).join("");
+  }
+  function renderMini(activeId) {
+    const activeProj = SESSIONS.find(s=>s.id===activeId)?.project;
+    $("railmini").innerHTML =
+      `<button class="rm-btn" onclick="toggleRail()" title="Expand sidebar (⌘B)">»</button>` +
+      PROJECTS.map(p => {
+        const first = p.sessions[0];
+        const hasAttn = p.sessions.some(s=>s.status==="attention");
+        return `<button class="rm-proj ${p.name===activeProj?'on':''}" style="--rc:${p.accent}" title="${p.name}${first?'':' · launch'}" onclick="${first?`select('${first.id}')`:`toast('Would launch Claude in ${p.name}')`}"><span class="rm-dot"></span>${hasAttn?'<span class="rm-badge"></span>':''}</button>`;
+      }).join("") +
+      `<button class="rm-btn rm-add" onclick="openPalette()" title="New session (⌘K)">＋</button>`;
+  }
+  function toggleRail(){ $("app").classList.toggle("rail-mini"); }
+  function renderTerminal(s) {
+    const rows = s.term.map(l => { if(l===null) return ""; const [g,gc,txt,tc]=l; return `<span class="${gc}">${esc(g)}</span><span class="${tc}">${esc(txt)}</span>`; }).join("\n");
+    const caret = (s.status==="idle"||s.status==="done") ? `<div class="prompt-row"><span class="t-accent">></span> <span class="caret"></span></div>` : "";
+    $("terminal").innerHTML = rows + "\n" + caret;
+  }
+  const mc = (v) => v>=80?"hot":v>=55?"warn":"";
+  function renderInspector(s) {
+    $("iPill").className = "pill " + s.status; $("iPillTxt").textContent = s.statusText;
+    const attn = s.attention ? `<div class="attn"><div class="attn-h">🔔 ${s.attention.title}</div><code>${esc(s.attention.cmd)}</code><div class="attn-btns"><button class="allow" onclick="toast('Allowed — decision sent to Claude')">Allow</button><button onclick="toast('Denied')">Deny</button><button onclick="toast('Deferred to terminal')">In terminal</button></div></div>` : "";
+    const activity = s.activity.map(a => `<div class="tl"><span class="tl-ic ${a.cls}">${a.ic}</span><span class="tl-t">${a.t}</span><span class="tl-time">${a.time}</span></div>`).join("");
+    $("inspector").innerHTML = `${attn}
+      <div class="ring-wrap lit"><svg class="ring" viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="16"></circle><circle class="fil" cx="20" cy="20" r="16" pathLength="100" stroke-dasharray="${s.ctxPct} 100"></circle></svg><div class="ring-info"><div class="big">${s.ctxPct}%</div><div class="sub">context · ${s.ctxTokens} / ${s.ctxSize}</div></div></div>
+      <div class="grid2"><div class="stat lit"><span class="label">Cost</span><span class="v">$${s.cost}</span></div><div class="stat lit"><span class="label">Elapsed</span><span class="v">${s.dur}</span></div><div class="stat lit"><span class="label">Model</span><span class="v" style="font-size:12px">${s.model}</span></div><div class="stat lit"><span class="label">Background</span><span class="v">${s.subagents}<small> subs</small></span></div></div>
+      <div><div class="label" style="margin-bottom:8px">Rate limits</div><div class="meters"><div class="mrow"><div class="mtop"><span>5-hour</span><b>${s.rl5h}%</b></div><div class="meter ${mc(s.rl5h)}"><i style="width:${s.rl5h}%"></i></div></div><div class="mrow"><div class="mtop"><span>7-day</span><b>${s.rl7d}%</b></div><div class="meter ${mc(s.rl7d)}"><i style="width:${s.rl7d}%"></i></div></div></div></div>
+      <div><div class="label" style="margin-bottom:5px">Recent activity</div><div class="timeline">${activity}</div></div>`;
+  }
+  function renderFoot() {
+    const s = SESSIONS.find(x=>x.id===current);
+    $("fProj").textContent = s.project; $("fDot").style.background = s.accent;
+    $("fSessions").textContent = SESSIONS.length; $("fCost").textContent = "$"+SESSIONS.reduce((a,x)=>a+parseFloat(x.cost),0).toFixed(2);
+    $("fRl").textContent = Math.max(...SESSIONS.map(x=>x.rl5h))+"%";
+  }
+  function renderAttn() {
+    const n = SESSIONS.filter(x=>x.status==="attention").length; const b = $("attnBadge");
+    if (n>0){ b.classList.add("show"); $("attnBadgeTxt").textContent = `${n} need${n===1?'s':''} you`; } else b.classList.remove("show");
+  }
+  function gotoAttention(){ const a = SESSIONS.find(x=>x.status==="attention"); if(a) select(a.id); }
+  function toggleInsp(){ $("app").classList.toggle("insp-off"); $("inspBtn").classList.toggle("on", !$("app").classList.contains("insp-off")); }
+
+  function select(id) {
+    const s = SESSIONS.find(x=>x.id===id); if(!s) return; current = id;
+    document.documentElement.style.setProperty("--accent", s.accent);
+    $("hProj").textContent = s.project; $("hProj").style.color = "var(--accent-ink)";
+    $("hBranch").textContent = s.worktree?"⑃ "+s.branch:s.branch; $("hPath").textContent = s.path;
+    renderProjects(id); renderMini(id); renderTerminal(s); renderInspector(s); renderFoot(); closePalette();
+  }
+
+  // ⌘K palette
+  let palItems=[], palSel=0;
+  function buildPalItems(q){
+    const items=[];
+    SESSIONS.forEach(s=>items.push({kind:"session",label:`${s.project} · ${s.branch}`,sub:s.last,sw:s.accent,run:()=>select(s.id)}));
+    FAVORITES.forEach(f=>items.push({kind:"launch",label:`Launch ${f.name}`,sub:f.path,sw:A[f.name],run:()=>toast(`Would launch Claude in ${f.name}`)}));
+    [["New session here","＋"],["Create git worktree","⑃"],["Toggle inspector","◨"],["Toggle theme","◐"]].forEach(([l,ic])=>items.push({kind:"action",label:l,sub:"command",ic,run:()=> l==="Toggle theme"?toggleTheme():l==="Toggle inspector"?toggleInsp():toast(l)}));
+    const f=q.trim().toLowerCase();
+    return f? items.filter(i=>(i.label+i.sub).toLowerCase().includes(f)) : items;
+  }
+  function renderPal(){
+    $("palList").innerHTML = palItems.map((i,idx)=>`<div class="pal-item ${idx===palSel?'on':''}" data-i="${idx}"><span class="pal-ic">${i.sw?`<span class="sw" style="background:${i.sw}"></span>`:(i.ic||"›")}</span><span class="pal-main"><span class="pm">${i.label}</span><span class="ps">${i.sub}</span></span><span class="pal-kind">${i.kind}</span></div>`).join("") || `<div class="pal-item"><span class="pal-main"><span class="pm" style="color:var(--muted)">No matches</span></span></div>`;
+    [...$("palList").querySelectorAll(".pal-item[data-i]")].forEach(el=>el.addEventListener("click",()=>palItems[+el.dataset.i]?.run()));
+  }
+  function refreshPal(){ palItems=buildPalItems($("palInput").value); palSel=0; renderPal(); }
+  function openPalette(){ $("scrim").classList.add("show"); $("palette").classList.add("show"); $("palInput").value=""; refreshPal(); setTimeout(()=>$("palInput").focus(),30); }
+  function closePalette(){ $("scrim").classList.remove("show"); $("palette").classList.remove("show"); }
+  $("palInput").addEventListener("input", refreshPal);
+  $("palInput").addEventListener("keydown",(e)=>{ if(e.key==="ArrowDown"){e.preventDefault();palSel=Math.min(palSel+1,palItems.length-1);renderPal();} else if(e.key==="ArrowUp"){e.preventDefault();palSel=Math.max(palSel-1,0);renderPal();} else if(e.key==="Enter"){e.preventDefault();palItems[palSel]?.run();} else if(e.key==="Escape"){closePalette();} });
+
+  function toggleTheme(){ const cur=document.documentElement.getAttribute("data-theme")||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"); document.documentElement.setAttribute("data-theme", cur==="dark"?"light":"dark"); }
+  $("themeBtn").addEventListener("click", toggleTheme);
+
+  window.addEventListener("keydown",(e)=>{
+    if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){ e.preventDefault(); $("palette").classList.contains("show")?closePalette():openPalette(); }
+    else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="i"){ e.preventDefault(); toggleInsp(); }
+    else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="b"){ e.preventDefault(); toggleRail(); }
+    else if((e.metaKey||e.ctrlKey)&&e.key>="1"&&e.key<="4"){ e.preventDefault(); const s=SESSIONS[+e.key-1]; if(s) select(s.id); }
+  });
+
+  let tT; function toast(m){ const el=$("toast"); el.textContent=m; el.classList.add("show"); clearTimeout(tT); tT=setTimeout(()=>el.classList.remove("show"),1900); }
+
+  renderAttn(); select("beacon");
+</script>
