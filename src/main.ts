@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
+import { getVersion } from "@tauri-apps/api/app";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -14,12 +16,48 @@ function loadWebgl(term: Terminal) {
     term.loadAddon(w);
   } catch { /* WebGL unavailable — DOM renderer is fine */ }
 }
-let termEngine: "embedded" | "ghostty" =
-  localStorage.getItem("cc-term-engine") === "ghostty" ? "ghostty" : "embedded";
-function toggleEngine() {
-  termEngine = termEngine === "ghostty" ? "embedded" : "ghostty";
+// macOS terminal key conventions for the embedded shell. xterm.js emits xterm's
+// modified-arrow sequences (Option+Left = \e[1;3D etc.), which a plain login zsh
+// doesn't bind by default — so word-nav keys self-insert garbage like ";3D".
+// Terminal.app instead maps them to the Meta/emacs sequences zsh binds out of the
+// box; we do the same here so the embedded shell navigates like a normal terminal.
+// Only plain-shell PTYs get this (Claude's REPL handles its own key input).
+function macShellKeys(id: string): (e: KeyboardEvent) => boolean {
+  const send = (data: string, e: KeyboardEvent): boolean => { e.preventDefault(); invoke("write_pty", { sessionId: id, data }); return false; };
+  return (e: KeyboardEvent) => {
+    if (e.type !== "keydown") return true;
+    if (e.altKey && !e.metaKey && !e.ctrlKey) {
+      if (e.key === "ArrowLeft") return send("\x1bb", e);      // backward-word
+      if (e.key === "ArrowRight") return send("\x1bf", e);     // forward-word
+      if (e.key === "Backspace") return send("\x1b\x7f", e);   // backward-kill-word
+    }
+    if (e.metaKey && !e.altKey && !e.ctrlKey) {
+      if (e.key === "ArrowLeft") return send("\x01", e);       // beginning-of-line (^A)
+      if (e.key === "ArrowRight") return send("\x05", e);      // end-of-line (^E)
+    }
+    return true;
+  };
+}
+type Engine = "embedded" | "ghostty" | "terminal" | "iterm";
+interface EngineDef { id: Engine; label: string; sub: string }
+const ALL_ENGINES: EngineDef[] = [
+  { id: "embedded", label: "Embedded", sub: "In-app terminal" },
+  { id: "ghostty",  label: "Ghostty",  sub: "External window · tinted" },
+  { id: "terminal", label: "Terminal", sub: "macOS Terminal.app" },
+  { id: "iterm",    label: "iTerm",    sub: "iTerm2" },
+];
+function engineDef(id: Engine): EngineDef { return ALL_ENGINES.find((e) => e.id === id) || ALL_ENGINES[0]; }
+// Embedded is always available; installed external terminals are filled in from
+// the backend on startup (see `available_terminals`).
+let availEngines: Engine[] = ["embedded"];
+let termEngine: Engine = (localStorage.getItem("cc-term-engine") as Engine) || "embedded";
+if (!ALL_ENGINES.some((e) => e.id === termEngine)) termEngine = "embedded";
+function setEngine(id: Engine) {
+  if (id === termEngine) return;
+  termEngine = id;
   localStorage.setItem("cc-term-engine", termEngine);
-  toast(`New sessions open in ${termEngine === "ghostty" ? "Ghostty (external)" : "the embedded terminal"}`);
+  const d = engineDef(id);
+  toast(id === "embedded" ? "New sessions open in the embedded terminal" : `New sessions open in ${d.label} (external)`);
   renderFoot();
 }
 
@@ -32,22 +70,96 @@ interface Favorite { name: string; path: string }
 const DEFAULT_FAVORITES: Favorite[] = [];
 let FAVORITES: Favorite[] = JSON.parse(localStorage.getItem("cc-favorites") || "null") || DEFAULT_FAVORITES;
 function saveFavorites() { localStorage.setItem("cc-favorites", JSON.stringify(FAVORITES)); }
+// User-defined sidebar order (project path keys), set by drag-drop. Projects not
+// listed here keep their natural order after the listed ones.
+let projOrder: string[] = JSON.parse(localStorage.getItem("cc-proj-order") || "null") || [];
+function saveProjOrder() { localStorage.setItem("cc-proj-order", JSON.stringify(projOrder)); }
+// Sidebar sort: "manual" honours the drag order above; "active" floats the most
+// recently-active sessions/projects to the top; "attention" floats the ones that
+// need you first (permission > error > your-turn), longest-waiting within a tier.
+type SortMode = "manual" | "active" | "attention";
+const SORT_MODES: SortMode[] = ["manual", "active", "attention"];
+const SORT_META: Record<SortMode, { glyph: string; label: string }> = {
+  manual:    { glyph: "≡", label: "Manual order — drag to arrange" },
+  active:    { glyph: "◷", label: "Latest activity first" },
+  attention: { glyph: "◆", label: "Needs you first" },
+};
+let sortMode: SortMode = (localStorage.getItem("cc-sort") as SortMode) || "manual";
+if (!SORT_MODES.includes(sortMode)) sortMode = "manual";
+// While a project group is being dragged, renderSidebar() must not rebuild the
+// #projects DOM — doing so would destroy the node the browser is dragging,
+// killing the drop. Telemetry ticks call renderAll() constantly, so this guard
+// is what makes reordering actually work during live sessions.
+let draggingProjects = false;
 const MONO = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
 
 // ---------- model ----------
 type Phase = "idle" | "thinking" | "working" | "done" | "error" | "ended";
-interface Act { ic: string; t: string; time: string; cls: string }
+type Risk = "low" | "med" | "high";
+// One tool call on the activity timeline. `durMs` is filled in on PostToolUse
+// (latency = the Pre→Post gap); null means still running.
+interface Act { tool: string; arg: string; time: string; startMs: number; durMs: number | null }
+// A single item from a TodoWrite payload (the plan Claude keeps for itself).
+interface Todo { content: string; status: string }
+// Uncommitted "working set" summary from the git_diffstat backend command.
+interface DiffStat { added: number; removed: number; files: number; untracked: number; dirty: number }
 interface Sess {
   id: string; project: string; accent: string; workdir: string; colorKey: string;
   branch: string; worktree: string | null; title: string;
-  phase: Phase; attention: string | null; pendingCmd: string; pendingPermId: string | null; subagents: number;
-  model: string; ctxPct: number | null; cost: number | null; durMs: number | null;
-  rl5h: number | null; rl7d: number | null; rl5hReset: number | null; rl7dReset: number | null; lastEvent: string; activity: Act[];
-  external: boolean; term?: Terminal; fit?: FitAddon; pane: HTMLElement;
+  phase: Phase; phaseSince: number; lastActivity: number; attention: string | null; pendingCmd: string; pendingPermId: string | null; pendRisk: Risk | null; subagents: number;
+  model: string; ctxPct: number | null; ctxTokens: number | null; cost: number | null; durMs: number | null;
+  curTool: string; curArg: string; todos: Todo[];
+  ctxHist: number[]; costHist: number[]; git: DiffStat | null; res: { cpu: number; memMb: number } | null;
+  lastEvent: string; activity: Act[];
+  external: boolean; shell?: boolean; term?: Terminal; fit?: FitAddon; pane: HTMLElement;
 }
 const sessions = new Map<string, Sess>();
 let activeId: string | null = null;
 let termFontSize = parseFloat(localStorage.getItem("cc-term-font") || "") || 12.5;
+
+// Account-wide rate limits. Every session's statusLine reports the same account
+// numbers, but only as fresh as *that* session last refreshed them — an idle
+// session lags a busy one. Kept as ONE copy shown identically across all sessions.
+const rl: { h5: number | null; h5Reset: number | null; d7: number | null; d7Reset: number | null } =
+  { h5: null, h5Reset: null, d7: null, d7Reset: null };
+// Merge a session's rate-limit reading into the shared copy. Naive last-writer-wins
+// made the % flip between sessions' stale snapshots (e.g. 13 ↔ 19 ↔ 21). Within one
+// window (same resets_at, ±2min tolerance for clock skew) usage only climbs, so we
+// keep the MAX; a genuinely later window supersedes and replaces (so a reset drops
+// the number instead of clinging to the old peak). Stale readings from a lagging
+// session (an earlier window) are ignored.
+function mergeRl(curPct: number | null, curReset: number | null, pct: unknown, reset: unknown): [number | null, number | null] {
+  const p = typeof pct === "number" ? pct : null;
+  const r = typeof reset === "number" ? reset : null;
+  if (p == null) return [curPct, curReset];
+  if (r != null && curReset != null) {
+    if (r > curReset + 120) return [p, r];              // a genuinely newer window
+    if (r < curReset - 120) return [curPct, curReset];  // stale reading from a lagging session
+  }
+  const np = curPct == null ? p : Math.max(curPct, p);  // same window → the peak is freshest
+  return [np, r != null ? Math.max(r, curReset ?? r) : curReset];
+}
+// Once a window's reset time passes, show 0% until the next statusLine refreshes
+// it — otherwise a maxed-out (1xx%) meter would linger past the reset.
+function rlPct(pct: number | null, reset: number | null): number | null {
+  if (reset != null && reset * 1000 <= Date.now()) return 0;
+  return pct;
+}
+function rlReset(reset: number | null): number | null {
+  return (reset != null && reset * 1000 <= Date.now()) ? null : reset;
+}
+
+// Claude Code sessions started OUTSIDE Muster (a plain terminal, an IDE). We
+// discover them from ~/.claude/sessions/<pid>.json (via the backend), show them
+// in the sidebar as read-only, and can jump to their terminal window.
+interface ExtSession {
+  pid: number; session_id: string; cwd: string; name: string;
+  status: string; status_updated_at?: number | null; started_at?: number | null; version: string;
+}
+let externals: ExtSession[] = [];
+let activeExtId: string | null = null;      // session_id of the external session being mirrored
+let extTranscriptTimer: number | undefined;
+const extWorking = (e: ExtSession) => !!e.status && !["idle", "sleeping", "done", ""].includes(e.status);
 
 // persisted daily usage rollup (survives app + system restarts)
 const usage: Record<string, number> = JSON.parse(localStorage.getItem("cc-usage") || "{}");
@@ -65,6 +177,16 @@ const colorOverrides: Record<string, string> = JSON.parse(localStorage.getItem("
 // key means "already probed" so we don't hit the backend twice.
 const icons: Record<string, string> = JSON.parse(localStorage.getItem("cc-icons") || "{}");
 function saveIcons() { localStorage.setItem("cc-icons", JSON.stringify(icons)); }
+// find_project_icon's discovery has improved (it now reaches monorepo subdirs like
+// `01_frontend/public/`). When it does, forget projects we'd cached as "no icon"
+// (empty string) so they re-probe. Found data-URIs are kept as-is; a user who hid
+// an icon will see it re-probed once (acceptable for this spike).
+const ICON_CACHE_VERSION = "2";
+if (localStorage.getItem("cc-icons-v") !== ICON_CACHE_VERSION) {
+  for (const k of Object.keys(icons)) if (!icons[k]) delete icons[k];
+  localStorage.setItem("cc-icons-v", ICON_CACHE_VERSION);
+  saveIcons();
+}
 function iconFor(key: string): string | null { const v = icons[key]; return v ? v : null; }
 async function probeIcon(key: string) {
   if (key in icons) return; // already probed
@@ -96,10 +218,16 @@ function accentFor(key: string): string {
   return hslToHex(h % 360, 0.68, 0.63);
 }
 function basename(p: string) { const parts = p.replace(/\/+$/, "").split("/"); return parts[parts.length - 1] || p; }
+// Claude prepends an animated spinner to its OSC title: it cycles through braille
+// dots (U+2800-U+28FF) and an eight-spoked asterisk (U+2733), e.g. a braille dot or
+// a star before "Fixing the bug". Strip any leading run of those so the sidebar
+// shows a steady summary; our own status stays in the row's colored .sglyph column.
+// Missing the braille range is what left the title glyph flickering. (CC 2.x OSC.)
+const TITLE_DECOR = /^(?:[\s•·∙⋅●○◦◆◇✦✧★☆✨✩-✷✺-✽∗＊*⏺⬤⭐⠀-⣿\uFE0F\u200D]|\u{1F31F})+/u;
 // Claude Code sets the terminal title (OSC) to an auto-summary; keep it unless it's
 // just the folder path/name (which we already show).
 function cleanTitle(t: string, s: Sess): string {
-  const x = (t || "").trim();
+  const x = (t || "").replace(TITLE_DECOR, "").trim();
   if (!x) return s.title;
   if (x === s.workdir || x === tilde(s.workdir) || x === s.project || x === basename(s.workdir)) return "";
   return x;
@@ -116,7 +244,8 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
   const colorKey = opts.colorKey ?? workdir;
   const accent = accentFor(colorKey);
   probeIcon(colorKey);
-  const external = termEngine === "ghostty";
+  const external = termEngine !== "embedded";
+  const eng = engineDef(termEngine);
   const pane = document.createElement("div");
   pane.className = "term-pane";
   $("terminals").appendChild(pane);
@@ -124,7 +253,7 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
   if (external) {
-    pane.innerHTML = `<div class="ext-pane"><div class="ext-logo"></div><h2>Running in Ghostty</h2><p>${esc(project)}${opts.worktree ? " · " + esc(opts.worktree) : ""} — the terminal is in your Ghostty window.<br>Muster still tracks its status, cost &amp; context here.</p></div>`;
+    pane.innerHTML = `<div class="ext-pane"><div class="ext-logo"></div><h2>Running in ${esc(eng.label)}</h2><p>${esc(project)}${opts.worktree ? " · " + esc(opts.worktree) : ""} — the terminal is in your ${esc(eng.label)} window.<br>Muster still tracks its status, cost &amp; context here.</p></div>`;
   } else {
     term = new Terminal({
       fontFamily: MONO, fontSize: termFontSize, cursorBlink: true, scrollback: 8000,
@@ -139,8 +268,9 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
 
   const s: Sess = {
     id, project, accent, workdir, colorKey, branch: opts.branch ?? "", worktree: opts.worktree ?? null, title: "",
-    phase: "idle", attention: null, pendingCmd: "", pendingPermId: null, subagents: 0,
-    model: "", ctxPct: null, cost: null, durMs: null, rl5h: null, rl7d: null, rl5hReset: null, rl7dReset: null,
+    phase: "idle", phaseSince: Date.now(), lastActivity: Date.now(), attention: null, pendingCmd: "", pendingPermId: null, pendRisk: null, subagents: 0,
+    model: "", ctxPct: null, ctxTokens: null, cost: null, durMs: null,
+    curTool: "", curArg: "", todos: [], ctxHist: [], costHist: [], git: null, res: null,
     lastEvent: "", activity: [], external, term, fit, pane,
   };
   sessions.set(id, s);
@@ -149,14 +279,17 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
     if (c !== s.title) { s.title = c; renderSidebar(); if (activeId === id) renderHeader(s); }
   });
   setActive(id);
+  dlog("info", `launch ${project} · ${id.slice(0, 8)} · ${termEngine}${opts.worktree ? " · worktree" : ""}`);
 
   try {
-    if (external) await invoke("spawn_ghostty", { sessionId: id, workdir, accent, title: project });
+    if (termEngine === "ghostty") await invoke("spawn_ghostty", { sessionId: id, workdir, accent, title: project });
+    else if (external) await invoke("spawn_external_terminal", { sessionId: id, workdir, engine: termEngine, title: project });
     else await invoke("spawn_claude", { sessionId: id, workdir, rows: term!.rows || 24, cols: term!.cols || 80 });
   } catch (e) {
+    dlog("error", `launch failed (${project} · ${id.slice(0, 8)}): ${e}`);
     toast("launch failed: " + e);
     if (term) term.writeln(`\r\n\x1b[31m[launch error] ${e}\x1b[0m`);
-    else pane.innerHTML = `<div class="ext-pane"><h2>Couldn't launch Ghostty</h2><p>${esc(String(e))}</p></div>`;
+    else pane.innerHTML = `<div class="ext-pane"><h2>Couldn't launch ${esc(eng.label)}</h2><p>${esc(String(e))}</p></div>`;
   }
   invoke<string | null>("git_branch", { workdir }).then((b) => {
     if (b && !s.branch) { s.branch = b; renderSidebar(); if (activeId === id) renderHeader(s); }
@@ -190,14 +323,16 @@ function removeFavorite(path: string) {
 }
 function closeSession(id: string) {
   const s = sessions.get(id); if (!s) return;
+  const wasActive = activeId === id;
+  // Resolve the successor while the closing session is still in the map, so its
+  // sidebar position (same-project neighbour) is known.
+  const next = wasActive ? nextAfterClose(s) : null;
   invoke("kill_session", { sessionId: id }).catch(() => {});
   try { s.term?.dispose(); } catch { /* */ }
   s.pane.remove();
-  const wasActive = activeId === id;
   sessions.delete(id);
   if (wasActive) {
     activeId = null;
-    const next = orderedSessions()[0];
     if (next) { setActive(next.id); return; }
     document.documentElement.style.setProperty("--accent", "#a78bfa");
     ($("empty") as HTMLElement).style.display = "grid";
@@ -206,13 +341,14 @@ function closeSession(id: string) {
 }
 function resolvePermission(id: string, behavior: string) {
   invoke("resolve_permission", { id, behavior }).catch(() => {});
-  for (const s of sessions.values()) if (s.pendingPermId === id) { s.pendingPermId = null; s.attention = null; }
+  for (const s of sessions.values()) if (s.pendingPermId === id) { s.pendingPermId = null; s.attention = null; s.pendingCmd = ""; }
   renderAll();
 }
 
 function setActive(id: string) {
   const s = sessions.get(id);
   if (!s) return;
+  closeExternalView();
   activeId = id;
   ($("empty") as HTMLElement).style.display = "none";
   for (const x of sessions.values()) x.pane.classList.toggle("active", x.id === id);
@@ -223,99 +359,425 @@ function setActive(id: string) {
     s.term.focus();
   }
   renderHeader(s); renderInspector(s); renderSidebar(); renderMini(); renderFoot();
+  // Show the branch that's really checked out right now, immediately on activate.
+  void refreshBranch(s).then((changed) => { if (changed) { renderSidebar(); if (activeId === id) renderHeader(s); } });
+  void refreshSessionStats(s); // working-set diff + CPU/RAM for the inspector
+}
+// Poll the inspector's on-demand stats for the active session: the uncommitted
+// working-set diff (git_diffstat) and the claude process's CPU/RAM
+// (session_resources). Both are cheap and only fetched for the visible session.
+async function refreshSessionStats(s: Sess) {
+  if (s.shell || s.external) return;
+  const [git, res] = await Promise.all([
+    invoke<DiffStat | null>("git_diffstat", { workdir: s.workdir }).catch(() => null),
+    invoke<{ cpu: number; mem_mb: number } | null>("session_resources", { sessionId: s.id }).catch(() => null),
+  ]);
+  // Only re-render when the *displayed* values change — CPU/RAM jitter every poll,
+  // so comparing rounded values avoids a needless inspector rebuild (which would
+  // restart the heartbeat animation) every 4s while a session sits idle.
+  const sig = (g: DiffStat | null, r: { cpu: number; memMb: number } | null) =>
+    (g ? `${g.added}/${g.removed}/${g.files}/${g.untracked}` : "-") + "|" + (r ? `${Math.round(r.cpu)}/${Math.round(r.memMb)}` : "-");
+  const before = sig(s.git, s.res);
+  s.git = git ?? null;
+  s.res = res ? { cpu: res.cpu, memMb: res.mem_mb } : null;
+  if (sig(s.git, s.res) !== before && activeId === s.id && !activeExtId) renderInspector(s);
+}
+
+// Re-derive a session's branch label from its live git HEAD, so it reflects the
+// branch actually checked out rather than the one the worktree/session was born
+// with (a worktree shows whatever branch is checked out, and that can change).
+// Returns true if the label changed. Detached HEAD shows "(detached @<sha>)".
+async function refreshBranch(s: Sess): Promise<boolean> {
+  if (!s.workdir) return false;
+  const info = await invoke<{ branch: string | null; short: string } | null>("git_head", { workdir: s.workdir }).catch(() => null);
+  if (!info) return false; // not a git repo (or gone) — leave the label as-is
+  const label = info.branch ?? `(detached @${info.short})`;
+  if (label === s.branch) return false;
+  s.branch = label;
+  return true;
+}
+async function refreshBranches() {
+  const changed = await Promise.all([...sessions.values()].map(refreshBranch));
+  if (changed.some(Boolean)) {
+    renderSidebar();
+    const a = activeId ? sessions.get(activeId) ?? null : null;
+    if (a) renderHeader(a);
+  }
+}
+
+// ---------- external sessions: discovery, jump, read-only transcript ----------
+async function refreshExternals() {
+  try {
+    const list = await invoke<ExtSession[]>("list_external_sessions", { exclude: [...sessions.keys()] });
+    externals = list;
+    if (activeExtId && !externals.some((e) => e.session_id === activeExtId)) {
+      // the mirrored session ended — fall back to a Muster session or the empty state
+      closeExternalView();
+      const next = orderedSessions()[0];
+      if (next) setActive(next.id);
+      else ($("empty") as HTMLElement).style.display = "grid";
+    } else if (activeExtId) {
+      const e = externals.find((x) => x.session_id === activeExtId);
+      if (e) { renderExtHeader(e); renderExtInspector(e); }
+    }
+    renderSidebar(); renderMini();
+  } catch { /* backend not ready yet */ }
+}
+function openExternal(sid: string) {
+  const e = externals.find((x) => x.session_id === sid);
+  if (!e) return;
+  activeExtId = sid;
+  activeId = null;
+  for (const x of sessions.values()) x.pane.classList.remove("active");
+  ($("empty") as HTMLElement).style.display = "none";
+  ($("extPane") as HTMLElement).hidden = false;
+  document.documentElement.style.setProperty("--accent", accentFor(e.cwd));
+  renderExtHeader(e); renderExtInspector(e); renderSidebar(); renderMini(); renderFoot();
+  $("extBody").innerHTML = `<div class="ext-empty">Loading transcript…</div>`;
+  loadTranscript(e, true);
+  clearInterval(extTranscriptTimer);
+  extTranscriptTimer = window.setInterval(() => {
+    const cur = externals.find((x) => x.session_id === activeExtId);
+    if (cur) loadTranscript(cur, false);
+  }, 2500);
+}
+function closeExternalView() {
+  if (activeExtId == null) return;
+  activeExtId = null;
+  clearInterval(extTranscriptTimer);
+  ($("extPane") as HTMLElement).hidden = true;
+}
+function jumpExternal(pid: number) {
+  invoke("focus_external_session", { pid }).catch((e) => toast("jump failed: " + e));
+}
+async function loadTranscript(e: ExtSession, initial: boolean) {
+  try {
+    const msgs = await invoke<{ role: string; text: string }[]>("read_transcript", { cwd: e.cwd, sessionId: e.session_id, limit: 80 });
+    if (activeExtId !== e.session_id) return; // switched away mid-flight
+    renderTranscript(msgs, initial);
+  } catch (err) {
+    if (activeExtId === e.session_id) $("extBody").innerHTML = `<div class="ext-empty">Couldn't read the transcript.<br><span class="mono">${esc(String(err))}</span></div>`;
+  }
+}
+function renderTranscript(msgs: { role: string; text: string }[], initial: boolean) {
+  const body = $("extBody");
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  body.innerHTML = msgs.length
+    ? msgs.map((m) => {
+        const user = m.role === "user";
+        return `<div class="tvmsg ${m.role}"><span class="tvgutter" title="${user ? "You" : "Claude"}">${user ? "❯" : "⏺"}</span><div class="tvtext">${esc(m.text)}</div></div>`;
+      }).join("")
+    : `<div class="ext-empty">No messages in this session yet.</div>`;
+  if (initial || nearBottom) body.scrollTop = body.scrollHeight;
+}
+function renderExtHeader(e: ExtSession) {
+  ($("btnClose") as HTMLButtonElement).hidden = true;
+  $("hProj").textContent = basename(e.cwd);
+  const hb = $("hBranch"); hb.textContent = "external"; hb.hidden = false; hb.classList.add("ext-chip");
+  $("hTitle").textContent = e.name || "";
+  $("hPath").textContent = tilde(e.cwd);
+}
+function renderExtInspector(e: ExtSession) {
+  const working = extWorking(e);
+  const pill = $("iPill"); pill.className = "pill " + (working ? "working" : "idle");
+  $("iPillTxt").textContent = e.status || "external";
+  const started = e.started_at ? new Date(e.started_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–";
+  $("inspector").innerHTML = `
+    <div class="ext-card">
+      <div class="ext-hl">↗ Running outside Muster</div>
+      <div class="ext-meta"><span class="label">Project</span><span>${esc(basename(e.cwd))}</span></div>
+      <div class="ext-meta"><span class="label">Path</span><span class="mono ell">${esc(tilde(e.cwd))}</span></div>
+      <div class="ext-meta"><span class="label">Status</span><span>${esc(e.status || "idle")}</span></div>
+      <div class="ext-meta"><span class="label">Started</span><span>${esc(started)}</span></div>
+      <div class="ext-meta"><span class="label">Claude</span><span>${e.version ? "v" + esc(e.version) : "–"}</span></div>
+      <div class="ext-meta"><span class="label">PID</span><span class="mono">${e.pid}</span></div>
+      <button class="ext-jump-btn" data-jump="${e.pid}">↗ Jump to its terminal</button>
+      <div class="ext-note">Muster can't drive this session — it was launched in another terminal. The panel on the left is a live read-only mirror of its transcript.</div>
+    </div>`;
 }
 
 // ---------- telemetry ----------
-function toolGlyph(tool: string): string {
-  if (tool === "Read") return "◈"; if (tool === "Edit" || tool === "Write") return "✎";
-  if (tool === "Bash") return "▸"; if (tool && tool.startsWith("Task")) return "◻"; return "›";
+// Set the phase and, when it actually changes, stamp phaseSince — the anchor for
+// the inspector's dwell timer ("0:42 in state") and the "your turn" wait clock.
+function setPhase(s: Sess, p: Phase) { if (s.phase !== p) { s.phase = p; s.phaseSince = Date.now(); } }
+// The most meaningful field of a tool call, for the vital header + timeline. Paths
+// collapse to a basename; commands/prompts keep a short preview.
+function toolArg(tool: string, input: any): string {
+  if (!input || typeof input !== "object") return "";
+  const v = input.file_path ?? input.path ?? input.command ?? input.pattern ?? input.url ?? input.query ?? input.prompt ?? input.description;
+  if (typeof v !== "string" || !v.trim()) return "";
+  if ((tool === "Read" || tool === "Edit" || tool === "Write") && v.includes("/")) return v.split("/").pop() || v;
+  return abbr(v, 64);
 }
-function pushActivity(s: Sess, ic: string, t: string, cls: string) {
+// Open a timeline entry on PreToolUse; closeActivity fills its latency on the
+// matching PostToolUse. Matching the most-recent open call of the same tool name
+// is approximate under parallel subagents, but right for the common serial case.
+function openActivity(s: Sess, tool: string, arg: string) {
   const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  s.activity.unshift({ ic, t, time, cls });
-  if (s.activity.length > 9) s.activity.length = 9;
+  s.activity.unshift({ tool, arg, time, startMs: Date.now(), durMs: null });
+  if (s.activity.length > 12) s.activity.length = 12;
 }
+function closeActivity(s: Sess, tool: string) {
+  const a = s.activity.find((x) => x.tool === tool && x.durMs == null);
+  if (a) a.durMs = Date.now() - a.startMs;
+}
+// Claude keeps its own to-do list via the TodoWrite tool; the payload rides the
+// PreToolUse hook we already receive. Capture it as the session's live plan.
+function applyTodos(s: Sess, input: any) {
+  const arr = input?.todos;
+  if (!Array.isArray(arr)) return;
+  s.todos = arr
+    .map((t: any) => ({ content: String(t?.content ?? t?.activeForm ?? ""), status: String(t?.status ?? "pending") }))
+    .filter((t) => t.content);
+}
+function abbr(s: string, n = 160): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > n ? one.slice(0, n - 1) + "…" : one;
+}
+// The abbreviated "what is it asking?" preview shown under the attention header.
+// Pulls the most meaningful field from the tool input (command, file, url, the
+// question/prompt itself…), falling back to the notification message.
 function permCmd(data: any): string {
-  const t = data.tool_name || "tool";
   const inp = data.tool_input || {};
-  if (typeof inp.command === "string") return `${inp.command}   (${t})`;
-  if (typeof inp.file_path === "string") return `${inp.file_path}   (${t})`;
-  return `${t}`;
+  const detail = inp.command ?? inp.file_path ?? inp.path ?? inp.url ?? inp.pattern ??
+    inp.prompt ?? inp.question ?? inp.query ?? inp.description;
+  if (typeof detail === "string" && detail.trim()) return abbr(detail);
+  if (typeof data.message === "string" && data.message.trim()) return abbr(data.message);
+  return "";
+}
+// Fully clear a session's pending-permission/attention state — used both when the
+// user answers via Muster's buttons and when they answer directly in the CLI (in
+// which case a later lifecycle event, not a button, is our signal to reset). If a
+// blocking request is still held server-side, release it so it doesn't leak.
+function clearPending(s: Sess) {
+  if (s.pendingPermId) invoke("resolve_permission", { id: s.pendingPermId, behavior: "terminal" }).catch(() => {});
+  s.attention = null; s.pendingPermId = null; s.pendingCmd = "";
 }
 
 function applyHook(s: Sess, data: any) {
   const ev: string = data.hook_event_name ?? "?";
   s.lastEvent = ev;
+  s.lastActivity = Date.now(); // a lifecycle hook = the session did something (drives "sort by activity")
   const bg = () => s.subagents > 0 || s.phase === "done";
   switch (ev) {
-    case "SessionStart": s.phase = "idle"; s.attention = null; break;
-    case "UserPromptSubmit": s.phase = "thinking"; s.attention = null; break;
-    case "PreToolUse":
-      if (!bg()) { s.phase = "working"; s.attention = null; }
-      pushActivity(s, toolGlyph(data.tool_name), `${data.tool_name || "tool"}`, "");
-      break;
-    case "PostToolUse": if (!bg()) s.phase = "working"; break;
-    case "PostToolUseFailure": if (!bg()) s.phase = "error"; break;
-    case "Stop": s.phase = "done"; s.attention = null; s.pendingPermId = null; break;
-    case "StopFailure": s.phase = "error"; break;
-    case "Notification": {
-      const nt: string = data.notification_type ?? "";
-      if (nt.includes("permission")) s.attention = "permission needed";
-      else if (nt === "idle_prompt") s.phase = "done";
-      else s.attention = nt || "notification";
+    // Lifecycle events past the permission point → the ask was answered (button
+    // OR directly in the CLI), so reset the pending/attention state either way.
+    case "SessionStart": setPhase(s, "idle"); clearPending(s); break;
+    case "UserPromptSubmit": setPhase(s, "thinking"); clearPending(s); s.curTool = ""; s.curArg = ""; break;
+    case "PreToolUse": {
+      const tool = data.tool_name || "tool";
+      const arg = toolArg(tool, data.tool_input);
+      if (tool === "TodoWrite") applyTodos(s, data.tool_input);
+      else openActivity(s, tool, arg); // the plan is its own module; keep it off the timeline
+      if (!bg()) { setPhase(s, "working"); clearPending(s); s.curTool = tool; s.curArg = arg; }
       break;
     }
-    case "PermissionRequest": s.attention = `permission: ${data.tool_name ?? ""}`; s.pendingCmd = permCmd(data); break;
+    case "PostToolUse": closeActivity(s, data.tool_name); if (!bg()) setPhase(s, "working"); break;
+    case "PostToolUseFailure": closeActivity(s, data.tool_name); if (!bg()) setPhase(s, "error"); break;
+    case "Stop": setPhase(s, "done"); clearPending(s); s.curTool = ""; s.curArg = ""; break;
+    case "StopFailure": setPhase(s, "error"); clearPending(s); break;
+    case "SessionEnd": setPhase(s, "ended"); clearPending(s); s.curTool = ""; s.curArg = ""; break;
+    case "Notification": {
+      const nt: string = data.notification_type ?? "";
+      const msg: string = typeof data.message === "string" ? data.message : "";
+      if (nt.includes("permission") || /permission/i.test(msg)) { s.attention = "permission needed"; if (msg) s.pendingCmd = abbr(msg); }
+      else if (nt === "idle_prompt") { setPhase(s, "done"); clearPending(s); }
+      else { s.attention = nt || msg || "notification"; if (msg) s.pendingCmd = abbr(msg); }
+      break;
+    }
+    case "PermissionRequest": s.attention = `permission: ${data.tool_name ?? ""}`; s.pendingCmd = permCmd(data); s.pendRisk = riskLevel(data.tool_name, data.tool_input); break;
     case "SubagentStart": s.subagents++; break;
     case "SubagentStop": s.subagents = Math.max(0, s.subagents - 1); break;
-    case "SessionEnd": s.phase = "ended"; break;
   }
 }
+function pushHist(arr: number[], v: number, cap = 24) { arr.push(v); if (arr.length > cap) arr.splice(0, arr.length - cap); }
 function applyStatusline(s: Sess, data: any) {
+  // A statusLine only fires from a live, interactive session. If this one was
+  // marked "ended" (e.g. a SessionEnd fired on /clear or /compact while the REPL
+  // kept running), the continuing statusLine proves it's alive — clear the stale
+  // ended state. A genuine exit stops statusLines and pty-exit re-ends it.
+  if (s.phase === "ended") setPhase(s, "idle");
   if (data.model?.display_name) s.model = data.model.display_name;
-  const ctx = data.context_window?.used_percentage; if (typeof ctx === "number") s.ctxPct = ctx;
+  const ctx = data.context_window?.used_percentage;
+  if (typeof ctx === "number") { s.ctxPct = ctx; pushHist(s.ctxHist, ctx); }
+  const tok = data.context_window?.used_tokens ?? data.context_window?.tokens;
+  if (typeof tok === "number") s.ctxTokens = tok;
   const cost = data.cost?.total_cost_usd;
-  if (typeof cost === "number") { addUsage(cost - (s.cost ?? 0)); s.cost = cost; }
+  if (typeof cost === "number") { addUsage(cost - (s.cost ?? 0)); s.cost = cost; pushHist(s.costHist, cost); }
   const dur = data.cost?.total_duration_ms; if (typeof dur === "number") s.durMs = dur;
   const r5 = data.rate_limits?.five_hour;
-  if (r5) { if (typeof r5.used_percentage === "number") s.rl5h = r5.used_percentage; if (typeof r5.resets_at === "number") s.rl5hReset = r5.resets_at; }
+  if (r5) [rl.h5, rl.h5Reset] = mergeRl(rl.h5, rl.h5Reset, r5.used_percentage, r5.resets_at);
   const r7 = data.rate_limits?.seven_day;
-  if (r7) { if (typeof r7.used_percentage === "number") s.rl7d = r7.used_percentage; if (typeof r7.resets_at === "number") s.rl7dReset = r7.resets_at; }
-  const wt = data.workspace?.git_worktree; if (wt) { s.worktree = wt; s.branch = wt; }
+  if (r7) [rl.d7, rl.d7Reset] = mergeRl(rl.d7, rl.d7Reset, r7.used_percentage, r7.resets_at);
+  // Keep the worktree flag if the statusline reports one, but the branch label
+  // itself comes from the live git HEAD poll (refreshBranches), not this field —
+  // otherwise the two fight and the label flickers.
+  const wt = data.workspace?.git_worktree; if (wt) s.worktree = wt;
 }
 
 // ---------- rendering ----------
-function projectList() {
-  const list = FAVORITES.map((f) => ({ name: f.name, path: f.path, accent: accentFor(f.path), sessions: [] as Sess[] }));
+interface ProjGroup { name: string; path: string; accent: string; sessions: Sess[]; externals: ExtSession[] }
+function projectList(): ProjGroup[] {
+  const list: ProjGroup[] = FAVORITES.map((f) => ({ name: f.name, path: f.path, accent: accentFor(f.path), sessions: [], externals: [] }));
   const byName = new Map(list.map((p) => [p.name, p]));
+  const byPath = new Map(list.map((p) => [p.path, p]));
   for (const s of sessions.values()) {
-    let p = byName.get(s.project);
-    if (!p) { p = { name: s.project, path: s.colorKey, accent: accentFor(s.colorKey), sessions: [] }; list.push(p); byName.set(s.project, p); }
+    let p = byName.get(s.project) || byPath.get(s.colorKey);
+    if (!p) { p = { name: s.project, path: s.colorKey, accent: accentFor(s.colorKey), sessions: [], externals: [] }; list.push(p); byName.set(s.project, p); byPath.set(s.colorKey, p); }
     p.sessions.push(s);
+  }
+  for (const e of externals) {
+    let p = byPath.get(e.cwd);
+    if (!p) { p = { name: basename(e.cwd), path: e.cwd, accent: accentFor(e.cwd), sessions: [], externals: [] }; list.push(p); byPath.set(e.cwd, p); byName.set(p.name, p); }
+    p.externals.push(e);
+  }
+  if (sortMode === "active") {
+    for (const p of list) p.sessions.sort((a, b) => b.lastActivity - a.lastActivity);
+    list.sort((a, b) => projActivity(b) - projActivity(a));
+  } else if (sortMode === "attention") {
+    for (const p of list) p.sessions.sort((a, b) => urgencyRank(a) - urgencyRank(b) || a.phaseSince - b.phaseSince);
+    list.sort((a, b) => projUrgency(a) - projUrgency(b) || projWaitSince(a) - projWaitSince(b));
+  } else {
+    // manual: the user's drag-drop order; unlisted projects keep their natural
+    // order after listed ones (stable sort preserves ties).
+    const rank = (path: string) => { const i = projOrder.indexOf(path); return i === -1 ? Number.MAX_SAFE_INTEGER : i; };
+    list.sort((a, b) => rank(a.path) - rank(b.path));
   }
   return list;
 }
+// How much a session wants the user's attention (lower = more urgent). Shared by
+// the sidebar's "attention" sort and the header reactor.
+function urgencyRank(s: Sess): number {
+  if (s.shell) return 6;
+  if (s.attention) return 0;         // blocking permission — Claude is waiting on you
+  if (s.phase === "error") return 1;
+  if (s.phase === "done") return 2;  // your turn
+  if (s.phase === "working" || s.phase === "thinking") return 3;
+  if (s.phase === "idle") return 4;
+  return 5;                          // ended
+}
+function projActivity(p: ProjGroup): number { return p.sessions.reduce((m, s) => Math.max(m, s.lastActivity), 0); }
+function projUrgency(p: ProjGroup): number { return p.sessions.reduce((m, s) => Math.min(m, urgencyRank(s)), 99); }
+function projWaitSince(p: ProjGroup): number { return p.sessions.reduce((m, s) => Math.min(m, s.phaseSince), Number.MAX_SAFE_INTEGER); }
 function orderedSessions(): Sess[] { return projectList().flatMap((p) => p.sessions); }
+// When the active session is closed, decide which one takes over. Prefer staying in
+// the same project — the sibling directly above (as shown in the sidebar), else the
+// one below — and only leave the project (nearest session in sidebar order) once it
+// has no sessions left. Must be called BEFORE the session is removed from the map.
+function nextAfterClose(s: Sess): Sess | null {
+  const g = projectList().find((p) => p.sessions.includes(s));
+  if (g) {
+    const gi = g.sessions.indexOf(s);
+    const sib = g.sessions[gi - 1] || g.sessions[gi + 1];
+    if (sib) return sib;
+  }
+  const flat = orderedSessions();
+  const fi = flat.indexOf(s);
+  return flat[fi + 1] || flat[fi - 1] || null;
+}
 
 function sessionRow(s: Sess): string {
   const k = statusKey(s);
-  const label = s.worktree ? `⑃ ${s.branch}` : (s.branch || "session");
+  // Prefer the abbreviated title; fall back to the branch/worktree only until
+  // Claude sets a title, so idle rows stay identifiable. (Branch is kept in the
+  // stage header — dropped here to save sidebar space.)
+  const label = s.title || (s.worktree ? `⑃ ${s.branch}` : (s.branch || "session"));
+  // shells have no telemetry phase — show a terminal prompt glyph (a dot once exited)
+  const glyph = s.shell ? (s.phase === "ended" ? GLYPH.ended : "❯") : GLYPH[k];
+  const gcls = s.shell ? (s.phase === "ended" ? GCLASS.ended : "g-idle") : GCLASS[k];
   return `<div class="srow ${s.id === activeId ? "active" : ""}" data-sel="${s.id}">
-    <span class="sglyph ${GCLASS[k]}">${GLYPH[k]}</span>
-    <span class="sbranch">${esc(label)}</span>
+    <span class="sglyph ${gcls}">${glyph}</span>
+    <span class="sbranch" title="${esc(label)}">${esc(label)}</span>
     <span class="sctx">${s.ctxPct != null ? Math.round(s.ctxPct) + "%" : ""}</span>
-    <span class="scost">${s.cost != null ? "$" + s.cost.toFixed(2) : ""}</span>
     <span class="sclose" data-close="${s.id}" title="Close session">✕</span></div>`;
 }
+function extRow(e: ExtSession): string {
+  const working = extWorking(e);
+  return `<div class="srow extrow ${e.session_id === activeExtId ? "active" : ""}" data-ext="${e.session_id}" data-key="${esc(e.cwd)}">
+    <span class="sglyph ${working ? "g-work" : "g-idle"}">${working ? "●" : "○"}</span>
+    <span class="sbranch">${esc(e.name || basename(e.cwd))}</span>
+    <span class="ext-tag" title="Running outside Muster · Claude v${esc(e.version)} · pid ${e.pid}">ext</span>
+    <span class="sjump" data-jump="${e.pid}" title="Jump to its terminal ↗">↗</span></div>`;
+}
 function renderSidebar() {
-  $("liveCount").textContent = sessions.size + (sessions.size === 1 ? " running" : " running");
+  $("liveCount").textContent = sessions.size + " running";
+  // Don't stomp the DOM the browser is mid-drag on — see draggingProjects.
+  if (draggingProjects) return;
   $("projects").innerHTML = projectList().map((p) => {
-    const rows = p.sessions.map(sessionRow).join("");
-    const head = p.sessions.length
-      ? `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount">${p.sessions.length}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`
-      : `<div class="phead empty-p" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="plaunch">launch →</span><span class="premove" data-remove="${esc(p.path)}" title="Remove project">✕</span></div>`;
-    return `<div class="pgroup">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
+    const rows = p.sessions.map(sessionRow).join("") + p.externals.map(extRow).join("");
+    const total = p.sessions.length + p.externals.length;
+    const isFav = FAVORITES.some((f) => f.path === p.path);
+    let head: string;
+    if (p.sessions.length) {
+      head = `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount">${total}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`;
+    } else if (isFav) {
+      const tail = p.externals.length ? `<span class="pcount ext">${p.externals.length} ext</span>` : `<span class="plaunch">launch →</span>`;
+      head = `<div class="phead empty-p" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${tail}<span class="premove" data-remove="${esc(p.path)}" title="Remove project">✕</span></div>`;
+    } else {
+      // discovered via an external session only — not a saved project
+      head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount ext">${p.externals.length} ext</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch a Muster session here">＋</span></div>`;
+    }
+    return `<div class="pgroup" draggable="true" data-path="${esc(p.path)}">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
   }).join("");
+}
+// Drag-drop reordering of project groups. Delegated on the persistent #projects
+// container so it survives re-renders; the new order is persisted by path.
+// A separator line (.dropmark) shows where the group will land; the dragged group
+// is only physically moved on drop, then the DOM order is read back and saved.
+// NB: this only works because the window sets dragDropEnabled:false in
+// tauri.conf.json — otherwise the webview's native handler eats dragover/drop.
+function initProjectDnD() {
+  const container = $("projects");
+  let dragEl: HTMLElement | null = null;
+  const marker = document.createElement("div");
+  marker.className = "dropmark";
+
+  const cleanup = () => {
+    marker.remove();
+    container.classList.remove("reordering");
+    dragEl?.classList.remove("dragging");
+    dragEl = null;
+    draggingProjects = false;
+  };
+
+  container.addEventListener("dragstart", (e) => {
+    const g = (e.target as HTMLElement).closest<HTMLElement>(".pgroup");
+    if (!g) return;
+    dragEl = g;
+    draggingProjects = true;
+    container.classList.add("reordering");
+    g.classList.add("dragging");
+    e.dataTransfer!.effectAllowed = "move";
+    try { e.dataTransfer!.setData("text/plain", g.dataset.path || ""); } catch { /* */ }
+  });
+
+  container.addEventListener("dragover", (e) => {
+    if (!dragEl) return;
+    e.preventDefault();
+    e.dataTransfer!.dropEffect = "move";
+    const over = (e.target as HTMLElement).closest<HTMLElement>(".pgroup");
+    if (!over || over === dragEl) return;
+    const r = over.getBoundingClientRect();
+    const after = e.clientY > r.top + r.height / 2;
+    container.insertBefore(marker, after ? over.nextSibling : over);
+  });
+
+  // Drop: slot the dragged group in at the marker, read the new order, persist.
+  container.addEventListener("drop", (e) => {
+    if (!dragEl) return;
+    e.preventDefault();
+    if (marker.parentNode) container.insertBefore(dragEl, marker);
+    cleanup();
+    projOrder = [...container.querySelectorAll<HTMLElement>(".pgroup")].map((el) => el.dataset.path!).filter(Boolean);
+    saveProjOrder();
+    // A manual drag captures the current visual order and reasserts manual mode
+    // (in a sorted mode the drag would otherwise be immediately overridden).
+    if (sortMode !== "manual") setSort("manual", false);
+    renderAll();
+  });
+
+  // dragend fires after drop (no-op then) and on cancel (just clean up, no reorder).
+  container.addEventListener("dragend", () => { if (draggingProjects) { cleanup(); renderAll(); } });
 }
 function renderMini() {
   const activeProj = activeId ? sessions.get(activeId)?.project : null;
@@ -323,85 +785,284 @@ function renderMini() {
     `<button class="rm-btn" data-rail="1" title="Expand sidebar (⌘B)">»</button>` +
     projectList().map((p) => {
       const first = p.sessions[0];
+      const firstExt = p.externals[0];
       const attn = p.sessions.some((s) => s.attention || s.phase === "error");
-      const sel = first ? `data-sel="${first.id}"` : `data-launch="${esc(p.path)}" data-proj="${esc(p.name)}"`;
+      const sel = first ? `data-sel="${first.id}"`
+        : firstExt ? `data-ext="${firstExt.session_id}"`
+        : `data-launch="${esc(p.path)}" data-proj="${esc(p.name)}"`;
       const ic = iconFor(p.path);
       const glyph = ic ? `<img class="rm-icon" src="${ic}" alt="" />` : `<span class="rm-dot"></span>`;
-      return `<button class="rm-proj ${p.name === activeProj ? "on" : ""}" style="--rc:${p.accent}" title="${esc(p.name)}" data-key="${esc(p.path)}" ${sel}>${glyph}${attn ? '<span class="rm-badge"></span>' : ""}</button>`;
+      const onCls = p.name === activeProj || (activeExtId && p.externals.some((e) => e.session_id === activeExtId)) ? "on" : "";
+      const extOnly = !first && firstExt ? "ext" : "";
+      return `<button class="rm-proj ${onCls} ${extOnly}" style="--rc:${p.accent}" title="${esc(p.name)}${extOnly ? " (external)" : ""}" data-key="${esc(p.path)}" ${sel}>${glyph}${attn ? '<span class="rm-badge"></span>' : ""}</button>`;
     }).join("") +
     `<button class="rm-btn rm-add" data-pal="1" title="New session (⌘K)">＋</button>`;
 }
 function renderHeader(s: Sess | null) {
   ($("btnClose") as HTMLButtonElement).hidden = !s;
-  if (!s) { $("hProj").textContent = "no session"; $("hBranch").hidden = true; $("hTitle").textContent = ""; $("hPath").textContent = ""; return; }
+  const hb = $("hBranch"); hb.classList.remove("ext-chip");
+  if (!s) { $("hProj").textContent = "no session"; hb.hidden = true; $("hTitle").textContent = ""; $("hPath").textContent = ""; return; }
   $("hProj").textContent = s.project;
-  const hb = $("hBranch");
-  if (s.branch) { hb.textContent = s.worktree ? "⑃ " + s.branch : s.branch; hb.hidden = false; } else hb.hidden = true;
-  $("hTitle").textContent = s.title || "";
+  if (s.shell) { hb.textContent = "shell"; hb.hidden = false; hb.classList.add("ext-chip"); }
+  else if (s.branch) { hb.textContent = s.worktree ? "⑃ " + s.branch : s.branch; hb.hidden = false; } else hb.hidden = true;
+  $("hTitle").textContent = s.shell ? "" : (s.title || "");
   $("hPath").textContent = tilde(s.workdir);
 }
 function fmtDur(ms: number) {
   const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
   return h > 0 ? `${h}h ${m}m` : `${m}m ${String(ss).padStart(2, "0")}s`;
 }
-function fmtReset(ts: number | null): string {
-  if (!ts) return "";
-  const ms = ts * 1000 - Date.now();
-  if (ms <= 0) return "resetting…";
-  const mins = Math.round(ms / 60000);
-  if (mins < 60) return `resets in ${mins}m`;
-  const h = Math.floor(mins / 60), m = mins % 60;
-  return m ? `resets in ${h}h ${m}m` : `resets in ${h}h`;
-}
-function resetHtml(ts: number | null): string { const t = fmtReset(ts); return t ? ` <span class="rst">· ${t}</span>` : ""; }
+// Absolute wall-clock time of a reset (epoch seconds) — "15:45" / "3:45 PM".
+function fmtClock(ts: number): string { return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
 const mc = (v: number) => (v >= 80 ? "hot" : v >= 55 ? "warn" : "");
+function renderShellInspector(s: Sess) {
+  const ended = s.phase === "ended";
+  const pill = $("iPill"); pill.className = "pill " + (ended ? "ended" : "idle");
+  $("iPillTxt").textContent = ended ? "exited" : "shell";
+  $("inspector").innerHTML = `
+    <div class="ext-card">
+      <div class="ext-hl">❯ Plain shell</div>
+      <div class="ext-meta"><span class="label">Project</span><span>${esc(s.project)}</span></div>
+      <div class="ext-meta"><span class="label">Path</span><span class="ell" title="${esc(tilde(s.workdir))}">${esc(tilde(s.workdir))}</span></div>
+      <div class="ext-note">A regular login shell running inside Muster — no Claude, no telemetry. Handy for commands you don't want to run inside a session.</div>
+    </div>`;
+}
+// ---- inspector: shared helpers for the redesigned modules ----
+const TOOL_VERB: Record<string, string> = { Read: "Reading", Edit: "Editing", Write: "Writing", Bash: "Running", Grep: "Searching", Glob: "Searching", WebFetch: "Browsing", WebSearch: "Searching", TodoWrite: "Planning" };
+function toolVerb(tool: string): string {
+  if (!tool) return "Working";
+  if (tool.startsWith("Task")) return "Delegating";
+  if (tool.startsWith("mcp__")) return "Calling tool";
+  return TOOL_VERB[tool] || "Working";
+}
+// Maps a tool to the CSS colour class that tints its dot / name / verb.
+function toolClass(tool: string): string {
+  if (!tool) return "";
+  if (tool === "Read" || tool === "Grep" || tool === "Glob") return "t-read";
+  if (tool === "Edit" || tool === "Write" || tool === "NotebookEdit") return "t-edit";
+  if (tool === "Bash") return "t-bash";
+  if (tool.startsWith("Task")) return "t-task";
+  if (tool === "WebFetch" || tool === "WebSearch") return "t-web";
+  return "t-mcp";
+}
+// Heuristic risk for a pending permission — informs the badge, not the decision.
+function riskLevel(tool: string, input: any): Risk {
+  const cmd = typeof input?.command === "string" ? input.command : "";
+  if (tool === "Bash") {
+    if (/(^|\s)(sudo|rm\s+-[rf]|rmdir|mkfs|dd|shutdown|reboot|kill(all)?)\b|git\s+clean|--force\b|--hard\b|-fdx\b|>\s*\/dev\/|:\(\)\s*\{|chmod\s+-R|curl[^|]*\|\s*(sh|bash)|npm\s+publish|git\s+push/i.test(cmd)) return "high";
+    return "med";
+  }
+  if (tool === "Write" || tool === "Edit" || tool === "NotebookEdit") return "med";
+  if (tool === "Read" || tool === "Grep" || tool === "Glob" || tool === "WebFetch" || tool === "WebSearch") return "low";
+  return "med";
+}
+const RISK_LABEL: Record<Risk, string> = { low: "low risk", med: "review", high: "high risk" };
+// Compact seconds → "M:SS" (under an hour) / "Hh Mm" — the dwell + wait clocks.
+function fmtDwell(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}:${String(ss).padStart(2, "0")}`;
+}
+function fmtLatency(ms: number): string { return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : Math.round(ms) + "ms"; }
+function verbFor(s: Sess): string {
+  if (s.phase === "thinking") return "Thinking";
+  if (s.phase === "working") return toolVerb(s.curTool);
+  if (s.phase === "done") return "Your turn";
+  if (s.phase === "error") return "Error";
+  if (s.phase === "ended") return "Ended";
+  return "Idle";
+}
+// Live text under the state name — recomputed each second by tickTimers().
+function dwellText(s: Sess): string {
+  if (s.phase === "ended") return "session ended";
+  const d = fmtDwell(Date.now() - s.phaseSince);
+  if (s.phase === "done") return `waiting ${d}`;
+  if (s.phase === "idle") return `idle ${d}`;
+  if (s.phase === "error") return `${d} ago`;
+  return `${d} in state`;
+}
+// True when this is the "your turn" session that's been blocked longest — the one
+// to jump to first. Only meaningful when several are waiting.
+function isLongestWaiting(s: Sess): boolean {
+  const waiting = [...sessions.values()].filter((x) => x.phase === "done" && !x.shell && !x.attention);
+  return waiting.length > 1 && waiting.every((x) => x.id === s.id || x.phaseSince >= s.phaseSince);
+}
+// A mini area+line sparkline as an inline SVG. Fixed intrinsic size so the endpoint
+// dot stays round; scales down within its card. `lo`/`hi` pin the domain (context
+// uses 0–100; cost uses 0–max) so the curve reflects absolute fill, not just shape.
+function sparkline(vals: number[], opts: { lo?: number; hi?: number } = {}): string {
+  const w = 108, h = 24, pad = 3;
+  if (vals.length < 2) return "";
+  const lo = opts.lo ?? Math.min(...vals);
+  let hi = opts.hi ?? Math.max(...vals);
+  if (hi <= lo) hi = lo + 1;
+  const n = vals.length;
+  const px = (i: number) => (i / (n - 1)) * (w - pad);
+  const py = (v: number) => h - pad - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo)) * (h - pad * 2);
+  const pts = vals.map((v, i) => `${px(i).toFixed(1)},${py(v).toFixed(1)}`);
+  const line = "M" + pts.join(" L");
+  const area = `${line} L${px(n - 1).toFixed(1)},${h} L0,${h} Z`;
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}"><path class="spk-a" d="${area}"></path><path class="spk-l" d="${line}"></path><circle class="spk-d" cx="${px(n - 1).toFixed(1)}" cy="${py(vals[n - 1]).toFixed(1)}" r="2.1"></circle></svg>`;
+}
+function compactWarn(pct: number | null): { txt: string; cls: string } | null {
+  if (pct == null) return null;
+  if (pct >= 90) return { txt: "auto-compact imminent", cls: "hot" };
+  if (pct >= 78) return { txt: "approaching auto-compact", cls: "warn" };
+  return null;
+}
+
+// ---- inspector: per-module HTML builders (act → track → reference) ----
+function vitalHtml(s: Sess): string {
+  const sk = statusKey(s);
+  const live = (s.phase === "working" || s.phase === "thinking") && !s.attention;
+  const verb = s.attention ? "Needs you" : verbFor(s);
+  const tcls = (!s.attention && s.phase === "working") ? toolClass(s.curTool) : "";
+  const doing = (!s.attention && s.phase === "working" && s.curTool)
+    ? `<div class="doing"><span class="tk ${toolClass(s.curTool)}">${esc(s.curTool)}</span>${s.curArg ? `<code>${esc(s.curArg)}</code>` : ""}</div>` : "";
+  const chips = [s.model ? esc(s.model) : "", s.subagents ? `${s.subagents} subagent${s.subagents > 1 ? "s" : ""}` : ""]
+    .filter(Boolean).map((c) => `<span class="chip-s">${c}</span>`).join("");
+  const longest = s.phase === "done" && isLongestWaiting(s) ? `<span class="chip-s hot">longest waiting</span>` : "";
+  const meta = chips || longest ? `<div class="vmeta">${chips}${longest}</div>` : "";
+  return `<div class="vital st-${sk}">
+    <div class="vtop"><span class="heart ${live ? "" : "still"}"></span><span class="vstate ${tcls}">${verb}</span><span class="dwell" id="iDwell">${esc(dwellText(s))}</span></div>
+    ${doing}${meta}</div>`;
+}
+function gaugesHtml(s: Sess): string {
+  const ctx = s.ctxPct;
+  const warn = compactWarn(ctx);
+  const ctxSpark = sparkline(s.ctxHist, { lo: 0, hi: 100 });
+  const costSpark = sparkline(s.costHist, { lo: 0 });
+  const tokTxt = s.ctxTokens != null ? `${Math.round(s.ctxTokens / 1000)}k tokens` : "context";
+  const ctxFoot = warn ? `<div class="warn-line ${warn.cls}">${warn.txt}</div>` : (ctxSpark ? `<div class="gspark">${ctxSpark}</div>` : "");
+  const costFoot = costSpark ? `<div class="gspark">${costSpark}</div>` : "";
+  return `<div class="gauges">
+    <div class="gauge">
+      <div class="grow"><svg class="mini-ring" viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="15"></circle><circle class="fil" cx="20" cy="20" r="15" pathLength="100" stroke-dasharray="${Math.max(0, Math.min(100, ctx ?? 0))} 100"></circle></svg><div><div class="gnum">${ctx != null ? Math.round(ctx) + "%" : "–"}</div><div class="glab">${tokTxt}</div></div></div>
+      ${ctxFoot}
+    </div>
+    <div class="gauge">
+      <div class="grow"><div><div class="gnum">${s.cost != null ? "$" + s.cost.toFixed(2) : "–"}</div><div class="glab">${s.durMs != null ? fmtDur(s.durMs) : "cost"}</div></div></div>
+      ${costFoot}
+    </div>
+  </div>`;
+}
+function planHtml(s: Sess): string {
+  const done = s.todos.filter((t) => t.status === "completed").length, total = s.todos.length;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const rows = s.todos.slice(0, 5).map((t) => {
+    const cls = t.status === "completed" ? "done" : t.status === "in_progress" ? "now" : "";
+    return `<div class="todo ${cls}"><span class="bx"></span><span class="tx">${esc(t.content)}</span></div>`;
+  }).join("");
+  const more = total > 5 ? `<div class="todo-more">+${total - 5} more</div>` : "";
+  return `<div class="plan"><div class="ph"><span class="lab">Plan</span><span class="frac">${done} / ${total}</span></div><div class="pbar"><i style="width:${pct}%"></i></div>${rows}${more}</div>`;
+}
+function wsetHtml(s: Sess): string {
+  const g = s.git!;
+  const tot = g.added + g.removed || 1;
+  const aw = Math.round((g.added / tot) * 100);
+  const newBadge = g.untracked ? `<span class="unc">${g.untracked} new</span>` : "";
+  return `<div class="wset">
+    <div class="wtop"><span class="add">+${g.added}</span><span class="del">−${g.removed}</span><span class="files">${g.files} file${g.files === 1 ? "" : "s"}</span></div>
+    <div class="stackbar"><span class="sa" style="width:${aw}%"></span><span class="sd" style="width:${100 - aw}%"></span></div>
+    <div class="branch"><span>${s.worktree ? "⑃ " : ""}<span class="b">${esc(s.branch || "—")}</span></span>${newBadge}</div></div>`;
+}
+function timelineHtml(s: Sess): string {
+  const acts = s.activity.slice(0, 8);
+  if (!acts.length) return `<div><div class="lab" style="margin-bottom:6px">Activity</div><div class="insp-empty" style="padding:12px 0">No activity yet.</div></div>`;
+  const maxDur = Math.max(1, ...acts.map((a) => a.durMs ?? 0));
+  const rows = acts.map((a) => {
+    const cls = toolClass(a.tool);
+    const running = a.durMs == null;
+    const w = running ? 100 : Math.max(6, Math.round(((a.durMs ?? 0) / maxDur) * 100));
+    const ms = running ? "···" : fmtLatency(a.durMs!);
+    return `<div class="row"><span class="dot ${cls}"></span><span class="nm ${cls}">${esc(a.tool)}</span><span class="arg">${esc(a.arg)}</span><span class="lat"><span class="latbar ${running ? "run" : ""}" style="width:${w}%"></span><span class="ms">${ms}</span></span></div>`;
+  }).join("");
+  return `<div><div class="lab" style="margin-bottom:6px">Activity · by tool</div><div class="tl2">${rows}</div></div>`;
+}
+function resHtml(s: Sess): string {
+  const r = s.res!;
+  const cpu = Math.min(100, r.cpu), memPct = Math.min(100, (r.memMb / 2048) * 100);
+  return `<div class="res">
+    <div class="rr"><span class="rk">cpu</span><span class="rbar ${mc(cpu)}"><i style="width:${cpu}%"></i></span><span class="rv">${r.cpu.toFixed(0)}%</span></div>
+    <div class="rr"><span class="rk">mem</span><span class="rbar ${mc(memPct)}"><i style="width:${memPct}%"></i></span><span class="rv">${r.memMb.toFixed(0)} MB</span></div></div>`;
+}
 function renderInspector(s: Sess | null) {
+  if (s?.shell) { renderShellInspector(s); return; }
   const pill = $("iPill"); const k = s ? statusKey(s) : "idle";
   pill.className = "pill " + k;
   $("iPillTxt").textContent = s ? (s.attention ? s.attention : PILL_TEXT[s.phase]) : "–";
   if (!s) { $("inspector").innerHTML = `<div class="insp-empty">No session selected.</div>`; return; }
 
-  const permBtns = s.pendingPermId
-    ? `<div class="attn-btns"><button class="allow" data-perm="allow" data-permid="${s.pendingPermId}">Allow</button><button data-perm="deny" data-permid="${s.pendingPermId}">Deny</button><button data-perm="terminal" data-permid="${s.pendingPermId}">In terminal</button></div>`
-    : "";
-  const attn = s.attention ? `<div class="attn"><div class="attn-h">🔔 ${esc(s.attention)}</div>${s.pendingCmd ? `<code>${esc(s.pendingCmd)}</code>` : ""}${permBtns}</div>` : "";
-  const ctx = s.ctxPct ?? 0;
-  const rl5 = s.rl5h, rl7 = s.rl7d;
-  const activity = s.activity.length
-    ? s.activity.map((a) => `<div class="tl"><span class="tl-ic ${a.cls}">${a.ic}</span><span class="tl-t">${a.t}</span><span class="tl-time">${a.time}</span></div>`).join("")
-    : `<div class="insp-empty" style="padding:14px 0">No activity yet.</div>`;
-
-  $("inspector").innerHTML = `${attn}
-    <div class="ring-wrap lit"><svg class="ring" viewBox="0 0 40 40"><circle class="trk" cx="20" cy="20" r="16"></circle><circle class="fil" cx="20" cy="20" r="16" pathLength="100" stroke-dasharray="${ctx} 100"></circle></svg><div class="ring-info"><div class="big">${s.ctxPct != null ? Math.round(s.ctxPct) + "%" : "–"}</div><div class="sub">context window</div></div></div>
-    <div class="grid2">
-      <div class="stat lit"><span class="label">Cost</span><span class="v">${s.cost != null ? "$" + s.cost.toFixed(4) : "–"}</span></div>
-      <div class="stat lit"><span class="label">Elapsed</span><span class="v" style="font-size:13px">${s.durMs != null ? fmtDur(s.durMs) : "–"}</span></div>
-      <div class="stat lit"><span class="label">Model</span><span class="v" style="font-size:12px">${esc(s.model || "–")}</span></div>
-      <div class="stat lit"><span class="label">Background</span><span class="v">${s.subagents}<small> subs</small></span></div>
-    </div>
-    <div><div class="label" style="margin-bottom:8px">Rate limits</div><div class="meters">
-      <div class="mrow"><div class="mtop"><span>5-hour${resetHtml(s.rl5hReset)}</span><b>${rl5 != null ? Math.round(rl5) + "%" : "–"}</b></div><div class="meter ${rl5 != null ? mc(rl5) : ""}"><i style="width:${rl5 ?? 0}%"></i></div></div>
-      <div class="mrow"><div class="mtop"><span>7-day${resetHtml(s.rl7dReset)}</span><b>${rl7 != null ? Math.round(rl7) + "%" : "–"}</b></div><div class="meter ${rl7 != null ? mc(rl7) : ""}"><i style="width:${rl7 ?? 0}%"></i></div></div>
-    </div></div>
-    <div><div class="label" style="margin-bottom:5px">Recent activity</div><div class="timeline">${activity}</div></div>`;
+  const html: string[] = [];
+  // ACT — a pending permission is the only thing that should ever jump the queue.
+  if (s.attention) {
+    const risk = s.pendingPermId && s.pendRisk ? `<span class="risk ${s.pendRisk}">${RISK_LABEL[s.pendRisk]}</span>` : "";
+    const permBtns = s.pendingPermId
+      ? `<div class="attn-btns"><button class="allow" data-perm="allow" data-permid="${s.pendingPermId}">Allow</button><button data-perm="deny" data-permid="${s.pendingPermId}">Deny</button><button data-perm="terminal" data-permid="${s.pendingPermId}">In terminal</button></div>`
+      : "";
+    html.push(`<div class="attn"><div class="attn-h">🔔 ${esc(s.attention)}${risk}</div>${s.pendingCmd ? `<code>${esc(s.pendingCmd)}</code>` : ""}${permBtns}</div>`);
+  }
+  html.push(vitalHtml(s));                                        // state, dwell, current tool
+  html.push(gaugesHtml(s));                                       // TRACK — context + cost
+  if (s.todos.length) html.push(planHtml(s));                     // the plan it's keeping
+  if (s.git && (s.git.files || s.git.untracked)) html.push(wsetHtml(s)); // what's changed on disk
+  html.push(timelineHtml(s));                                     // activity, by tool
+  if (s.res) html.push(resHtml(s));                              // REFERENCE — cpu/mem, pinned to the bottom
+  $("inspector").innerHTML = html.join("");
 }
 function renderFoot() {
   const total = usage[todayKey()] || 0;
-  const s = activeId ? sessions.get(activeId) : null;
-  $("fProj").textContent = s ? s.project : "–";
-  ($("fDot") as HTMLElement).style.background = s ? accentFor(s.colorKey) : "var(--muted-2)";
   $("fSessions").textContent = String(sessions.size);
   $("fCost").textContent = "$" + total.toFixed(2);
-  const rls = [...sessions.values()].map((x) => x.rl5h).filter((v): v is number => v != null);
-  $("fRl").textContent = rls.length ? Math.round(Math.max(...rls)) + "%" : "–";
-  $("fEngine").textContent = termEngine === "ghostty" ? "Ghostty" : "embedded";
+  const r = rlPct(rl.h5, rl.h5Reset);
+  $("fRl").textContent = r != null ? Math.round(r) + "%" : "–";
+  const r7 = rlPct(rl.d7, rl.d7Reset);
+  $("fRl7").textContent = r7 != null ? Math.round(r7) + "%" : "–";
+  const reset = rlReset(rl.h5Reset);
+  $("fRlReset").textContent = reset != null ? ` · resets ${fmtClock(reset)}` : "";
+  $("fEngine").textContent = engineDef(termEngine).label;
 }
+// The fleet's "needs you" set — sessions with a blocking permission, an error, or
+// finished and awaiting your reply — most urgent first (waiting wins), longest in
+// that state first. Independent of the sidebar sort so the reactor is stable.
+function needsYou(s: Sess): boolean { return !s.shell && (!!s.attention || s.phase === "done" || s.phase === "error"); }
+function needsYouSessions(): Sess[] {
+  return [...sessions.values()].filter(needsYou).sort((a, b) => urgencyRank(a) - urgencyRank(b) || a.phaseSince - b.phaseSince);
+}
+function reactorState(s: Sess): "attention" | "error" | "done" { return s.attention ? "attention" : s.phase === "error" ? "error" : "done"; }
+function reactorLabel(dom: "attention" | "error" | "done", n: number): string {
+  if (dom === "attention") return `${n} need${n === 1 ? "s" : ""} you`;
+  if (dom === "error") return `${n} error${n === 1 ? "" : "s"}`;
+  return `${n} your turn`;
+}
+// Header "reactor": one rollup of the fleet's most-urgent state. Clicking it jumps
+// straight to the longest-waiting session in that state (a picker if several).
 function renderAttn() {
-  const n = [...sessions.values()].filter((s) => s.attention).length;
+  const list = needsYouSessions();
   const b = $("attnBadge");
-  if (n > 0) { b.classList.add("show"); $("attnBadgeTxt").textContent = `${n} need${n === 1 ? "s" : ""} you`; }
-  else b.classList.remove("show");
+  if (!list.length) { b.className = "attn-badge"; closeAttnPop(); return; }
+  const dom = reactorState(list[0]);
+  const n = list.filter((s) => reactorState(s) === dom).length;
+  b.className = `attn-badge show react-${dom}${list.length > 1 ? " multi" : ""}`;
+  $("attnBadgeTxt").textContent = reactorLabel(dom, n);
+  if ($("attnPop").classList.contains("show")) { if (list.length > 1) openAttnPop(list); else closeAttnPop(); }
 }
+// Click the reactor → jump to the session; if several need you, a dropdown lists
+// project + title + reason so you can pick which to jump to.
+function badgeLabel(s: Sess) { return s.title || (s.worktree ? `⑃ ${s.branch}` : (s.branch || "session")); }
+function openAttnPop(list: Sess[]) {
+  const r = $("attnBadge").getBoundingClientRect();
+  const pop = $("attnPop");
+  pop.innerHTML = list.map((s) => {
+    const k = statusKey(s);
+    const reason = s.attention || PILL_TEXT[s.phase];
+    return `<button class="ap-item" data-sel="${s.id}"><span class="ap-dot ${GCLASS[k]}">${GLYPH[k]}</span><span class="ap-main"><span class="ap-proj">${esc(s.project)}</span><span class="ap-ttl">${esc(badgeLabel(s))}</span></span><span class="ap-reason ${GCLASS[k]}">${esc(abbr(reason, 42))}</span></button>`;
+  }).join("");
+  pop.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+  pop.style.left = "auto";
+  pop.style.top = (r.bottom + 6) + "px";
+  pop.classList.add("show");
+}
+function closeAttnPop() { $("attnPop").classList.remove("show"); }
 // ---------- macOS menu-bar (tray) mirror of the sidebar ----------
 let lastTraySig = "";
 function updateTray() {
@@ -412,12 +1073,20 @@ function updateTray() {
     const status = s.attention ? s.attention : PILL_TEXT[s.phase];
     return { id: s.id, label: `${GLYPH[k]}  ${s.project} · ${branch}  —  ${status}` };
   });
-  const attn = list.filter((s) => s.attention || s.phase === "error").length;
+  const needy = needsYouSessions();
   const n = list.length;
-  const title = n === 0 ? "" : attn > 0 ? `◆ ${attn}` : `● ${n}`;
-  const tooltip = n === 0
-    ? "Muster — no active sessions"
-    : `Muster — ${n} session${n === 1 ? "" : "s"}${attn ? `, ${attn} need${attn === 1 ? "s" : ""} you` : ""}`;
+  let title = "", tooltip = "Muster — no active sessions";
+  if (n > 0) {
+    if (needy.length) {
+      const dom = reactorState(needy[0]);
+      const c = needy.filter((s) => reactorState(s) === dom).length;
+      title = `${GLYPH[dom]} ${c}`;
+      tooltip = `Muster — ${n} session${n === 1 ? "" : "s"}, ${reactorLabel(dom, c)}`;
+    } else {
+      title = `● ${n}`;
+      tooltip = `Muster — ${n} session${n === 1 ? "" : "s"}`;
+    }
+  }
   const sig = title + "|" + tooltip + "|" + items.map((i) => i.label).join("§");
   if (sig === lastTraySig) return; // avoid rebuilding the native menu on every telemetry tick
   lastTraySig = sig;
@@ -425,41 +1094,257 @@ function updateTray() {
 }
 function renderAll() {
   renderSidebar(); renderMini(); renderFoot(); renderAttn();
-  const s = activeId ? sessions.get(activeId) ?? null : null;
-  renderInspector(s); renderHeader(s);
+  // When mirroring an external session, activeId is null but the stage/inspector
+  // belong to that external — render it, NOT the null "no session" state. Skipping
+  // this is what let a background Muster session's telemetry tick blank the
+  // external header/inspector ~1s after clicking it.
+  if (activeExtId) {
+    const e = externals.find((x) => x.session_id === activeExtId);
+    if (e) { renderExtHeader(e); renderExtInspector(e); }
+  } else {
+    const s = activeId ? sessions.get(activeId) ?? null : null;
+    renderInspector(s); renderHeader(s);
+  }
   updateTray();
 }
 
-// ---------- palette ----------
-let palItems: { kind: string; label: string; sub: string; sw?: string; ic?: string; icon?: string; run: () => void }[] = [];
+// ---------- debug console ----------
+// A lightweight in-app event log + live state snapshot, surfaced via the 🐞 button
+// (in the footer) and mirrored to a fixed file (muster-debug.json) so an external
+// tool — or an LLM agent debugging the running app — can read what it's doing.
+// The most useful signal here is "unrouted telemetry": telemetry arriving for a
+// session id the UI doesn't know (the class of bug that made panes look ended).
+type DbgLvl = "info" | "warn" | "error";
+let appVersion = "";
+const dbgLog: { t: number; lvl: DbgLvl; msg: string }[] = [];
+let dbgOpen = false;
+const telem = { rx: 0, routed: 0, dropped: 0 };
+function dlog(lvl: DbgLvl, msg: string) {
+  dbgLog.push({ t: Date.now(), lvl, msg });
+  if (dbgLog.length > 400) dbgLog.splice(0, dbgLog.length - 400);
+  renderDbgBadge();
+  if (dbgOpen) renderDbgPanel();
+}
+function dbgIssues() { return dbgLog.reduce((n, e) => n + (e.lvl === "info" ? 0 : 1), 0); }
+function renderDbgBadge() {
+  const n = dbgIssues();
+  const b = $("dbgBadge");
+  b.textContent = String(n);
+  (b as HTMLElement).hidden = n === 0;
+  $("dbgBtn").classList.toggle("has-issues", n > 0);
+}
+function dbgSnapshot() {
+  return {
+    generatedAt: new Date().toISOString(),
+    version: appVersion, activeId, activeExtId, termEngine, rateLimits: rl, telemetry: telem,
+    sessions: [...sessions.values()].map((s) => ({
+      id: s.id, project: s.project, phase: s.phase, attention: s.attention, model: s.model,
+      ctxPct: s.ctxPct, cost: s.cost, durMs: s.durMs, subagents: s.subagents,
+      lastEvent: s.lastEvent, external: s.external, branch: s.branch, workdir: s.workdir,
+    })),
+    externals: externals.map((e) => ({ pid: e.pid, session_id: e.session_id, cwd: e.cwd, status: e.status })),
+    log: dbgLog.slice(-250),
+  };
+}
+function dbgTime(t: number) { const d = new Date(t); return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0"); }
+function renderDbgPanel() {
+  const snap = dbgSnapshot();
+  const srows = snap.sessions.length
+    ? snap.sessions.map((s) => `<tr><td>${esc(s.project)}</td><td class="mono">${s.id.slice(0, 8)}</td><td class="ph-${s.phase}">${s.phase}${s.attention ? " ⚠" : ""}</td><td>${s.ctxPct != null ? Math.round(s.ctxPct) + "%" : "–"}</td><td>${s.cost != null ? "$" + s.cost.toFixed(2) : "–"}</td><td class="mono">${esc(s.lastEvent || "–")}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="dbg-dim">no Muster sessions</td></tr>`;
+  const logRows = dbgLog.slice().reverse().slice(0, 250)
+    .map((e) => `<div class="dl ${e.lvl}"><span class="dl-t">${dbgTime(e.t)}</span><span class="dl-l">${e.lvl}</span><span class="dl-m">${esc(e.msg)}</span></div>`).join("")
+    || `<div class="dbg-dim" style="padding:8px">no events yet</div>`;
+  $("dbgBody").innerHTML =
+    `<div class="dbg-stats">telemetry: rx ${telem.rx} · routed ${telem.routed} · <span class="${telem.dropped ? "warn" : ""}">dropped ${telem.dropped}</span> · 5h ${rl.h5 != null ? Math.round(rl.h5) + "%" : "–"}</div>
+     <table class="dbg-tbl"><thead><tr><th>project</th><th>id</th><th>phase</th><th>ctx</th><th>cost</th><th>last event</th></tr></thead><tbody>${srows}</tbody></table>
+     <div class="dbg-log">${logRows}</div>`;
+}
+function toggleDbg(open?: boolean) {
+  dbgOpen = open ?? !dbgOpen;
+  ($("dbgPanel") as HTMLElement).hidden = !dbgOpen;
+  if (dbgOpen) { renderDbgPanel(); flushDebug(); }
+}
+async function flushDebug() {
+  try {
+    const path = await invoke<string>("write_debug_file", { contents: JSON.stringify(dbgSnapshot(), null, 2) });
+    $("dbgPath").textContent = path;
+  } catch { /* backend not ready */ }
+}
+
+// ---------- palette (⌘K) ----------
+// A fused switcher + command runner. Prefixes scope the search (⟩ commands,
+// @ sessions/projects, / by state); results are grouped with the "Needs you" set
+// pinned on top, fuzzy-matched with highlight, and frecency-ranked. ⌘K on a session
+// opens an action panel (jump, terminal, worktree, kill, answer permission) without
+// leaving the box — a page stack you back out of with Backspace/Esc.
+interface PalItem {
+  kind: "session" | "launch" | "command" | "action" | "fallback";
+  key: string;                 // stable key for frecency (commands/launches)
+  label: string; labelHtml: string; sub?: string;
+  sw?: string; icon?: string; glyph?: string;
+  shortcut?: string[];         // right-aligned kbd hint, e.g. ["⌘","1"]
+  session?: Sess;              // present on session rows → enables the ⌘K action panel
+  score?: number;
+  run: () => void;
+}
+interface PalGroup { name: string; count?: number; items: PalItem[] }
+let palGroups: PalGroup[] = [];
+let palFlat: PalItem[] = [];   // the selectable rows, in display order
 let palSel = 0;
-function buildPalItems(q: string) {
-  const items: typeof palItems = [];
-  for (const s of orderedSessions()) items.push({ kind: "session", label: `${s.project} · ${s.branch || "session"}`, sub: s.title || tilde(s.workdir), sw: accentFor(s.colorKey), icon: iconFor(s.colorKey) || undefined, run: () => setActive(s.id) });
-  for (const f of FAVORITES) items.push({ kind: "launch", label: `Launch ${f.name}`, sub: tilde(f.path), sw: accentFor(f.path), icon: iconFor(f.path) || undefined, run: () => requestLaunch(f.name, f.path) });
-  ([
-    ["Add project…", "＋", addProject],
-    [`Terminal engine → ${termEngine === "ghostty" ? "Embedded" : "Ghostty (external)"}`, "⌸", toggleEngine],
-    ["Toggle inspector", "◨", toggleInsp],
-    ["Toggle sidebar", "◧", toggleRail],
-    ["Toggle theme", "◐", toggleTheme],
-  ] as [string, string, () => void][])
-    .forEach(([l, ic, fn]) => items.push({ kind: "action", label: l, sub: "command", ic, run: fn }));
-  const f = q.trim().toLowerCase();
-  return f ? items.filter((i) => (i.label + i.sub).toLowerCase().includes(f)) : items;
+let palPage: "root" | "actions" = "root";
+let palActionSess: Sess | null = null;
+
+// Frecency: recency × frequency with a ~30-day half-life, for stable command/launch keys.
+const frecency: Record<string, { n: number; t: number }> = JSON.parse(localStorage.getItem("cc-frecency") || "{}");
+function frecScore(key: string): number { const f = frecency[key]; return f ? f.n * Math.pow(0.5, (Date.now() - f.t) / 2592000000) : 0; }
+function bumpFrec(key: string) { if (!key || key.startsWith("session:")) return; const f = frecency[key] || { n: 0, t: 0 }; f.n++; f.t = Date.now(); frecency[key] = f; localStorage.setItem("cc-frecency", JSON.stringify(frecency)); }
+
+// Subsequence fuzzy match with matched-char highlighting. null = no match; higher
+// score = better (rewards contiguous runs and matches at word starts).
+function fuzzy(text: string, q: string): { score: number; html: string } | null {
+  if (!q) return { score: 0, html: esc(text) };
+  const tl = text.toLowerCase(), ql = q.toLowerCase();
+  const hit: number[] = []; let ti = 0, score = 0, run = 0;
+  for (const c of ql) {
+    let found = -1;
+    for (let k = ti; k < tl.length; k++) if (tl[k] === c) { found = k; break; }
+    if (found === -1) return null;
+    const boundary = found === 0 || /[\s/·._-]/.test(text[found - 1]);
+    run = found === ti ? run + 1 : 1;
+    score += 1 + run + (boundary ? 4 : 0) - found * 0.02;
+    hit.push(found); ti = found + 1;
+  }
+  const set = new Set(hit); let html = "";
+  for (let k = 0; k < text.length; k++) html += set.has(k) ? `<b class="hit">${esc(text[k])}</b>` : esc(text[k]);
+  return { score, html };
 }
+// Match the label, falling back to the sub (unhighlighted) so a path/status still filters.
+function scoreItem(it: PalItem, term: string): PalItem | null {
+  const m = fuzzy(it.label, term);
+  if (m) return { ...it, labelHtml: m.html, score: m.score };
+  if (term && it.sub) { const s = fuzzy(it.sub, term); if (s) return { ...it, labelHtml: esc(it.label), score: s.score - 2 }; }
+  return null;
+}
+function parsePal(raw: string): { mode: "all" | "cmd" | "sess" | "filter"; term: string } {
+  const s = raw.replace(/^\s+/, "");
+  if (s[0] === ">" || s[0] === "⟩") return { mode: "cmd", term: s.slice(1).trim() };
+  if (s[0] === "@") return { mode: "sess", term: s.slice(1).trim() };
+  if (s[0] === "/") return { mode: "filter", term: s.slice(1).trim() };
+  return { mode: "all", term: s.trim() };
+}
+// The ⌘K-within action list for one session.
+function sessionActions(s: Sess): PalItem[] {
+  const mk = (label: string, glyph: string, run: () => void): PalItem => ({ kind: "action", key: "", label, labelHtml: esc(label), glyph, run });
+  const a: PalItem[] = [mk("Jump to session", "→", () => setActive(s.id))];
+  if (s.pendingPermId) {
+    a.push(mk("Allow the pending permission", "✓", () => resolvePermission(s.pendingPermId!, "allow")));
+    a.push(mk("Deny the pending permission", "✕", () => resolvePermission(s.pendingPermId!, "deny")));
+    a.push(mk("Answer it in the terminal", "❯", () => resolvePermission(s.pendingPermId!, "terminal")));
+  }
+  if (!s.shell) {
+    a.push(mk("Open a terminal here", "❯", () => { setActive(s.id); openPlainTerminal(); }));
+    a.push(mk("New worktree from here", "⑃", () => openWt(s.project, s.colorKey, false)));
+  }
+  a.push(mk("Close session", "✕", () => closeSession(s.id)));
+  return a;
+}
+const PAL_CMDS: { key: string; label: string; glyph: string; run: () => void; sc?: string[] }[] = [
+  { key: "cmd:add", label: "Add a project folder…", glyph: "＋", run: addProject },
+  { key: "cmd:term", label: "Open a terminal in the current project", glyph: "❯", run: openPlainTerminal },
+  { key: "cmd:sort", label: "Change the sidebar sort order", glyph: "≡", run: cycleSort },
+  { key: "cmd:insp", label: "Toggle the inspector", glyph: "◨", run: toggleInsp, sc: ["⌘", "I"] },
+  { key: "cmd:rail", label: "Toggle the sidebar", glyph: "◧", run: toggleRail, sc: ["⌘", "B"] },
+  { key: "cmd:theme", label: "Toggle the theme", glyph: "◐", run: toggleTheme },
+];
+function buildPalGroups(raw: string): PalGroup[] {
+  // action panel page — one group of the target session's actions, fuzzy-filtered
+  if (palPage === "actions" && palActionSess) {
+    const t = raw.trim();
+    const items = sessionActions(palActionSess).map((it) => scoreItem(it, t)).filter(Boolean) as PalItem[];
+    items.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const label = palActionSess.title || palActionSess.branch || "session";
+    return [{ name: `↩ ${palActionSess.project} · ${label}`, items }];
+  }
+  const { mode, term } = parsePal(raw);
+  const searchTerm = mode === "filter" ? "" : term;   // in /filter mode the term is a state, not a name
+  const emptyTerm = !searchTerm;
+  const order = new Map(orderedSessions().map((s, i) => [s.id, i]));
+  const stateOf = (s: Sess) => (s.attention ? "waiting" : s.phase);
+  const matchesState = mode === "filter" && term ? (s: Sess) => stateOf(s).startsWith(term.toLowerCase()) : () => true;
+
+  const sessCands: PalItem[] = [...sessions.values()].filter(matchesState).map((s) => {
+    const i = order.get(s.id);
+    const label = `${s.project} · ${s.title || s.branch || (s.shell ? "shell" : "session")}`;
+    const sub = s.shell ? "shell" : `${verbFor(s).toLowerCase()}${s.ctxPct != null ? ` · ${Math.round(s.ctxPct)}% ctx` : ""}${s.cost != null ? ` · $${s.cost.toFixed(2)}` : ""}`;
+    return { kind: "session", key: "session:" + s.id, label, labelHtml: esc(label), sub, sw: accentFor(s.colorKey), icon: iconFor(s.colorKey) || undefined, shortcut: i != null && i < 9 ? ["⌘", String(i + 1)] : undefined, session: s, run: () => setActive(s.id) };
+  });
+  const launchCands: PalItem[] = FAVORITES.map((f) => ({ kind: "launch", key: "launch:" + f.path, label: `Launch ${f.name}`, labelHtml: esc(`Launch ${f.name}`), sub: tilde(f.path), sw: accentFor(f.path), icon: iconFor(f.path) || undefined, run: () => requestLaunch(f.name, f.path) }));
+  const cmdCands: PalItem[] = PAL_CMDS.map((c) => ({ kind: "command", key: c.key, label: c.label, labelHtml: esc(c.label), sub: "command", glyph: c.glyph, shortcut: c.sc, run: c.run }));
+  for (const id of availEngines) { const d = engineDef(id); cmdCands.push({ kind: "command", key: "engine:" + id, label: `New sessions in ${d.label}${id === termEngine ? " ✓" : ""}`, labelHtml: esc(`New sessions in ${d.label}${id === termEngine ? " ✓" : ""}`), sub: d.sub, glyph: id === "embedded" ? "▤" : "⧉", run: () => setEngine(id) }); }
+
+  const score = (arr: PalItem[]) => arr.map((it) => scoreItem(it, searchTerm)).filter(Boolean) as PalItem[];
+  const byScore = (a: PalItem, b: PalItem) => (b.score ?? 0) - (a.score ?? 0);
+  const byFrec = (a: PalItem, b: PalItem) => frecScore(b.key) - frecScore(a.key);
+  const sessNatural = (a: PalItem, b: PalItem) => urgencyRank(a.session!) - urgencyRank(b.session!) || b.session!.lastActivity - a.session!.lastActivity;
+
+  const sess = score(sessCands), launch = score(launchCands), cmds = score(cmdCands);
+  const needy = sess.filter((i) => needsYou(i.session!)).sort(emptyTerm ? sessNatural : byScore);
+  const rest = sess.filter((i) => !needsYou(i.session!)).sort(emptyTerm ? sessNatural : byScore);
+
+  const groups: PalGroup[] = [];
+  const recentKeys = new Set<string>();
+  if (mode !== "cmd" && needy.length) groups.push({ name: "Needs you", count: needy.length, items: needy });
+  if (emptyTerm && mode === "all") {
+    const recent = [...cmds, ...launch].filter((i) => frecScore(i.key) > 0).sort(byFrec).slice(0, 3);
+    recent.forEach((i) => recentKeys.add(i.key));
+    if (recent.length) groups.push({ name: "Recent", items: recent });
+  }
+  if (mode !== "cmd" && rest.length) groups.push({ name: "Sessions", count: rest.length, items: rest });
+  if (mode === "all" || mode === "sess") { const l = launch.filter((i) => !recentKeys.has(i.key)).sort(emptyTerm ? byFrec : byScore); if (l.length) groups.push({ name: "Launch", items: l }); }
+  if (mode === "all" || mode === "cmd") { const c = cmds.filter((i) => !recentKeys.has(i.key)).sort(emptyTerm ? byFrec : byScore); if (c.length) groups.push({ name: "Commands", items: c }); }
+  if (!groups.length) groups.push({ name: "No matches", items: [{ kind: "fallback", key: "", label: "Add a project folder…", labelHtml: esc("Add a project folder…"), glyph: "＋", run: addProject }] });
+  return groups;
+}
+function runPalItem(it: PalItem | undefined) { if (!it) return; bumpFrec(it.key); closePalette(); it.run(); }
+function openPalActions(s: Sess) { palPage = "actions"; palActionSess = s; const inp = $("palInput") as HTMLInputElement; inp.value = ""; palSel = 0; refreshPal(); inp.focus(); }
+function popPalPage() { palPage = "root"; palActionSess = null; const inp = $("palInput") as HTMLInputElement; inp.value = ""; palSel = 0; refreshPal(); inp.focus(); }
 function renderPal() {
-  $("palList").innerHTML = palItems.map((i, idx) =>
-    `<div class="pal-item ${idx === palSel ? "on" : ""}" data-i="${idx}"><span class="pal-ic">${i.icon ? `<img class="pal-icimg" src="${i.icon}" alt="" />` : i.sw ? `<span class="sw" style="background:${i.sw}"></span>` : (i.ic || "›")}</span><span class="pal-main"><span class="pm">${esc(i.label)}</span><span class="ps">${esc(i.sub)}</span></span><span class="pal-kind">${i.kind}</span></div>`
-  ).join("") || `<div class="pal-item"><span class="pal-main"><span class="pm" style="color:var(--muted)">No matches</span></span></div>`;
-  $("palList").querySelectorAll<HTMLElement>(".pal-item[data-i]").forEach((el) =>
-    el.addEventListener("click", () => { const it = palItems[+el.dataset.i!]; if (it) { it.run(); closePalette(); } }));
+  let idx = 0;
+  const html = palGroups.map((g) => {
+    const rows = g.items.map((it) => {
+      const i = idx++;
+      const ic = it.icon ? `<img class="pal-icimg" src="${it.icon}" alt="" />` : it.sw ? `<span class="sw" style="background:${it.sw}"></span>` : (it.glyph || "›");
+      const sh = it.shortcut ? `<span class="pal-sh">${it.shortcut.map((k) => `<span class="k">${esc(k)}</span>`).join("")}</span>`
+        : it.session ? `<span class="pal-sh actions"><span class="k">⌘K</span></span>` : "";
+      return `<div class="pal-item ${i === palSel ? "on" : ""}" data-i="${i}"><span class="pal-ic">${ic}</span><span class="pal-main"><span class="pm">${it.labelHtml}</span>${it.sub ? `<span class="ps">${esc(it.sub)}</span>` : ""}</span>${sh}</div>`;
+    }).join("");
+    return `<div class="pal-gh">${esc(g.name)}${g.count ? `<span class="gc">${g.count}</span>` : ""}</div>${rows}`;
+  }).join("");
+  $("palList").innerHTML = html || `<div class="pal-item"><span class="pal-main"><span class="pm" style="color:var(--muted)">No matches</span></span></div>`;
+  $("palList").querySelectorAll<HTMLElement>(".pal-item[data-i]").forEach((el) => el.addEventListener("click", () => runPalItem(palFlat[+el.dataset.i!])));
+  const foot = $("palFoot");
+  foot.innerHTML = palPage === "actions"
+    ? `<span>↵ run</span><span>⌫ back</span><span class="sp"></span><span>esc close</span>`
+    : `<span class="pf-mode">⟩ command</span><span>@ project</span><span>/ state</span><span class="sp"></span><span>⌘K actions · esc</span>`;
+  $("palList").querySelector(".pal-item.on")?.scrollIntoView({ block: "nearest" });
 }
-function refreshPal() { palItems = buildPalItems(($("palInput") as HTMLInputElement).value); palSel = 0; renderPal(); }
-function openPalette() { $("scrim").classList.add("show"); $("palette").classList.add("show"); ($("palInput") as HTMLInputElement).value = ""; refreshPal(); setTimeout(() => ($("palInput") as HTMLInputElement).focus(), 30); }
-function closePalette() { $("scrim").classList.remove("show"); $("palette").classList.remove("show"); }
+function refreshPal() { palGroups = buildPalGroups(($("palInput") as HTMLInputElement).value); palFlat = palGroups.flatMap((g) => g.items); palSel = 0; renderPal(); }
+function openPalette() { palPage = "root"; palActionSess = null; palSel = 0; $("scrim").classList.add("show"); $("palette").classList.add("show"); ($("palInput") as HTMLInputElement).value = ""; refreshPal(); setTimeout(() => ($("palInput") as HTMLInputElement).focus(), 30); }
+function closePalette() { $("scrim").classList.remove("show"); $("palette").classList.remove("show"); palPage = "root"; palActionSess = null; }
 
 // ---------- panels / theme ----------
+function setSort(m: SortMode, announce = true) {
+  sortMode = m;
+  localStorage.setItem("cc-sort", m);
+  const b = $("railSort");
+  b.textContent = SORT_META[m].glyph;
+  b.title = `Sort: ${SORT_META[m].label} · click to change`;
+  b.classList.toggle("on", m !== "manual");
+  if (announce) toast(SORT_META[m].label);
+  renderSidebar(); renderMini();
+}
+function cycleSort() { setSort(SORT_MODES[(SORT_MODES.indexOf(sortMode) + 1) % SORT_MODES.length]); }
 function toggleRail() { $("app").classList.toggle("rail-mini"); }
 function toggleInsp() { $("app").classList.toggle("insp-off"); $("inspBtn").classList.toggle("on", !$("app").classList.contains("insp-off")); refit(); }
 function toggleTheme() { const cur = document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark"); }
@@ -476,7 +1361,20 @@ async function openWt(project: string, repoDir: string, allowMain: boolean) {
   wtCtx = { project, repoDir };
   const n = [...sessions.values()].filter((s) => s.project === project).length + 1;
   $("wtSub").textContent = allowMain ? `${project} already has a running session — open a worktree or make a new one.` : `Open an existing worktree, or create one for ${project}.`;
-  ($("wtMain") as HTMLElement).hidden = !allowMain;
+  const mainBtn = $("wtMain") as HTMLElement;
+  mainBtn.hidden = !allowMain;
+  if (allowMain) {
+    // Default to a neutral label; refine it to the actual current branch once git answers.
+    mainBtn.innerHTML = "without worktree";
+    mainBtn.title = "Start a session in the repo itself — no new worktree";
+    invoke<string | null>("git_branch", { workdir: repoDir }).then((b) => {
+      if (!wtCtx || wtCtx.repoDir !== repoDir) return; // dialog moved on / closed
+      if (b) {
+        mainBtn.innerHTML = `on <span class="wt-mainbr">${esc(b)}</span>`;
+        mainBtn.title = `Start a session on the current branch (${b}) — no new worktree`;
+      }
+    }).catch(() => {});
+  }
   const bi = $("wtBranch") as HTMLInputElement; bi.value = `agent-${n}`;
   ($("wtList") as HTMLElement).hidden = true; $("wtList").innerHTML = "";
   $("scrim").classList.add("show"); $("wtDlg").classList.add("show");
@@ -522,6 +1420,7 @@ listen<{ sessionId: string; data: string }>("pty-output", (e) => {
   s.term.write(Uint8Array.from(atob(e.payload.data), (c) => c.charCodeAt(0)));
 });
 listen<{ sessionId: string; code: number }>("pty-exit", (e) => {
+  dlog("info", `pty-exit ${e.payload.sessionId.slice(0, 8)} · code ${e.payload.code}`);
   const s = sessions.get(e.payload.sessionId); if (!s) return;
   s.phase = "ended"; s.attention = null;
   s.term?.writeln(`\r\n\x1b[90m[claude exited: code ${e.payload.code}]\x1b[0m`);
@@ -529,9 +1428,12 @@ listen<{ sessionId: string; code: number }>("pty-exit", (e) => {
 });
 listen<{ kind: string; data: any }>("telemetry", (e) => {
   const { kind, data } = e.payload; if (!data) return;
+  telem.rx++;
   const sid: string | undefined = data.session_id?.toLowerCase?.();
-  const s = sid ? sessions.get(sid) : undefined; if (!s) return;
-  if (kind === "statusline") applyStatusline(s, data); else applyHook(s, data);
+  const s = sid ? sessions.get(sid) : undefined;
+  if (!s) { telem.dropped++; dlog("warn", `${kind} telemetry for unrouted session ${sid ? sid.slice(0, 8) : "?"} — dropped`); return; }
+  telem.routed++;
+  if (kind === "statusline") applyStatusline(s, data); else { dlog("info", `hook ${data.hook_event_name ?? "?"} · ${sid!.slice(0, 8)}`); applyHook(s, data); }
   renderAll();
 });
 // menu-bar (tray) menu → jump to the clicked session
@@ -541,10 +1443,11 @@ listen<{ id: string; data: any }>("permission", (e) => {
   const { id, data } = e.payload; if (!data) return;
   const sid: string | undefined = data.session_id?.toLowerCase?.();
   const s = sid ? sessions.get(sid) : undefined;
-  if (!s) { invoke("resolve_permission", { id, behavior: "terminal" }).catch(() => {}); return; }
+  if (!s) { dlog("warn", `permission for unrouted session ${sid ? sid.slice(0, 8) : "?"} — auto-deferred to terminal`); invoke("resolve_permission", { id, behavior: "terminal" }).catch(() => {}); return; }
   s.attention = `permission: ${data.tool_name || ""}`;
   s.pendingCmd = permCmd(data);
   s.pendingPermId = id;
+  s.pendRisk = riskLevel(data.tool_name, data.tool_input);
   renderAll();
 });
 
@@ -552,16 +1455,20 @@ listen<{ id: string; data: any }>("permission", (e) => {
 document.addEventListener("click", (e) => {
   const t = e.target as HTMLElement;
   if (!t.closest("#colorPop, .pdot, .rm-dot")) closeColorPop();
+  if (!t.closest("#enginePop, #fEngineSeg")) closeEnginePop();
+  if (!t.closest("#attnPop, #attnBadge")) closeAttnPop();
   const dot = t.closest<HTMLElement>(".pdot, .rm-dot");
   if (dot) { const owner = dot.closest<HTMLElement>("[data-key]"); if (owner?.dataset.key) { openColorPopover(owner.dataset.key, e.clientX, e.clientY); return; } }
-  const el = t.closest<HTMLElement>("[data-perm],[data-wt],[data-close],[data-remove],[data-add],[data-sel],[data-launch],[data-pal],[data-rail],[data-toast]");
+  const el = t.closest<HTMLElement>("[data-perm],[data-wt],[data-close],[data-remove],[data-add],[data-jump],[data-ext],[data-sel],[data-launch],[data-pal],[data-rail],[data-toast]");
   if (!el) return;
   if (el.dataset.perm) resolvePermission(el.dataset.permid || "", el.dataset.perm);
   else if (el.dataset.wt) openWorktreeSession(el.dataset.wt, el.dataset.wtbranch || "");
   else if (el.dataset.close) closeSession(el.dataset.close);
   else if (el.dataset.remove) removeFavorite(el.dataset.remove);
   else if (el.dataset.add) addProject();
-  else if (el.dataset.sel) setActive(el.dataset.sel);
+  else if (el.dataset.jump) jumpExternal(+el.dataset.jump);
+  else if (el.dataset.ext) openExternal(el.dataset.ext);
+  else if (el.dataset.sel) { setActive(el.dataset.sel); closeAttnPop(); }
   else if (el.dataset.launch) requestLaunch(el.dataset.proj || basename(el.dataset.launch), el.dataset.launch);
   else if (el.dataset.pal) openPalette();
   else if (el.dataset.rail) toggleRail();
@@ -627,12 +1534,111 @@ document.addEventListener("contextmenu", (e) => {
   openColorPopover(el.dataset.key, e.clientX, e.clientY);
 });
 
+// ---------- terminal-engine popover (footer "new in …") ----------
+function openEnginePopover() {
+  const seg = $("fEngineSeg");
+  const r = seg.getBoundingClientRect();
+  const pop = $("enginePop");
+  pop.innerHTML = availEngines.map((id) => {
+    const d = engineDef(id);
+    return `<button class="mp-item ${id === termEngine ? "on" : ""}" data-engine="${id}"><span class="mp-ic">${id === "embedded" ? "▤" : "⧉"}</span><span class="mp-main"><span class="mp-l">${esc(d.label)}</span><span class="mp-s">${esc(d.sub)}</span></span><span class="mp-check">✓</span></button>`;
+  }).join("");
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 228)) + "px";
+  pop.style.bottom = (window.innerHeight - r.top + 6) + "px";
+  pop.style.top = "auto";
+  pop.classList.add("show");
+}
+function closeEnginePop() { $("enginePop").classList.remove("show"); }
+$("enginePop").addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>("[data-engine]");
+  if (!b) return;
+  setEngine(b.dataset.engine as Engine);
+  closeEnginePop();
+});
+
+// Reactor click → jump straight to the longest-waiting session, or open a picker
+// if several need you.
+$("attnBadge").addEventListener("click", () => {
+  const list = needsYouSessions();
+  if (list.length === 0) return;
+  if (list.length === 1) { setActive(list[0].id); closeAttnPop(); return; }
+  $("attnPop").classList.contains("show") ? closeAttnPop() : openAttnPop(list);
+});
+
 $("kbar").addEventListener("click", openPalette);
 $("themeBtn").addEventListener("click", toggleTheme);
 $("railCollapse").addEventListener("click", toggleRail);
+$("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);
-$("btnNew").addEventListener("click", openPalette);
-$("btnWorktree").addEventListener("click", () => { const s = activeId ? sessions.get(activeId) : null; if (!s) { toast("No active session"); return; } openWt(s.project, s.colorKey, false); });
+// The active project context is either a Muster session or an external one.
+function activeProjectCtx(): { project: string; path: string } | null {
+  if (activeExtId) { const e = externals.find((x) => x.session_id === activeExtId); if (e) return { project: basename(e.cwd), path: e.cwd }; }
+  const s = activeId ? sessions.get(activeId) : null;
+  return s ? { project: s.project, path: s.colorKey } : null;
+}
+// The active session's *actual* cwd (the worktree dir for worktree sessions, not
+// the color-grouping repo key) — used when opening a plain terminal there.
+function activeCwd(): string | null {
+  if (activeExtId) { const e = externals.find((x) => x.session_id === activeExtId); return e ? e.cwd : null; }
+  const s = activeId ? sessions.get(activeId) : null;
+  return s ? s.workdir : null;
+}
+// Open a plain (non-Claude) terminal at the active project's cwd for running shell
+// commands alongside a session. When the launch engine is "embedded" it opens an
+// in-app shell pane (like a session); otherwise it opens the external terminal app.
+function openPlainTerminal() {
+  const wd = activeCwd();
+  if (!wd) { toast("No active session"); return; }
+  if (termEngine === "embedded") { const c = activeProjectCtx(); launchShell(c?.project || basename(wd), wd); return; }
+  invoke("open_terminal_here", { workdir: wd, engine: termEngine }).catch((e) => toast("terminal: " + e));
+}
+// A plain login shell in an embedded xterm pane — no Claude, no telemetry.
+async function launchShell(project: string, workdir: string) {
+  const id = crypto.randomUUID();
+  const colorKey = workdir;
+  const pane = document.createElement("div");
+  pane.className = "term-pane";
+  $("terminals").appendChild(pane);
+  const term = new Terminal({
+    fontFamily: MONO, fontSize: termFontSize, cursorBlink: true, scrollback: 8000,
+    theme: { background: "#0c0b11", foreground: "#dcd8e6", cursor: "#c3b6f0", selectionBackground: "#3a3350" },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  loadWebgl(term);
+  term.open(pane);
+  term.onData((d) => invoke("write_pty", { sessionId: id, data: d }));
+  term.attachCustomKeyEventHandler(macShellKeys(id)); // Terminal.app-style ⌥/⌘ nav for the shell
+  const s: Sess = {
+    id, project, accent: accentFor(colorKey), workdir, colorKey, branch: "", worktree: null, title: "shell",
+    phase: "idle", phaseSince: Date.now(), lastActivity: Date.now(), attention: null, pendingCmd: "", pendingPermId: null, pendRisk: null, subagents: 0,
+    model: "", ctxPct: null, ctxTokens: null, cost: null, durMs: null,
+    curTool: "", curArg: "", todos: [], ctxHist: [], costHist: [], git: null, res: null,
+    lastEvent: "", activity: [],
+    external: false, shell: true, term, fit, pane,
+  };
+  sessions.set(id, s);
+  setActive(id);
+  dlog("info", `shell ${project} · ${id.slice(0, 8)}`);
+  try {
+    await invoke("spawn_shell", { sessionId: id, workdir, rows: term.rows || 24, cols: term.cols || 80 });
+  } catch (e) {
+    dlog("error", `shell launch failed: ${e}`);
+    toast("shell failed: " + e);
+    term.writeln(`\r\n\x1b[31m[shell error] ${e}\x1b[0m`);
+  }
+  renderAll();
+}
+// "+ Session" starts a session in the current project (offering a worktree if it
+// already has one). With no active session there's no project context → palette.
+$("btnNew").addEventListener("click", () => {
+  const c = activeProjectCtx();
+  if (c) requestLaunch(c.project, c.path); else openPalette();
+});
+$("btnWorktree").addEventListener("click", () => { const c = activeProjectCtx(); if (!c) { toast("No active session"); return; } openWt(c.project, c.path, false); });
+$("btnTerm").addEventListener("click", openPlainTerminal);
+$("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
+$("fEngineSeg").addEventListener("click", (e) => { e.stopPropagation(); $("enginePop").classList.contains("show") ? closeEnginePop() : openEnginePopover(); });
 $("btnClose").addEventListener("click", () => { if (activeId) closeSession(activeId); });
 $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);
@@ -641,10 +1647,20 @@ $("wtBranch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.pr
 $("scrim").addEventListener("click", () => { closePalette(); closeWt(); });
 $("palInput").addEventListener("input", refreshPal);
 $("palInput").addEventListener("keydown", (e) => {
-  if (e.key === "ArrowDown") { e.preventDefault(); palSel = Math.min(palSel + 1, palItems.length - 1); renderPal(); }
+  const meta = e.metaKey || e.ctrlKey;
+  const val = ($("palInput") as HTMLInputElement).value;
+  if (e.key === "ArrowDown") { e.preventDefault(); palSel = Math.min(palSel + 1, palFlat.length - 1); renderPal(); }
   else if (e.key === "ArrowUp") { e.preventDefault(); palSel = Math.max(palSel - 1, 0); renderPal(); }
-  else if (e.key === "Enter") { e.preventDefault(); const it = palItems[palSel]; if (it) { it.run(); closePalette(); } }
-  else if (e.key === "Escape") { closePalette(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPalItem(palFlat[palSel]); }
+  else if (meta && e.key.toLowerCase() === "k") {
+    // ⌘K on a session opens its action panel; otherwise swallow it so the global
+    // handler doesn't close the palette out from under an open action list.
+    e.preventDefault(); e.stopPropagation();
+    const it = palFlat[palSel];
+    if (palPage === "root" && it?.session) openPalActions(it.session);
+  }
+  else if (e.key === "Backspace" && !val && palPage === "actions") { e.preventDefault(); popPalPage(); }
+  else if (e.key === "Escape") { if (palPage === "actions") { e.preventDefault(); popPalPage(); } else closePalette(); }
 });
 window.addEventListener("keydown", (e) => {
   const meta = e.metaKey || e.ctrlKey;
@@ -658,7 +1674,73 @@ window.addEventListener("keydown", (e) => {
 });
 new ResizeObserver(() => refit()).observe($("terminals"));
 
+// show the running app's version (from tauri.conf.json) in the footer, so it's
+// clear which build is installed after an update.
+getVersion().then((v) => { appVersion = v; $("fVer").textContent = "v" + v; }).catch(() => {});
+
+// ---------- debug console wiring ----------
+$("dbgBtn").addEventListener("click", () => toggleDbg());
+$("dbgClose").addEventListener("click", () => toggleDbg(false));
+$("dbgClear").addEventListener("click", () => { dbgLog.length = 0; telem.rx = telem.routed = telem.dropped = 0; renderDbgBadge(); renderDbgPanel(); });
+$("dbgCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(JSON.stringify(dbgSnapshot(), null, 2)); toast("Debug snapshot copied"); } catch { toast("copy failed"); }
+});
+// surface uncaught JS errors in the console so they're visible (and land in the file)
+window.addEventListener("error", (e) => dlog("error", `js error: ${e.message} @ ${(e.filename || "").split("/").pop()}:${e.lineno}`));
+window.addEventListener("unhandledrejection", (e) => dlog("error", `unhandled rejection: ${String((e as PromiseRejectionEvent).reason)}`));
+dlog("info", "app started");
+flushDebug();
+setInterval(flushDebug, 4000);
+
 // scour each known project for a favicon/logo once, so the sidebar shows real icons
 FAVORITES.forEach((f) => probeIcon(f.path));
 
+// discover which external terminals are installed, so the footer/palette only
+// offers ones that actually work (embedded is always available).
+invoke<string[]>("available_terminals").then((ids) => {
+  availEngines = ALL_ENGINES.map((e) => e.id).filter((id) => id === "embedded" || ids.includes(id));
+  if (!availEngines.includes(termEngine)) { termEngine = "embedded"; localStorage.setItem("cc-term-engine", termEngine); }
+  renderFoot();
+}).catch(() => {});
+
+// keep rate-limit reset countdowns fresh (and flip a maxed meter back to 0 once
+// its window resets) even when no new telemetry is arriving.
+setInterval(() => {
+  if (activeExtId) return; // the external mirror manages its own refresh
+  const s = activeId ? sessions.get(activeId) ?? null : null;
+  renderInspector(s);
+  renderFoot();
+}, 30000);
+
+// Tick the inspector's dwell / wait clocks every second WITHOUT a full re-render —
+// a targeted textContent update on #iDwell, so the heartbeat animation isn't reset
+// each second (innerHTML replacement restarts CSS animations). This is the one
+// place we deviate from the render-everything pattern, and it's why the pulse is
+// smooth while "waiting 3:40" counts up live.
+setInterval(() => {
+  if (activeExtId) return;
+  const s = activeId ? sessions.get(activeId) ?? null : null;
+  if (!s || s.shell) return;
+  const el = document.getElementById("iDwell");
+  if (el) el.textContent = dwellText(s);
+}, 1000);
+
+// Refresh the active session's working-set diff + CPU/RAM on a slow cadence.
+setInterval(() => {
+  if (activeExtId) return;
+  const s = activeId ? sessions.get(activeId) ?? null : null;
+  if (s) void refreshSessionStats(s);
+}, 4000);
+
+// discover Claude Code sessions running outside Muster and keep them fresh.
+refreshExternals();
+setInterval(refreshExternals, 3000);
+
+// keep each session's branch label honest — re-read the real HEAD so switching
+// branches inside a session (or a worktree) is reflected instead of the stale
+// creation-time name.
+setInterval(refreshBranches, 4000);
+
+setSort(sortMode, false); // paint the sort button's glyph/title for the persisted mode
+initProjectDnD();
 renderAll();

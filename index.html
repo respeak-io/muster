@@ -20,7 +20,7 @@
 
       <aside class="rail">
         <div class="rail-scroll">
-          <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><span class="count" id="liveCount"></span><button class="rail-add" data-add="1" title="Add a project folder">+</button><button class="rail-collapse" id="railCollapse" title="Collapse sidebar (⌘B)">«</button></div></div>
+          <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><span class="count" id="liveCount"></span><button class="rail-sort" id="railSort" title="Sort order">≡</button><button class="rail-add" data-add="1" title="Add a project folder">+</button><button class="rail-collapse" id="railCollapse" title="Collapse sidebar (⌘B)">«</button></div></div>
           <div id="projects"></div>
         </div>
         <div class="railmini" id="railmini"></div>
@@ -34,6 +34,7 @@
             <span class="path" id="hPath"></span>
           </div>
           <div class="st-actions">
+            <button class="act" id="btnTerm" title="Open a plain (non-Claude) terminal at the project root">❯ Terminal</button>
             <button class="act" id="btnWorktree" title="Create git worktree + session">⑃ Worktree</button>
             <button class="act primary" id="btnNew">＋ Session</button>
             <button class="act icon" id="btnClose" title="Close session" hidden>✕</button>
@@ -48,6 +49,10 @@
               <p>Launch Claude Code in a project from the sidebar, or press <kbd>⌘</kbd><kbd>K</kbd>.</p>
             </div>
           </div>
+          <div class="ext-view" id="extPane" hidden>
+            <div class="ext-view-bar"><span class="ext-view-dot"></span>Read-only mirror · this session runs in another terminal</div>
+            <div class="ext-body" id="extBody"></div>
+          </div>
         </div>
       </main>
 
@@ -57,21 +62,24 @@
       </aside>
 
       <footer class="foot">
-        <span class="fseg"><span class="fdot" id="fDot"></span><b id="fProj">–</b> active</span>
+        <a class="frepo" id="fRepo" href="https://github.com/respeak-io/muster" title="respeak-io/muster — open on GitHub">respeak-io/muster<span class="fcaret">↗</span></a>
+        <span class="fver" id="fVer" title="Installed Muster version"></span>
         <span class="fseg"><span id="fSessions">0</span> sessions</span>
         <span class="fseg">today <b id="fCost">$0.00</b></span>
-        <span class="fseg">5h <b id="fRl">–</b></span>
-        <span class="fseg">new in <b id="fEngine">embedded</b></span>
+        <span class="fseg">5h <b id="fRl">–</b><span class="fsub" id="fRlReset"></span></span>
+        <span class="fseg">7d <b id="fRl7">–</b></span>
+        <span class="fseg fclick" id="fEngineSeg" title="Choose where new sessions open">new in <b id="fEngine">embedded</b> <span class="fcaret">▴</span></span>
         <span class="spacer"></span>
         <span class="fseg fk">⌘K · ⌘1–9 switch · ⌘B sidebar · ⌘I inspector · ⌘± font</span>
+        <button class="dbg-btn" id="dbgBtn" title="Debug console — live events & app state"><span class="dbg-ic">🐞</span><span class="dbg-badge" id="dbgBadge" hidden>0</span></button>
       </footer>
     </div>
 
     <div class="scrim" id="scrim"></div>
     <div class="palette" id="palette" role="dialog" aria-modal="true">
-      <input id="palInput" placeholder="Jump to a session, launch a project, or run a command…" autocomplete="off" />
+      <input id="palInput" placeholder="Search sessions, run a command…   ⟩ @ /" autocomplete="off" />
       <div class="pal-list" id="palList"></div>
-      <div class="pal-foot"><span>↑↓ navigate</span><span>↵ select</span><span>esc close</span></div>
+      <div class="pal-foot" id="palFoot"></div>
     </div>
 
     <div class="wtdlg" id="wtDlg" role="dialog" aria-modal="true">
@@ -82,12 +90,26 @@
       <input class="wt-in" id="wtBranch" spellcheck="false" placeholder="feature-x" autocomplete="off" />
       <div class="wt-btns">
         <button class="wt-cancel" id="wtCancel">Cancel</button>
-        <button class="wt-alt" id="wtMain" hidden>Launch in main</button>
+        <button class="wt-alt" id="wtMain" hidden>without worktree</button>
         <button class="wt-go" id="wtGo">Create worktree ▸</button>
       </div>
     </div>
 
+    <div class="dbg-panel" id="dbgPanel" hidden>
+      <div class="dbg-head">
+        <b>Debug console</b>
+        <span class="dbg-path" id="dbgPath" title="Live snapshot file — readable by external tools / agents"></span>
+        <span class="dbg-hspacer"></span>
+        <button class="dbg-x" id="dbgCopy" title="Copy full snapshot to clipboard">copy</button>
+        <button class="dbg-x" id="dbgClear" title="Clear the event log">clear</button>
+        <button class="dbg-x" id="dbgClose" title="Close">✕</button>
+      </div>
+      <div class="dbg-body" id="dbgBody"></div>
+    </div>
+
     <div class="toast" id="toast"></div>
     <div class="colorpop" id="colorPop"></div>
+    <div class="menupop" id="enginePop"></div>
+    <div class="menupop attnpop" id="attnPop"></div>
   </body>
 </html>
