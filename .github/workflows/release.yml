@@ -1,0 +1,56 @@
+name: release
+
+# Cut a release by pushing a version tag, e.g.:
+#   git tag v0.4.2 && git push origin v0.4.2
+# tauri-action builds the macOS (aarch64) bundle, signs the updater artifact with
+# the minisign key, creates the GitHub Release, and uploads the .dmg, the
+# .app.tar.gz(+.sig) updater artifact, and a latest.json the app's updater reads.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest # arm64 runner → aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Minisign key that signs the updater artifact; the app verifies against
+          # the pubkey baked into tauri.conf.json. Set both as repo secrets.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Muster ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install."
+          releaseDraft: false
+          prerelease: false
+          # tauri-action generates and uploads latest.json when the updater is
+          # configured; the app's endpoint points at the release's latest.json.
+          args: --target aarch64-apple-darwin

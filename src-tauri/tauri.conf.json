@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Muster",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "identifier": "io.respeak.cclauncher",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,6 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -34,7 +35,15 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "Muster Dev"
+      "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1QzE4MTkxMEIyOTUzRDgKUldUWVV5a0xrWUhCOWRBTG5nMlhjdEE5V0xJc0xCRUFGQnlnRFEvVUNZMU5jSWdtVW5XUnl6V08K",
+      "endpoints": [
+        "https://github.com/respeak-io/muster/releases/latest/download/latest.json"
+      ]
     }
   }
 }

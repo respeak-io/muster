@@ -204,7 +204,7 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 700; background: color-mix(in srgb, var(--pc) 14%, transparent); color: var(--pc); border: 1px solid color-mix(in srgb, var(--pc) 30%, transparent); }
 .pill .pd { width: 5px; height: 5px; border-radius: 50%; background: var(--pc); }
 .pill.attention{--pc:var(--st-attention);} .pill.working{--pc:var(--st-working);} .pill.thinking{--pc:var(--st-working);} .pill.done{--pc:var(--st-done);} .pill.idle{--pc:var(--st-idle);} .pill.error{--pc:var(--st-error);} .pill.ended{--pc:var(--muted-2);}
-.insp-scroll { overflow-y: auto; padding: 12px 13px 16px; display: flex; flex-direction: column; gap: 13px; min-height: 0; }
+.insp-scroll { overflow-y: auto; padding: 12px 13px 16px; display: flex; flex-direction: column; gap: 13px; min-height: 0; flex: 1; }
 .insp-empty { color: var(--muted-2); font-size: 11.5px; text-align: center; padding: 30px 10px; }
 
 .attn { border-radius: var(--radius); padding: 11px; display: flex; flex-direction: column; gap: 9px; background: linear-gradient(180deg, color-mix(in srgb, var(--st-attention) 15%, transparent), color-mix(in srgb, var(--st-attention) 6%, transparent)); border: 1px solid color-mix(in srgb, var(--st-attention) 32%, transparent); }
@@ -288,7 +288,7 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .tl2 .row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--hair); }
 .tl2 .row:last-child { border-bottom: 0; }
 .tl2 .dot { width: 8px; height: 8px; border-radius: 2px; flex: none; background: currentColor; }
-.tl2 .nm { font: 11px var(--font-mono); width: 40px; flex: none; }
+.tl2 .nm { font: 11px var(--font-mono); width: 66px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tl2 .arg { flex: 1; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .tl2 .lat { width: 46px; flex: none; display: flex; flex-direction: column; gap: 2px; align-items: flex-end; }
 .tl2 .latbar { height: 3px; border-radius: 2px; background: var(--accent); opacity: .5; align-self: stretch; }
@@ -297,7 +297,7 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .tl2 .ms { font: 8.5px var(--font-mono); color: var(--muted-2); }
 
 /* --- resources (cpu / ram) --- */
-.res { border-radius: var(--radius); padding: 11px 12px; background: var(--surface); border: 1px solid var(--hair); display: flex; flex-direction: column; gap: 9px; }
+.res { margin-top: auto; border-radius: var(--radius); padding: 11px 12px; background: var(--surface); border: 1px solid var(--hair); display: flex; flex-direction: column; gap: 9px; }
 .res .rr { display: flex; align-items: center; gap: 9px; }
 .res .rk { font: 9.5px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted-2); width: 30px; flex: none; }
 .res .rbar { flex: 1; height: 4px; border-radius: 2px; background: var(--hair-strong); overflow: hidden; }
@@ -320,7 +320,11 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .foot .spacer { margin-left: auto; }
 .foot .fk { color: var(--muted-2); }
 .foot .fsub { color: var(--muted-2); }
-.foot .fver { color: var(--muted-2); letter-spacing: .02em; }
+.foot .fver { color: var(--muted-2); letter-spacing: .02em; cursor: pointer; padding: 0 4px; margin: 0 -4px; border-radius: 5px; }
+.foot .fver:hover { color: var(--accent-ink); background: var(--surface); }
+.foot .fupdate { display: flex; align-items: center; font: inherit; letter-spacing: .02em; cursor: pointer; padding: 2px 8px; border-radius: 999px; color: #16121f; background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white 12%), var(--accent)); border: 1px solid transparent; box-shadow: 0 4px 12px -8px var(--accent-glow); }
+.foot .fupdate:hover { filter: brightness(1.06); }
+@media (prefers-reduced-motion: no-preference) { .foot .fupdate { animation: pulse 1.6s ease-in-out infinite; } }
 .foot .fclick { cursor: pointer; padding: 0 4px; margin: 0 -4px; border-radius: 5px; }
 .foot .fclick:hover { background: var(--surface); }
 .foot .fclick:hover b { color: var(--accent-ink); }

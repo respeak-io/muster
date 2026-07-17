@@ -20,7 +20,7 @@
 
       <aside class="rail">
         <div class="rail-scroll">
-          <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><span class="count" id="liveCount"></span><button class="rail-sort" id="railSort" title="Sort order">≡</button><button class="rail-add" data-add="1" title="Add a project folder">+</button><button class="rail-collapse" id="railCollapse" title="Collapse sidebar (⌘B)">«</button></div></div>
+          <div class="rail-top"><span class="label">Projects</span><div class="rt-right"><button class="rail-sort" id="railSort" title="Sort order">≡</button><button class="rail-add" data-add="1" title="Add a project folder">+</button><button class="rail-collapse" id="railCollapse" title="Collapse sidebar (⌘B)">«</button></div></div>
           <div id="projects"></div>
         </div>
         <div class="railmini" id="railmini"></div>
@@ -63,7 +63,8 @@
 
       <footer class="foot">
         <a class="frepo" id="fRepo" href="https://github.com/respeak-io/muster" title="respeak-io/muster — open on GitHub">respeak-io/muster<span class="fcaret">↗</span></a>
-        <span class="fver" id="fVer" title="Installed Muster version"></span>
+        <span class="fver" id="fVer" title="Installed Muster version · click to check for updates"></span>
+        <button class="fupdate" id="fUpdate" title="Download the new version and restart Muster" hidden></button>
         <span class="fseg"><span id="fSessions">0</span> sessions</span>
         <span class="fseg">today <b id="fCost">$0.00</b></span>
         <span class="fseg">5h <b id="fRl">–</b><span class="fsub" id="fRlReset"></span></span>

@@ -180,6 +180,26 @@ fn augmented_path() -> String {
     format!("{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{base}")
 }
 
+/// Force a UTF-8 locale on a PTY child. A macOS app launched from Finder inherits no
+/// `LANG`, so the child falls back to the C/POSIX locale and mangles non-ASCII output
+/// (UTF-8 rendered as Mac Roman — `ü`→`√º`, emoji shredded). Terminal.app/iTerm set a
+/// UTF-8 locale on startup; mirror that. Preserve an already-UTF-8 `LANG` (e.g. Muster
+/// launched from a terminal), else default one; and pin `LC_CTYPE` so an inherited
+/// `LC_CTYPE=C` can't re-break the charset behind a good `LANG`.
+fn apply_utf8_locale(cmd: &mut CommandBuilder) {
+    let is_utf8 = |var: &str| {
+        std::env::var(var)
+            .map(|v| { let u = v.to_ascii_uppercase(); u.contains("UTF-8") || u.contains("UTF8") })
+            .unwrap_or(false)
+    };
+    if !is_utf8("LANG") {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
+    if !is_utf8("LC_CTYPE") {
+        cmd.env("LC_CTYPE", "en_US.UTF-8");
+    }
+}
+
 #[tauri::command]
 fn spawn_claude(
     app: AppHandle,
@@ -213,6 +233,7 @@ fn spawn_claude(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("CC_LAUNCHER_SESSION", &session_id);
+    apply_utf8_locale(&mut cmd);
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
@@ -309,6 +330,7 @@ fn spawn_shell(
     cmd.env("PATH", augmented_path());
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    apply_utf8_locale(&mut cmd);
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
@@ -1304,6 +1326,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let server = tiny_http::Server::http("127.0.0.1:0")
                 .expect("bind telemetry server on 127.0.0.1");

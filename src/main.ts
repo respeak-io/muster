@@ -2,8 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -530,6 +532,24 @@ function applyTodos(s: Sess, input: any) {
     .map((t: any) => ({ content: String(t?.content ?? t?.activeForm ?? ""), status: String(t?.status ?? "pending") }))
     .filter((t) => t.content);
 }
+// Plan mode surfaces its plan via ExitPlanMode, not TodoWrite — the payload is
+// freeform markdown (`tool_input.plan`), not structured items. Parse its list/steps
+// into the same plan module so plan-mode plans show up too. Every step is "pending":
+// it's a proposal, not yet in flight; a later TodoWrite takes over with live status.
+function applyPlan(s: Sess, input: any) {
+  const md: string = typeof input?.plan === "string" ? input.plan : "";
+  if (!md.trim()) return;
+  const lines = md.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let steps = lines
+    .map((l) => l.match(/^(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.+)$/)?.[1])
+    .filter((x): x is string => !!x);
+  if (!steps.length) steps = lines.filter((l) => !/^#{1,6}\s/.test(l)); // prose fallback
+  const todos = steps
+    .slice(0, 12)
+    .map((c) => ({ content: c.replace(/\*\*/g, "").replace(/`/g, "").trim(), status: "pending" }))
+    .filter((t) => t.content);
+  if (todos.length) s.todos = todos;
+}
 function abbr(s: string, n = 160): string {
   const one = s.replace(/\s+/g, " ").trim();
   return one.length > n ? one.slice(0, n - 1) + "…" : one;
@@ -568,6 +588,7 @@ function applyHook(s: Sess, data: any) {
       const tool = data.tool_name || "tool";
       const arg = toolArg(tool, data.tool_input);
       if (tool === "TodoWrite") applyTodos(s, data.tool_input);
+      else if (tool === "ExitPlanMode") applyPlan(s, data.tool_input);
       else openActivity(s, tool, arg); // the plan is its own module; keep it off the timeline
       if (!bg()) { setPhase(s, "working"); clearPending(s); s.curTool = tool; s.curArg = arg; }
       break;
@@ -700,7 +721,6 @@ function extRow(e: ExtSession): string {
     <span class="sjump" data-jump="${e.pid}" title="Jump to its terminal ↗">↗</span></div>`;
 }
 function renderSidebar() {
-  $("liveCount").textContent = sessions.size + " running";
   // Don't stomp the DOM the browser is mid-drag on — see draggingProjects.
   if (draggingProjects) return;
   $("projects").innerHTML = projectList().map((p) => {
@@ -1677,6 +1697,68 @@ new ResizeObserver(() => refit()).observe($("terminals"));
 // show the running app's version (from tauri.conf.json) in the footer, so it's
 // clear which build is installed after an update.
 getVersion().then((v) => { appVersion = v; $("fVer").textContent = "v" + v; }).catch(() => {});
+
+// ---------- app self-update (Tauri updater plugin) ----------
+// Checks the latest GitHub release (respeak-io/muster) for a newer Muster.
+// Installing an update RESTARTS the app, which kills every live PTY/Claude
+// session — so we never auto-install: the update surfaces as a footer chip and
+// a one-time toast, and only downloads + relaunches after an explicit,
+// session-count-aware confirmation. Clicking the version label re-checks.
+let pendingUpdate: Awaited<ReturnType<typeof check>> | null = null;
+let updateBusy = false;
+
+async function checkForUpdates(manual: boolean) {
+  if (updateBusy) return;
+  try {
+    const upd = await check();
+    pendingUpdate = upd;
+    const chip = $("fUpdate");
+    if (upd) {
+      chip.textContent = `⇧ update to v${upd.version}`;
+      chip.hidden = false;
+      dlog("info", `update available: v${upd.version}`);
+      if (manual) toast(`Muster v${upd.version} is available`);
+    } else {
+      chip.hidden = true;
+      if (manual) toast("You're on the latest version");
+    }
+  } catch (e) {
+    dlog("error", `update check failed: ${String(e)}`);
+    if (manual) toast("Update check failed — see debug console");
+  }
+}
+
+async function runUpdate() {
+  if (!pendingUpdate || updateBusy) return;
+  const live = [...sessions.values()].filter((s) => !s.external).length;
+  const warn = live
+    ? `Muster will download v${pendingUpdate.version}, close ${live} running session${live === 1 ? "" : "s"}, and restart.`
+    : `Muster will download v${pendingUpdate.version} and restart.`;
+  const ok = await ask(`${warn}\n\nContinue?`, {
+    title: "Update Muster",
+    kind: "warning",
+    okLabel: "Update & restart",
+    cancelLabel: "Not now",
+  });
+  if (!ok) return;
+  updateBusy = true;
+  try {
+    toast(`Downloading v${pendingUpdate.version}…`);
+    await pendingUpdate.downloadAndInstall((ev) => {
+      if (ev.event === "Finished") toast("Installing update…");
+    });
+    await relaunch();
+  } catch (e) {
+    updateBusy = false;
+    dlog("error", `update install failed: ${String(e)}`);
+    toast("Update failed — see debug console");
+  }
+}
+
+$("fUpdate").addEventListener("click", runUpdate);
+$("fVer").addEventListener("click", () => checkForUpdates(true));
+// quiet check on launch, once the app has settled.
+setTimeout(() => checkForUpdates(false), 3000);
 
 // ---------- debug console wiring ----------
 $("dbgBtn").addEventListener("click", () => toggleDbg());
