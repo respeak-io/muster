@@ -10,6 +10,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
+import { parsePatch, type DiffFile, type DiffHunk } from "./diff";
 
 function loadWebgl(term: Terminal) {
   try {
@@ -170,6 +171,14 @@ let externals: ExtSession[] = [];
 let activeExtId: string | null = null;      // session_id of the external session being mirrored
 let extTranscriptTimer: number | undefined;
 const extWorking = (e: ExtSession) => !!e.status && !["idle", "sleeping", "done", ""].includes(e.status);
+
+// Uncommitted git state keyed by folder (a session's workdir or an external's cwd),
+// polled by refreshDirtyStates. It's the single source of truth for the sidebar's
+// "has changes" dot and the external inspector's diff card: s.git only stays fresh
+// for the *active* session, so nothing else can rely on it across every project.
+const dirtyByFolder = new Map<string, DiffStat | null>();
+const isDirty = (g?: DiffStat | null): boolean => !!g && (g.files > 0 || g.untracked > 0);
+const folderDirty = (f: string): boolean => isDirty(dirtyByFolder.get(f));
 
 // persisted daily usage rollup (survives app + system restarts)
 const usage: Record<string, number> = JSON.parse(localStorage.getItem("cc-usage") || "{}");
@@ -433,6 +442,26 @@ async function refreshExternals() {
     renderSidebar(); renderMini();
   } catch { /* backend not ready yet */ }
 }
+// Poll uncommitted git state for every folder in play (session workdirs + external
+// cwds), so the sidebar dot and the external diff card are accurate for all projects
+// at once — not just whichever session is active. git_diffstat is the same cheap
+// call the inspector already makes; here it fans out across the distinct folders.
+async function refreshDirtyStates() {
+  const folders = new Set<string>();
+  for (const s of sessions.values()) if (!s.shell && s.workdir) folders.add(s.workdir);
+  for (const e of externals) if (e.cwd) folders.add(e.cwd);
+  for (const f of [...dirtyByFolder.keys()]) if (!folders.has(f)) dirtyByFolder.delete(f); // prune gone folders
+  const sig = (g?: DiffStat | null) => (g ? `${g.files}/${g.untracked}/${g.added}/${g.removed}` : "-");
+  let changed = false;
+  await Promise.all([...folders].map(async (f) => {
+    const g = await invoke<DiffStat | null>("git_diffstat", { workdir: f }).catch(() => null);
+    if (sig(dirtyByFolder.get(f)) !== sig(g)) changed = true;
+    dirtyByFolder.set(f, g ?? null);
+  }));
+  if (!changed) return;
+  renderSidebar();
+  if (activeExtId) { const e = externals.find((x) => x.session_id === activeExtId); if (e) renderExtInspector(e); }
+}
 function openExternal(sid: string) {
   const e = externals.find((x) => x.session_id === sid);
   if (!e) return;
@@ -444,6 +473,7 @@ function openExternal(sid: string) {
   document.documentElement.style.setProperty("--accent", accentFor(e.cwd));
   renderExtHeader(e); renderExtInspector(e); renderSidebar(); renderMini(); renderFoot();
   $("extBody").innerHTML = `<div class="ext-empty">Loading transcript…</div>`;
+  void refreshDirtyStates(); // fill the working-set card promptly, not on the next poll tick
   loadTranscript(e, true);
   clearInterval(extTranscriptTimer);
   extTranscriptTimer = window.setInterval(() => {
@@ -487,11 +517,27 @@ function renderExtHeader(e: ExtSession) {
   $("hTitle").textContent = e.name || "";
   $("hPath").textContent = tilde(e.cwd);
 }
+// A read-only working-set peek for an external session's folder — the same card as a
+// Muster session's, minus the fetch/pull/push row (we don't drive this checkout).
+// Shown only when the folder actually has uncommitted changes.
+function extPeekHtml(e: ExtSession, g: DiffStat): string {
+  const tot = g.added + g.removed || 1;
+  const aw = Math.round((g.added / tot) * 100);
+  const newBadge = g.untracked ? ` · ${g.untracked} new` : "";
+  return `<div class="wset ext-wset">
+    <div class="lab" style="margin-bottom:2px">Working set · in this folder</div>
+    <div class="wpeek" data-diff="${esc(e.cwd)}" data-difftitle="${esc(basename(e.cwd))}" title="Open the uncommitted diff">
+      <div class="wtop"><span class="add">+${g.added}</span><span class="del">−${g.removed}</span><span class="files">${g.files} file${g.files === 1 ? "" : "s"}${newBadge}</span><span class="wpeek-cue">⤢</span></div>
+      <div class="stackbar"><span class="sa" style="width:${aw}%"></span><span class="sd" style="width:${100 - aw}%"></span></div>
+    </div></div>`;
+}
 function renderExtInspector(e: ExtSession) {
   const working = extWorking(e);
   const pill = $("iPill"); pill.className = "pill " + (working ? "working" : "idle");
   $("iPillTxt").textContent = e.status || "external";
   const started = e.started_at ? new Date(e.started_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–";
+  const g = dirtyByFolder.get(e.cwd);
+  const peek = isDirty(g) ? extPeekHtml(e, g!) : "";
   $("inspector").innerHTML = `
     <div class="ext-card">
       <div class="ext-hl">↗ Running outside Muster</div>
@@ -503,7 +549,7 @@ function renderExtInspector(e: ExtSession) {
       <div class="ext-meta"><span class="label">PID</span><span class="mono">${e.pid}</span></div>
       <button class="ext-jump-btn" data-jump="${e.pid}">↗ Jump to its terminal</button>
       <div class="ext-note">Muster can't drive this session — it was launched in another terminal. The panel on the left is a live read-only mirror of its transcript.</div>
-    </div>`;
+    </div>${peek}`;
 }
 
 // ---------- telemetry ----------
@@ -735,15 +781,19 @@ function renderSidebar() {
     const rows = p.sessions.map(sessionRow).join("") + p.externals.map(extRow).join("");
     const total = p.sessions.length + p.externals.length;
     const isFav = FAVORITES.some((f) => f.path === p.path);
+    // Any member folder (a session's workdir or an external's cwd) with uncommitted
+    // changes lights the project's dot — so a dirty worktree marks its parent too.
+    const dirty = p.sessions.some((s) => folderDirty(s.workdir)) || p.externals.some((e) => folderDirty(e.cwd));
+    const dot = dirty ? `<span class="pdirty" title="Uncommitted changes in this project"></span>` : "";
     let head: string;
     if (p.sessions.length) {
-      head = `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount">${total}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`;
+      head = `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}<span class="pcount">${total}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`;
     } else if (isFav) {
       const tail = p.externals.length ? `<span class="pcount ext">${p.externals.length} ext</span>` : `<span class="plaunch">launch →</span>`;
-      head = `<div class="phead empty-p" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${tail}<span class="premove" data-remove="${esc(p.path)}" title="Remove project">✕</span></div>`;
+      head = `<div class="phead empty-p" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}${tail}<span class="premove" data-remove="${esc(p.path)}" title="Remove project">✕</span></div>`;
     } else {
       // discovered via an external session only — not a saved project
-      head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount ext">${p.externals.length} ext</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch a Muster session here">＋</span></div>`;
+      head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}<span class="pcount ext">${p.externals.length} ext</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch a Muster session here">＋</span></div>`;
     }
     return `<div class="pgroup" draggable="true" data-path="${esc(p.path)}">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
   }).join("");
@@ -992,8 +1042,9 @@ function wsetHtml(s: Sess): string {
   // The diff half is only worth drawing when something is actually uncommitted —
   // a clean tree that's 5 behind still needs the branch/sync row below.
   const diff = dirty
-    ? `<div class="wtop"><span class="add">+${g.added}</span><span class="del">−${g.removed}</span><span class="files">${g.files} file${g.files === 1 ? "" : "s"}</span></div>
-    <div class="stackbar"><span class="sa" style="width:${aw}%"></span><span class="sd" style="width:${100 - aw}%"></span></div>`
+    ? `<div class="wpeek" data-diff="${esc(s.workdir)}" data-difftitle="${esc(s.project + (s.branch ? " · " + s.branch : ""))}" title="Open the uncommitted diff">
+      <div class="wtop"><span class="add">+${g.added}</span><span class="del">−${g.removed}</span><span class="files">${g.files} file${g.files === 1 ? "" : "s"}</span><span class="wpeek-cue">⤢</span></div>
+      <div class="stackbar"><span class="sa" style="width:${aw}%"></span><span class="sd" style="width:${100 - aw}%"></span></div></div>`
     : "";
   const sync = g.upstream
     ? `<span class="sync${g.ahead || g.behind ? "" : " even"}" title="${esc(g.upstream)} — as of the last fetch">${
@@ -1029,6 +1080,72 @@ function gitBtnsHtml(s: Sess, g: DiffStat): string {
     ${btn("push", "push", up && !g.ahead ? "Nothing to push" : "", pushHint)}
   </div>`;
 }
+
+// ---------- working-set diff viewer ----------
+// Clicking the +N −M card opens a read-only peek at the uncommitted diff. The
+// backend (git_diff) hands us one combined unified-diff patch; parsePatch turns it
+// into files/hunks (in ./diff, unit-tested there). Rendering stays here, in the DOM.
+const DSTAT: Record<DiffFile["status"], [string, string]> = {
+  modified: ["M", "s-mod"], added: ["A", "s-add"], deleted: ["D", "s-del"], renamed: ["R", "s-ren"],
+};
+let diffOpen = false;
+// Keyed by folder (workdir/cwd), not session id, so the same viewer serves Muster's
+// own sessions and read-only external ones alike — both are just a git working tree.
+async function openDiff(workdir: string, title: string) {
+  if (!workdir) return;
+  diffOpen = true;
+  $("scrim").classList.add("show");
+  $("diffDlg").classList.add("show");
+  $("diffTitle").textContent = title || basename(workdir);
+  $("diffSub").textContent = "reading working tree…";
+  $("diffBody").innerHTML = `<div class="diff-empty">Reading the working tree…</div>`;
+  try {
+    const res = await invoke<{ patch: string; truncated: boolean } | null>("git_diff", { workdir });
+    if (!diffOpen) return; // closed while the diff was loading
+    renderDiffBody(res ? parsePatch(res.patch) : [], !!res?.truncated);
+  } catch (e) {
+    if (!diffOpen) return;
+    $("diffSub").textContent = "";
+    $("diffBody").innerHTML = `<div class="diff-empty">Couldn't read the diff.<br><span class="mono">${esc(String(e))}</span></div>`;
+  }
+}
+function closeDiff() {
+  diffOpen = false;
+  $("diffDlg").classList.remove("show");
+  if (!$("palette").classList.contains("show") && !$("wtDlg").classList.contains("show")) $("scrim").classList.remove("show");
+}
+function renderDiffBody(files: DiffFile[], truncated: boolean) {
+  const tot = files.reduce((a, f) => ({ add: a.add + f.added, rem: a.rem + f.removed }), { add: 0, rem: 0 });
+  $("diffSub").innerHTML = files.length
+    ? `<span class="add">+${tot.add}</span> <span class="del">−${tot.rem}</span> · ${files.length} file${files.length === 1 ? "" : "s"}`
+    : "";
+  if (!files.length) { $("diffBody").innerHTML = `<div class="diff-empty">No uncommitted changes to show.</div>`; return; }
+  const sections = files.map((f, i) => {
+    const [glyph, cls] = DSTAT[f.status];
+    const name = f.status === "renamed" && f.oldPath
+      ? `<span class="d-old">${esc(f.oldPath)}</span><span class="d-arr">→</span>${esc(f.path)}`
+      : esc(f.path);
+    const counts = f.binary ? `<span class="d-bin">binary</span>`
+      : `<span class="add">+${f.added}</span> <span class="del">−${f.removed}</span>`;
+    const body = f.binary
+      ? `<div class="d-binbody">Binary file — no textual diff.</div>`
+      : f.hunks.map(hunkHtml).join("") || `<div class="d-binbody">No line changes (mode or metadata only).</div>`;
+    return `<div class="dfile" data-fi="${i}">
+      <div class="dfhead" data-dtoggle="${i}"><span class="dchev">▾</span><span class="dstat ${cls}">${glyph}</span><span class="dpath">${name}</span><span class="dcount">${counts}</span></div>
+      <div class="dfbody">${body}</div></div>`;
+  }).join("");
+  const note = truncated ? `<div class="diff-trunc">Diff truncated — too large to show in full. Open a terminal for the complete diff.</div>` : "";
+  $("diffBody").innerHTML = sections + note;
+}
+function hunkHtml(h: DiffHunk): string {
+  const rows = h.lines.map((l) => {
+    const sign = l.kind === "add" ? "+" : l.kind === "del" ? "−" : "";
+    return `<div class="dline ${l.kind}"><span class="ln">${l.oldNo ?? ""}</span><span class="ln">${l.newNo ?? ""}</span><span class="dsign">${sign}</span><span class="lc">${esc(l.text)}</span></div>`;
+  }).join("");
+  const ctx = h.header ? `<span class="dhh-ctx">${esc(h.header)}</span>` : "";
+  return `<div class="dhunk"><div class="dhh">⋯${ctx}</div>${rows}</div>`;
+}
+
 function timelineHtml(s: Sess): string {
   const acts = s.activity.slice(0, 8);
   if (!acts.length) return `<div><div class="lab" style="margin-bottom:6px">Activity</div><div class="insp-empty" style="padding:12px 0">No activity yet.</div></div>`;
@@ -1209,7 +1326,8 @@ function dbgSnapshot() {
       ctxPct: s.ctxPct, cost: s.cost, durMs: s.durMs, subagents: s.subagents,
       lastEvent: s.lastEvent, external: s.external, branch: s.branch, workdir: s.workdir,
     })),
-    externals: externals.map((e) => ({ pid: e.pid, session_id: e.session_id, cwd: e.cwd, status: e.status })),
+    externals: externals.map((e) => ({ pid: e.pid, session_id: e.session_id, cwd: e.cwd, status: e.status, dirty: folderDirty(e.cwd) })),
+    dirtyFolders: [...dirtyByFolder.entries()].map(([f, g]) => ({ folder: f, added: g?.added ?? 0, removed: g?.removed ?? 0, files: g?.files ?? 0, untracked: g?.untracked ?? 0, dirty: isDirty(g) })),
     log: dbgLog.slice(-250),
   };
 }
@@ -1533,10 +1651,11 @@ document.addEventListener("click", (e) => {
   if (!t.closest("#attnPop, #attnBadge")) closeAttnPop();
   const dot = t.closest<HTMLElement>(".pdot, .rm-dot");
   if (dot) { const owner = dot.closest<HTMLElement>("[data-key]"); if (owner?.dataset.key) { openColorPopover(owner.dataset.key, e.clientX, e.clientY); return; } }
-  const el = t.closest<HTMLElement>("[data-perm],[data-git],[data-wt],[data-close],[data-remove],[data-add],[data-jump],[data-ext],[data-sel],[data-launch],[data-pal],[data-rail],[data-toast]");
+  const el = t.closest<HTMLElement>("[data-perm],[data-git],[data-diff],[data-wt],[data-close],[data-remove],[data-add],[data-jump],[data-ext],[data-sel],[data-launch],[data-pal],[data-rail],[data-toast]");
   if (!el) return;
   if (el.dataset.perm) resolvePermission(el.dataset.permid || "", el.dataset.perm);
   else if (el.dataset.git) runGit(el.dataset.gitsid || "", el.dataset.git);
+  else if (el.dataset.diff) openDiff(el.dataset.diff, el.dataset.difftitle || "");
   else if (el.dataset.wt) openWorktreeSession(el.dataset.wt, el.dataset.wtbranch || "");
   else if (el.dataset.close) closeSession(el.dataset.close);
   else if (el.dataset.remove) removeFavorite(el.dataset.remove);
@@ -1778,7 +1897,13 @@ $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);
 $("wtMain").addEventListener("click", () => { if (!wtCtx) return; const { project, repoDir } = wtCtx; closeWt(); launch(project, repoDir, { colorKey: repoDir }); });
 $("wtBranch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtCreate(); } else if (e.key === "Escape") closeWt(); });
-$("scrim").addEventListener("click", () => { closePalette(); closeWt(); });
+$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); });
+$("diffClose").addEventListener("click", closeDiff);
+// Collapse / expand a file section by clicking its header.
+$("diffBody").addEventListener("click", (e) => {
+  const h = (e.target as HTMLElement).closest<HTMLElement>("[data-dtoggle]");
+  if (h) h.parentElement!.classList.toggle("collapsed");
+});
 $("palInput").addEventListener("input", refreshPal);
 $("palInput").addEventListener("keydown", (e) => {
   const meta = e.metaKey || e.ctrlKey;
@@ -1805,6 +1930,7 @@ window.addEventListener("keydown", (e) => {
   else if (meta && (e.key === "=" || e.key === "+")) { e.preventDefault(); bumpFont(0.5); }
   else if (meta && e.key === "-") { e.preventDefault(); bumpFont(-0.5); }
   else if (meta && e.key === "0") { e.preventDefault(); termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
+  else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
 });
 new ResizeObserver(() => refit()).observe($("terminals"));
 
@@ -1936,6 +2062,11 @@ setInterval(() => {
 // discover Claude Code sessions running outside Muster and keep them fresh.
 refreshExternals();
 setInterval(refreshExternals, 3000);
+
+// keep the sidebar's "uncommitted changes" dot (and the external diff card) honest
+// for every project at once — s.git alone only covers the active session.
+refreshDirtyStates();
+setInterval(refreshDirtyStates, 5000);
 
 // keep each session's branch label honest — re-read the real HEAD so switching
 // branches inside a session (or a worktree) is reflected instead of the stale

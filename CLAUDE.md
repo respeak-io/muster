@@ -12,11 +12,12 @@ npm run tauri dev      # run the app (Tauri + Vite dev server on fixed port 1420
 npm run tauri build    # production bundle
 npm run build          # tsc typecheck + vite build (frontend only; the beforeBuildCommand)
 npx tsc --noEmit       # typecheck only (tsconfig is noEmit)
+npm test               # vitest — frontend unit tests (test/*.test.ts)
 ```
 
-Rust backend (run from `src-tauri/`): `cargo check`, `cargo clippy`, `cargo build`.
+Rust backend (run from `src-tauri/`): `cargo check`, `cargo clippy`, `cargo test`, `cargo build`.
 
-There is **no test suite and no linter beyond `tsc` (strict) and `clippy`**. Verification is running the app and exercising it — the statusLine half of telemetry only fires in interactive mode, so it cannot be checked headlessly with `claude -p`. Requires `claude` on PATH, Node 18+, and Rust stable + Tauri system deps.
+Test coverage is **thin and unit-only** — there is no end-to-end harness. What exists: `vitest` over pure frontend logic (currently the diff parser, `test/diff.test.ts`, importing from `src/diff.ts`) and `#[cfg(test)]` integration tests in `lib.rs` that drive real `git` against a temp repo. Anything touching the DOM, PTYs, or live telemetry is still verified by **running the app and exercising it** — the statusLine half of telemetry only fires in interactive mode, so it cannot be checked headlessly with `claude -p`. Beyond tests, the linters are `tsc` (strict) and `clippy`. Requires `claude` on PATH, Node 18+, and Rust stable + Tauri system deps.
 
 ## The core mechanism: per-launch instrumentation
 

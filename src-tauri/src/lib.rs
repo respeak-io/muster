@@ -897,6 +897,68 @@ fn git_diffstat(workdir: String) -> Option<DiffStat> {
 }
 
 #[derive(serde::Serialize)]
+struct GitDiff {
+    /// Combined unified-diff patch for the working set: tracked changes vs HEAD,
+    /// followed by each untracked file rendered as a new-file diff. The frontend
+    /// parses this into files/hunks for the peek viewer.
+    patch: String,
+    /// True when we stopped early because the patch hit the size/file cap — the
+    /// viewer shows a "truncated" note so a partial diff can't read as complete.
+    truncated: bool,
+}
+
+/// The full *uncommitted* diff behind the working-set card, for the peek viewer.
+/// Tracked changes come from `diff HEAD`; untracked files are appended as new-file
+/// diffs via `diff --no-index` against `/dev/null` — which, unlike `add -N`, never
+/// touches the index (important while a live session may be staging/committing).
+/// `core.quotepath=false` keeps non-ASCII paths literal; a size + file-count cap
+/// stops a huge working tree from shipping a multi-MB payload into the webview.
+#[tauri::command]
+fn git_diff(workdir: String) -> Option<GitDiff> {
+    const CAP: usize = 800_000; // ~0.8 MB of patch text — ample for a peek
+    const MAX_UNTRACKED: usize = 300;
+
+    let tracked = git_cmd(&workdir, &["-c", "core.quotepath=false", "--no-optional-locks", "diff", "HEAD"])
+        .output()
+        .ok()?;
+    if !tracked.status.success() {
+        return None; // not a repo, or an unborn HEAD (no commits)
+    }
+    let mut patch = String::from_utf8_lossy(&tracked.stdout).into_owned();
+    let mut truncated = false;
+    if patch.len() > CAP {
+        patch.truncate(CAP);
+        truncated = true;
+    }
+
+    // Untracked files, each as its own new-file diff. `--no-index` exits 1 whenever
+    // the files differ (always, vs /dev/null), so we read stdout regardless of status.
+    if !truncated {
+        if let Ok(o) = git_cmd(&workdir, &["--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z"]).output() {
+            let listing = String::from_utf8_lossy(&o.stdout);
+            let others: Vec<&str> = listing.split('\0').filter(|s| !s.is_empty()).collect();
+            if others.len() > MAX_UNTRACKED {
+                truncated = true;
+            }
+            for f in others.into_iter().take(MAX_UNTRACKED) {
+                if patch.len() >= CAP {
+                    truncated = true;
+                    break;
+                }
+                if let Ok(d) = git_cmd(&workdir, &["-c", "core.quotepath=false", "diff", "--no-index", "--", "/dev/null", f]).output() {
+                    patch.push_str(&String::from_utf8_lossy(&d.stdout));
+                }
+            }
+            if patch.len() > CAP {
+                patch.truncate(CAP);
+                truncated = true;
+            }
+        }
+    }
+    Some(GitDiff { patch, truncated })
+}
+
+#[derive(serde::Serialize)]
 struct GitActionResult {
     ok: bool,
     /// One line for the toast.
@@ -1653,6 +1715,7 @@ pub fn run() {
             git_branch,
             git_head,
             git_diffstat,
+            git_diff,
             git_action,
             session_resources,
             create_worktree,
@@ -1672,4 +1735,68 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A fresh, empty scratch directory under the OS temp dir. No randomness (pid +
+    /// an atomic counter keep it unique even under cargo's parallel test threads).
+    fn scratch_dir() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("muster_git_diff_test_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run a git command in `dir`, asserting success. Identity/signing are passed via
+    /// `-c` so the test doesn't depend on (or touch) the developer's global gitconfig.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").current_dir(dir).args(args).output().expect("failed to spawn git");
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn git_diff_reports_tracked_and_untracked_changes() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("tracked.txt"), "line1\nline2\nline3\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+
+        // Working-tree changes: edit the tracked file, add an untracked one.
+        std::fs::write(dir.join("tracked.txt"), "line1\nCHANGED\nline3\nline4\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+
+        let d = git_diff(dir.to_str().unwrap().to_string()).expect("git_diff returned None for a real repo");
+        assert!(!d.truncated);
+        // Tracked modification, diffed against HEAD.
+        assert!(d.patch.contains("diff --git a/tracked.txt b/tracked.txt"), "missing tracked diff:\n{}", d.patch);
+        assert!(d.patch.contains("+CHANGED") && d.patch.contains("-line2"));
+        // Untracked file rendered as a new-file diff.
+        assert!(d.patch.contains("diff --git a/new.txt b/new.txt"), "missing untracked diff:\n{}", d.patch);
+        assert!(d.patch.contains("new file mode") && d.patch.contains("+brand new"));
+
+        // Crucially, surfacing the untracked file must NOT have staged it — `--no-index`
+        // leaves the index untouched, which is why we use it over `git add -N`.
+        let st = Command::new("git").current_dir(&dir).args(["status", "--porcelain"]).output().unwrap();
+        let st = String::from_utf8_lossy(&st.stdout);
+        assert!(st.contains("?? new.txt"), "new.txt should still be untracked, got:\n{st}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_diff_returns_none_outside_a_repo() {
+        let dir = scratch_dir();
+        assert!(git_diff(dir.to_str().unwrap().to_string()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

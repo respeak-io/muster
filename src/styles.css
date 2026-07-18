@@ -119,6 +119,8 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 /* pname flexes + truncates so a long name never wraps the header onto a 2nd row */
 .pname { flex: 0 1 auto; min-width: 0; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pcount { flex: none; margin-left: auto; font: 600 10px var(--font-mono); color: var(--muted-2); background: var(--surface-2); padding: 1px 6px; border-radius: 6px; }
+/* project has uncommitted changes in one of its folders — sits right after the name */
+.pdirty { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--st-working); box-shadow: 0 0 5px color-mix(in srgb, var(--st-working) 70%, transparent); }
 .padd { flex: none; font-size: 13px; color: var(--muted-2); padding: 0 2px; }
 .padd:hover { color: var(--text); }
 .phead.empty-p .pname { color: var(--muted-2); font-weight: 550; }
@@ -279,6 +281,10 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .wset .files { color: var(--muted); margin-left: auto; }
 .stackbar { height: 6px; border-radius: 3px; overflow: hidden; display: flex; background: var(--hair-strong); }
 .stackbar .sa { background: var(--st-done); } .stackbar .sd { background: var(--st-attention); }
+/* the +N −M card is a button into the diff viewer */
+.wpeek { display: flex; flex-direction: column; gap: 8px; cursor: pointer; }
+.wpeek-cue { margin-left: 8px; color: var(--muted-2); font-size: 12px; transition: color .12s; }
+.wpeek:hover .wpeek-cue { color: var(--accent-ink); } .wpeek:hover .files { color: var(--text); }
 .wset .branch { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
 .wset .branch .b { font-family: var(--font-mono); color: var(--accent-ink); }
 .wset .unc { margin-left: auto; font: 9.5px var(--font-mono); color: var(--st-working); background: color-mix(in srgb, var(--st-working) 14%, transparent); padding: 2px 6px; border-radius: 5px; }
@@ -293,6 +299,53 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .gitrow .gitb:hover:not(:disabled) { filter: brightness(1.12); border-color: var(--accent-ink); }
 .gitrow .gitb:disabled { opacity: .38; cursor: default; }
 .gitrow.busy { opacity: .6; }
+
+/* --- working-set diff viewer (modal) --- */
+.diffdlg { position: fixed; top: 8vh; left: 50%; transform: translateX(-50%) translateY(-8px) scale(.985); width: min(1000px, 94vw); max-height: 82vh; z-index: 41; display: flex; flex-direction: column; border-radius: var(--radius-lg); overflow: hidden; opacity: 0; pointer-events: none; transition: opacity .16s, transform .16s; background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(24px) saturate(1.4); border: 1px solid var(--hair-strong); box-shadow: 0 40px 100px -30px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.06); }
+.diffdlg.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0) scale(1); }
+.diff-head { display: flex; align-items: center; gap: 10px; padding: 10px 13px; border-bottom: 1px solid var(--hair); flex: none; }
+.diff-title-wrap { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.diff-title-wrap b { font-size: 13px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.diff-sub { font: 11px var(--font-mono); color: var(--muted); white-space: nowrap; flex: none; }
+.diff-sub .add { color: var(--st-done); } .diff-sub .del { color: var(--st-attention); }
+.diff-x { margin-left: auto; width: 24px; height: 24px; border-radius: 7px; border: 1px solid var(--hair); background: var(--surface); color: var(--muted); cursor: pointer; font-size: 12px; flex: none; }
+.diff-x:hover { color: var(--text); border-color: var(--hair-strong); }
+.diff-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px; }
+.diff-empty, .diff-trunc { color: var(--muted); font-size: 12px; padding: 16px; text-align: center; }
+.diff-trunc { color: var(--st-working); }
+
+.dfile { border: 1px solid var(--hair); border-radius: var(--radius-sm); margin-bottom: 9px; overflow: hidden; background: var(--bg-2); }
+.dfile:last-child { margin-bottom: 0; }
+.dfhead { display: flex; align-items: center; gap: 9px; padding: 7px 10px; cursor: pointer; background: var(--surface); user-select: none; }
+.dfhead:hover { background: var(--surface-2); }
+.dfile:not(.collapsed) .dfhead { border-bottom: 1px solid var(--hair); }
+.dfile.collapsed .dfbody { display: none; }
+.dfile.collapsed .dchev { transform: rotate(-90deg); }
+.dchev { color: var(--muted-2); font-size: 9px; transition: transform .12s; width: 10px; flex: none; }
+.dstat { width: 16px; height: 16px; border-radius: 4px; display: grid; place-items: center; font: 700 10px var(--font-mono); flex: none; }
+.dstat.s-mod { color: var(--st-working); background: color-mix(in srgb, var(--st-working) 16%, transparent); }
+.dstat.s-add { color: var(--st-done); background: color-mix(in srgb, var(--st-done) 16%, transparent); }
+.dstat.s-del { color: var(--st-attention); background: color-mix(in srgb, var(--st-attention) 16%, transparent); }
+.dstat.s-ren { color: var(--tool-read); background: color-mix(in srgb, var(--tool-read) 16%, transparent); }
+.dpath { font: 12px var(--font-mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.d-old { color: var(--muted); } .d-arr { color: var(--muted-2); margin: 0 5px; }
+.dcount { margin-left: auto; font: 11px var(--font-mono); flex: none; white-space: nowrap; }
+.dcount .add { color: var(--st-done); } .dcount .del { color: var(--st-attention); }
+.d-bin { color: var(--muted-2); font-size: 10px; }
+.d-binbody { color: var(--muted); font: 11px var(--font-mono); padding: 8px 12px; }
+
+.dhunk { border-top: 1px solid var(--hair); }
+.dhunk:first-child { border-top: none; }
+.dhh { padding: 3px 10px; font: 10.5px var(--font-mono); color: var(--muted-2); background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.dhh-ctx { color: var(--muted); margin-left: 8px; }
+.dline { display: flex; font: 11.5px/1.55 var(--font-mono); }
+.dline .ln { flex: none; width: 40px; padding-right: 8px; text-align: right; color: var(--muted-2); opacity: .55; user-select: none; }
+.dsign { flex: none; width: 15px; text-align: center; color: var(--muted-2); user-select: none; }
+.lc { flex: 1; min-width: 0; padding-right: 10px; tab-size: 2; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dline.add { background: color-mix(in srgb, var(--st-done) 11%, transparent); }
+.dline.add .dsign { color: var(--st-done); }
+.dline.del { background: color-mix(in srgb, var(--st-attention) 11%, transparent); }
+.dline.del .dsign { color: var(--st-attention); }
 
 /* --- timeline (colour by tool, latency bar) --- */
 .tl2 { display: flex; flex-direction: column; }
