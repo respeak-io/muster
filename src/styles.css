@@ -71,6 +71,56 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .attn-badge .bdot { width: 5px; height: 5px; border-radius: 50%; background: var(--rc, var(--st-attention)); }
 .ibtn { width: 26px; height: 26px; border-radius: 8px; cursor: pointer; display: grid; place-items: center; font-size: 13px; color: var(--muted); background: var(--surface); border: 1px solid var(--hair); }
 .ibtn:hover { color: var(--text); border-color: var(--hair-strong); }
+
+/* caffeinate split button — icon toggles the last-used preset, caret opens the
+   preset dropdown. The whole control reflects on/off via the .on class. */
+.caf { display: inline-flex; align-items: stretch; height: 26px; border-radius: 8px; overflow: hidden; color: var(--muted); background: var(--surface); border: 1px solid var(--hair); box-shadow: inset 0 1px 0 var(--lift); }
+.caf:hover { border-color: var(--hair-strong); }
+.caf-main, .caf-caret { border: 0; background: transparent; cursor: pointer; color: inherit; display: grid; place-items: center; padding: 0; }
+.caf-main { width: 28px; }
+.caf-caret { width: 15px; font-size: 8px; color: var(--muted-2); border-left: 1px solid var(--hair); }
+.caf-main:hover, .caf-caret:hover { color: var(--text); background: var(--lift); }
+.caf-ic { width: 16px; height: 16px; display: block; overflow: visible; }
+.caf-steam { opacity: 0; transition: opacity .25s; }
+.caf-cup, .caf-handle { transition: stroke .2s; }
+/* ARMED (.on) — accent tint. ASSERTING (a caffeinate child is actually running)
+   adds the glow + rising steam. Agent mode armed-but-idle is .on without
+   .asserting: a lit cup, quiet, waiting for the fleet to get busy. */
+.caf.on { color: var(--accent-ink); background: var(--accent-wash); border-color: var(--accent-line); }
+.caf.on .caf-caret { color: var(--accent-ink); border-left-color: var(--accent-line); }
+.caf.asserting { box-shadow: inset 0 1px 0 var(--lift), 0 0 12px -4px var(--accent-glow); }
+.caf.asserting .caf-steam { opacity: .85; }
+@media (prefers-reduced-motion: no-preference) {
+  .caf.asserting .caf-steam path { transform-box: fill-box; animation: caf-steam 2.1s ease-in-out infinite; }
+  .caf.asserting .caf-steam .s2 { animation-delay: .5s; }
+  .caf.asserting .caf-steam .s3 { animation-delay: 1s; }
+  @keyframes caf-steam { 0% { opacity: 0; transform: translateY(2.5px); } 45% { opacity: .85; } 100% { opacity: 0; transform: translateY(-2.5px); } }
+}
+
+/* caffeinate preset dropdown (reuses .menupop chrome) */
+.cafpop { min-width: 244px; }
+.cafpop .mp-main { flex: 1; }
+.cafpop .mp-flags { flex: none; margin-left: 8px; font: 10px var(--font-mono); color: var(--muted-2); background: var(--surface-2); border: 1px solid var(--hair); border-radius: 5px; padding: 1px 6px; }
+.cafpop .mp-item.on { background: var(--accent-wash); border-color: var(--accent-line); }
+.cafpop .mp-item.on .mp-ic, .cafpop .mp-item.on .mp-l { color: var(--accent-ink); }
+.cafpop .mp-item.on .mp-flags { color: var(--accent-ink); border-color: var(--accent-line); background: transparent; }
+.cafpop .mp-item.cur .mp-ic { color: var(--accent-ink); }
+.cafpop .mp-sep { height: 1px; margin: 5px 7px; background: var(--hair); }
+.cafpop .mp-off .mp-ic { color: var(--st-attention); }
+.cafpop .mp-off .mp-l { color: var(--st-attention); }
+/* a preset row + its optional sub-controls (timer durations / agent switch) */
+.cafpop .caf-opt { display: flex; flex-direction: column; }
+.cafpop .caf-sub { display: flex; align-items: center; gap: 6px; padding: 0 10px 7px 36px; }
+.cafpop .caf-durs { gap: 5px; }
+.cafpop .caf-dur { flex: none; height: 22px; padding: 0 10px; border-radius: 6px; cursor: pointer; font: 600 10.5px var(--font-mono); color: var(--muted); background: var(--surface); border: 1px solid var(--hair); }
+.cafpop .caf-dur:hover { color: var(--text); border-color: var(--hair-strong); }
+.cafpop .caf-dur.on { color: var(--accent-ink); background: var(--accent-wash); border-color: var(--accent-line); }
+.cafpop .caf-switch-row { justify-content: space-between; }
+.cafpop .caf-sw-lbl { font-size: 10.5px; color: var(--muted); }
+.cafpop .caf-switch { flex: none; width: 30px; height: 17px; border-radius: 999px; cursor: pointer; padding: 0; border: 1px solid var(--hair-strong); background: var(--surface-2); position: relative; transition: background .15s, border-color .15s; }
+.cafpop .caf-switch .caf-knob { position: absolute; top: 1.5px; left: 1.5px; width: 12px; height: 12px; border-radius: 50%; background: var(--muted); transition: transform .15s, background .15s; }
+.cafpop .caf-switch.on { background: var(--accent-wash); border-color: var(--accent-line); }
+.cafpop .caf-switch.on .caf-knob { transform: translateX(13px); background: var(--accent-ink); }
 @media (prefers-reduced-motion: no-preference) { .attn-badge .bdot { animation: pulse 1.5s ease-in-out infinite; } }
 
 /* left rail */

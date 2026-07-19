@@ -14,6 +14,22 @@
         <div class="kbar" id="kbar"><span>⌕</span><span>Jump to a session, launch a project…</span><span class="kbd"><kbd>⌘</kbd><kbd>K</kbd></span></div>
         <div class="top-right">
           <button class="attn-badge" id="attnBadge"><span class="bdot"></span><span id="attnBadgeTxt"></span></button>
+          <div class="caf" id="caf">
+            <button class="caf-main" id="cafMain" aria-label="Keep this Mac awake">
+              <svg class="caf-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <g class="caf-steam" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+                  <path class="s1" d="M9 2.6c-.8 1-.8 2 0 3s.8 2 0 3" />
+                  <path class="s2" d="M13 2.6c-.8 1-.8 2 0 3s.8 2 0 3" />
+                  <path class="s3" d="M17 2.6c-.8 1-.8 2 0 3s.8 2 0 3" />
+                </g>
+                <path class="caf-cup" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"
+                  d="M4.5 10h12v4.5a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5V10Z" />
+                <path class="caf-handle" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+                  d="M16.5 11h1.8a2.6 2.6 0 0 1 0 5.2h-1.3" />
+              </svg>
+            </button>
+            <button class="caf-caret" id="cafCaret" aria-label="Choose caffeinate mode">▾</button>
+          </div>
           <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
         </div>
       </header>
@@ -111,6 +127,7 @@
     <div class="toast" id="toast"></div>
     <div class="colorpop" id="colorPop"></div>
     <div class="menupop" id="enginePop"></div>
+    <div class="menupop cafpop" id="cafPop"></div>
     <div class="menupop attnpop" id="attnPop"></div>
   </body>
 </html>

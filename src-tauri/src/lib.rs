@@ -39,6 +39,10 @@ struct AppState {
     /// Answered later by the `resolve_permission` command.
     pending: Mutex<HashMap<String, tiny_http::Request>>,
     next_perm: std::sync::atomic::AtomicU64,
+    /// The single running `caffeinate` child, if the user has toggled it on.
+    /// Started with `-w <our pid>` so it self-terminates if Muster ever dies
+    /// without a clean stop — no orphaned process keeps the Mac awake forever.
+    caffeinate: Mutex<Option<std::process::Child>>,
 }
 
 /// Find a request header by (case-insensitive) name.
@@ -585,6 +589,50 @@ fn kill_session(state: State<AppState>, session_id: String) -> Result<(), String
             state.owned_pids.lock().unwrap().remove(&p);
         }
     }
+    Ok(())
+}
+
+/// A caffeinate flag we're willing to pass through: a short-option cluster over
+/// the sleep-assertion letters (`-d -i -m -s -u`, or combined like `-dimsu`),
+/// the `-t` timeout switch, or a bare decimal number (its seconds argument).
+/// Everything the UI sends is a fixed preset, so this is just belt-and-braces
+/// against ever handing an arbitrary string to the shell-less spawn.
+fn valid_caffeinate_flag(f: &str) -> bool {
+    if let Some(rest) = f.strip_prefix('-') {
+        return !rest.is_empty() && rest.chars().all(|c| "dimsut".contains(c));
+    }
+    !f.is_empty() && f.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Toggle a macOS `caffeinate` power-assertion on or off. Only ever one child
+/// runs: any existing one is killed first, so switching presets is just a
+/// stop+restart. `active=false` (or an empty `flags`) simply stops it.
+#[tauri::command]
+fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> Result<(), String> {
+    let mut guard = state.caffeinate.lock().unwrap();
+    // Tear down whatever's running (also reaps a child that self-exited on -t).
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if !active || flags.is_empty() {
+        return Ok(());
+    }
+    if let Some(bad) = flags.iter().find(|f| !valid_caffeinate_flag(f)) {
+        return Err(format!("refusing unknown caffeinate flag: {bad}"));
+    }
+    // `-w <our pid>`: caffeinate exits on its own the moment Muster does, so a
+    // crash or force-quit can't leave the display pinned awake.
+    let mut cmd = std::process::Command::new("/usr/bin/caffeinate");
+    cmd.arg("-w").arg(std::process::id().to_string());
+    for f in &flags {
+        cmd.arg(f);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().map_err(|e| format!("caffeinate: {e}"))?;
+    *guard = Some(child);
     Ok(())
 }
 
@@ -1576,6 +1624,7 @@ pub fn run() {
                 owned_pids: Mutex::new(HashSet::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_perm: std::sync::atomic::AtomicU64::new(1),
+                caffeinate: Mutex::new(None),
             });
 
             let handle = app.handle().clone();
@@ -1656,6 +1705,7 @@ pub fn run() {
             git_action,
             session_resources,
             create_worktree,
+            set_caffeinate,
             resolve_permission,
             list_worktrees,
             spawn_ghostty,
