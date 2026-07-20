@@ -21,14 +21,18 @@ Three independent "signings" — do **not** conflate them:
 
 ## Windows — activate Azure Trusted Signing
 
-Needed from Tim (Azure account admin), identical to `pii-reduction/installer/SIGNING.md`:
+The signing coordinates are already wired: the **account** (`Respeak`), **profile**
+(`RespeakPublicTrust`), and **endpoint** (`https://weu.codesigning.azure.net`) live in
+`src-tauri/tauri.signing.conf.json`; the subscription id plus the values for the SP setup
+are in the **git-ignored** `src-tauri/.env.signing` (never committed — copy it from a
+colleague / the password manager).
 
-- Trusted Signing **account name**, **certificate profile name**, and **region endpoint**
-  (`weu` = West Europe, `neu` = North Europe).
+What's still needed (identical to `pii-reduction/installer/SIGNING.md`):
+
 - A **service principal** (App Registration) holding the built-in role **"Trusted Signing
   Certificate Profile Signer"**, scoped to the account or profile. Creating the profile is
   not enough — without this role signing returns **403**. It yields `AZURE_TENANT_ID` /
-  `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`.
+  `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, which become GitHub repo secrets.
 
 ### Create the service principal (least-privilege, one-time)
 
@@ -37,12 +41,15 @@ account. The SP gets exactly **one role** on exactly the signing account — no
 subscription-wide access, nothing else in the tenant.
 
 ```bash
+# Load the real coordinates from the git-ignored env file (subscription, RG, account):
+set -a; . src-tauri/.env.signing; set +a
+
 az login
-az account set --subscription "<SUBSCRIPTION_ID>"
+az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
 # Scope = the Trusted Signing ACCOUNT (holds the Respeak GmbH profile that already signs
 # Schwärzwerk — one profile signs both products, so one SP covers both).
-SCOPE=$(az resource show -g "<RESOURCE_GROUP>" -n "<SIGNING_ACCOUNT>" \
+SCOPE=$(az resource show -g "$AZURE_RESOURCE_GROUP" -n "$TRUSTED_SIGNING_ACCOUNT" \
   --resource-type "Microsoft.CodeSigning/codeSigningAccounts" --query id -o tsv)
 
 # Create the SP AND assign only the signer role at that scope, in one shot.
@@ -79,9 +86,9 @@ Notes:
 
 Then:
 
-1. Fill in `src-tauri/tauri.signing.conf.json` with the account / profile / region.
+1. `tauri.signing.conf.json` already carries the account / profile / endpoint — nothing to fill.
 2. Add `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` as GitHub **repo
-   secrets**.
+   secrets** (from the `create-for-rbac` output above).
 3. Done. `release.yml` auto-detects `AZURE_CLIENT_ID`: when present it installs the signing
    CLI and merges `tauri.signing.conf.json` via `--config`, so tauri-action signs the app
    `.exe`, the NSIS setup, and the `.msi`. Until that secret exists, releases build

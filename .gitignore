@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Azure signing coordinates + service-principal creds (never commit) — see src-tauri/SIGNING.md
+.env
+.env.signing
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
