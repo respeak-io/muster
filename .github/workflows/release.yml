@@ -51,6 +51,25 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      # Windows OS code-signing (Azure Trusted Signing) is OPT-IN and gated on the
+      # AZURE_CLIENT_ID secret being present. Until Respeak's Azure account/profile +
+      # a service-principal secret exist, this is a no-op and the release builds
+      # unsigned exactly as before. See src-tauri/SIGNING.md.
+      - name: Detect Windows signing secrets
+        id: sign
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.AZURE_CLIENT_ID }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install trusted-signing-cli
+        if: steps.sign.outputs.enabled == 'true'
+        run: cargo install trusted-signing-cli
+
       - name: Build, sign, and publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -59,6 +78,11 @@ jobs:
           # the pubkey baked into tauri.conf.json. Set both as repo secrets.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Azure Trusted Signing auth for the signCommand in tauri.signing.conf.json
+          # (only consumed when the overlay is merged in — see the args line below).
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Muster ${{ github.ref_name }}"
@@ -93,4 +117,7 @@ jobs:
           prerelease: false
           # tauri-action generates and uploads latest.json when the updater is
           # configured; the app's endpoint points at the release's latest.json.
-          args: ${{ matrix.args }}
+          # When Windows signing is enabled, merge the signCommand overlay via
+          # --config so tauri-action signs the .exe, NSIS setup, and .msi; otherwise
+          # pass the matrix args unchanged (unsigned, as today).
+          args: ${{ steps.sign.outputs.enabled == 'true' && format('{0} --config src-tauri/tauri.signing.conf.json', matrix.args) || matrix.args }}

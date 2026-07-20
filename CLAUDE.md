@@ -16,6 +16,8 @@ npx tsc --noEmit       # typecheck only (tsconfig is noEmit)
 
 Rust backend (run from `src-tauri/`): `cargo check`, `cargo clippy`, `cargo build`.
 
+**Package manager: `npm`** for this repo (there's a `package-lock.json`; both CI workflows use `npm ci`). Keep using npm here — other Respeak projects (e.g. `pii-reduction`) use pnpm, so don't carry that assumption over. Windows code-signing / release-signing setup lives in `src-tauri/SIGNING.md`.
+
 There is **no test suite and no linter beyond `tsc` (strict) and `clippy`**. Verification is running the app and exercising it — the statusLine half of telemetry only fires in interactive mode, so it cannot be checked headlessly with `claude -p`. Requires `claude` on PATH, Node 18+, and Rust stable + Tauri system deps.
 
 ## The core mechanism: per-launch instrumentation
