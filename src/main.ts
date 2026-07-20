@@ -218,6 +218,7 @@ interface ExtSession {
 }
 let externals: ExtSession[] = [];
 let activeExtId: string | null = null;      // session_id of the external session being mirrored
+let activeExtPid: number | null = null;     // its pid — stable across session_id rotation, used to re-bind
 let extTranscriptTimer: number | undefined;
 const extWorking = (e: ExtSession) => !!e.status && !["idle", "sleeping", "done", ""].includes(e.status);
 
@@ -484,15 +485,23 @@ async function refreshExternals() {
     // groups by — otherwise ext-only projects would forever show the accent dot.
     // probeIcon dedupes by key, so this hits the backend at most once per repo.
     for (const e of externals) probeIcon(e.repo_root || e.cwd);
-    if (activeExtId && !externals.some((e) => e.session_id === activeExtId)) {
-      // the mirrored session ended — fall back to a Muster session or the empty state
-      closeExternalView();
-      const next = orderedSessions()[0];
-      if (next) setActive(next.id);
-      else ($("empty") as HTMLElement).style.display = "grid";
-    } else if (activeExtId) {
-      const e = externals.find((x) => x.session_id === activeExtId);
-      if (e) { renderExtHeader(e); renderExtInspector(e); }
+    if (activeExtId) {
+      // Re-resolve the mirrored session. If its id rotated (/clear·/compact·/resume
+      // rewrite ~/.claude/sessions/<pid>.json with a new session_id), re-bind by the
+      // stable pid instead of dropping the selection — otherwise the sidebar silently
+      // jumps to an unrelated session (and e.g. the ❯ Terminal button then targets it).
+      const e = externals.find((x) => x.session_id === activeExtId)
+        ?? (activeExtPid != null ? externals.find((x) => x.pid === activeExtPid) : undefined);
+      if (e) {
+        activeExtId = e.session_id; activeExtPid = e.pid;
+        renderExtHeader(e); renderExtInspector(e);
+      } else {
+        // Truly gone — fall back to a Muster session or the empty state.
+        closeExternalView();
+        const next = orderedSessions()[0];
+        if (next) setActive(next.id);
+        else ($("empty") as HTMLElement).style.display = "grid";
+      }
     }
     renderSidebar(); renderMini();
   } catch { /* backend not ready yet */ }
@@ -521,6 +530,7 @@ function openExternal(sid: string) {
   const e = externals.find((x) => x.session_id === sid);
   if (!e) return;
   activeExtId = sid;
+  activeExtPid = e.pid;
   activeId = null;
   for (const x of sessions.values()) x.pane.classList.remove("active");
   ($("empty") as HTMLElement).style.display = "none";
@@ -539,6 +549,7 @@ function openExternal(sid: string) {
 function closeExternalView() {
   if (activeExtId == null) return;
   activeExtId = null;
+  activeExtPid = null;
   clearInterval(extTranscriptTimer);
   ($("extPane") as HTMLElement).hidden = true;
 }
@@ -2062,7 +2073,9 @@ $("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);
 // The active project context is either a Muster session or an external one.
 function activeProjectCtx(): { project: string; path: string } | null {
-  if (activeExtId) { const e = externals.find((x) => x.session_id === activeExtId); if (e) return { project: basename(e.cwd), path: e.cwd }; }
+  // For an external session use its repo root, not the worktree cwd, so launching a
+  // session / opening a worktree from it operates on the repo (and groups under it).
+  if (activeExtId) { const e = externals.find((x) => x.session_id === activeExtId); if (e) { const root = e.repo_root || e.cwd; return { project: basename(root), path: root }; } }
   const s = activeId ? sessions.get(activeId) : null;
   return s ? { project: s.project, path: s.colorKey } : null;
 }
@@ -2079,17 +2092,25 @@ function activeCwd(): string | null {
 function openPlainTerminal() {
   const wd = activeCwd();
   if (!wd) { toast("No active session"); return; }
-  if (termEngine === "embedded") { const c = activeProjectCtx(); launchShell(c?.project || basename(wd), wd); return; }
-  invoke("open_terminal_here", { workdir: wd, engine: termEngine }).catch((e) => toast("terminal: " + e));
+  if (termEngine !== "embedded") { invoke("open_terminal_here", { workdir: wd, engine: termEngine }).catch((e) => toast("terminal: " + e)); return; }
+  // Inherit the active session's repo grouping so a shell opened in a worktree nests
+  // under its repo (as a worktree cluster) rather than appearing as its own project.
+  // The active session/external always shares the shell's cwd, so it labels the cluster.
+  const s = activeId ? sessions.get(activeId) : null;
+  const e = activeExtId ? externals.find((x) => x.session_id === activeExtId) : undefined;
+  const colorKey = s ? s.colorKey : e ? (e.repo_root || e.cwd) : wd;
+  const worktree = s ? s.worktree : e ? (e.repo_root && e.cwd !== e.repo_root ? (e.branch || basename(e.cwd)) : null) : null;
+  const branch = s ? s.branch : (e?.branch || "");
+  launchShell(s ? s.project : basename(colorKey), wd, { colorKey, worktree, branch });
 }
 // Hand a command over to a terminal at `workdir` instead of running it ourselves.
 // The embedded engine can genuinely prefill: it opens a shell pane and types the
 // command *without* a newline, so the user reads it and presses Enter. External
 // terminal apps take a directory but no pending input, so there we open the
 // terminal and put the command on the clipboard — honest about the extra paste.
-async function handToTerminal(project: string, workdir: string, cmd: string) {
+async function handToTerminal(project: string, workdir: string, cmd: string, opts: { colorKey?: string; worktree?: string | null; branch?: string } = {}) {
   if (termEngine === "embedded") {
-    const id = await launchShell(project, workdir);
+    const id = await launchShell(project, workdir, opts);
     // The login shell needs a moment before its prompt will accept input.
     setTimeout(() => { void invoke("write_pty", { sessionId: id, data: cmd }).catch(() => {}); }, 600);
     toast("Prefilled in a shell — press Enter to run");
@@ -2124,7 +2145,7 @@ async function runGit(sessionId: string, op: string) {
     } else if (r.suggest) {
       // Keep the toast clickable-adjacent: say what blocked it, then hand it over.
       toast(`${op}: ${r.summary} → opening a terminal`);
-      await handToTerminal(s.project, s.workdir, r.suggest);
+      await handToTerminal(s.project, s.workdir, r.suggest, { colorKey: s.colorKey, worktree: s.worktree, branch: s.branch });
     } else {
       toast(`${op}: ${r.summary}`);
     }
@@ -2141,9 +2162,11 @@ async function runGit(sessionId: string, op: string) {
 
 // A plain login shell in an embedded xterm pane — no Claude, no telemetry.
 // Returns the new session id so a caller can write into the shell (see handToTerminal).
-async function launchShell(project: string, workdir: string): Promise<string> {
+async function launchShell(project: string, workdir: string, opts: { colorKey?: string; worktree?: string | null; branch?: string } = {}): Promise<string> {
   const id = crypto.randomUUID();
-  const colorKey = workdir;
+  // Group by the repo root (opts.colorKey), not the raw cwd, so a shell opened in a
+  // worktree nests under its repo instead of becoming a standalone top-level project.
+  const colorKey = opts.colorKey ?? workdir;
   const pane = document.createElement("div");
   pane.className = "term-pane";
   $("terminals").appendChild(pane);
@@ -2158,7 +2181,7 @@ async function launchShell(project: string, workdir: string): Promise<string> {
   term.onData((d) => invoke("write_pty", { sessionId: id, data: d }));
   term.attachCustomKeyEventHandler(macShellKeys(id)); // Terminal.app-style ⌥/⌘ nav for the shell
   const s: Sess = {
-    id, project, accent: accentFor(colorKey), workdir, colorKey, branch: "", worktree: null, title: "shell",
+    id, project, accent: accentFor(colorKey), workdir, colorKey, branch: opts.branch ?? "", worktree: opts.worktree ?? null, title: "shell",
     phase: "idle", phaseSince: Date.now(), lastActivity: Date.now(), attention: null, pendingCmd: "", pendingPermId: null, pendRisk: null, subagents: 0,
     model: "", ctxPct: null, ctxTokens: null, cost: null, durMs: null,
     curTool: "", curArg: "", todos: [], ctxHist: [], costHist: [], git: null, res: null,
