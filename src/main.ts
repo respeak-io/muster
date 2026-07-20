@@ -1262,6 +1262,15 @@ function fmtDur(ms: number) {
 }
 // Absolute wall-clock time of a reset (epoch seconds) — "15:45" / "3:45 PM".
 function fmtClock(ts: number): string { return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+// Time remaining until a reset (epoch seconds) — "2h 10m" / "3d 4h". The weekly
+// window can be days out, where fmtClock's time-of-day alone would be misleading.
+function fmtUntil(ts: number): string {
+  const s = Math.max(0, Math.floor(ts - Date.now() / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
 const mc = (v: number) => (v >= 80 ? "hot" : v >= 55 ? "warn" : "");
 function renderShellInspector(s: Sess) {
   const ended = s.phase === "ended";
@@ -1571,10 +1580,41 @@ function renderFoot() {
   $("fRl").textContent = r != null ? Math.round(r) + "%" : "–";
   const r7 = rlPct(rl.d7, rl.d7Reset);
   $("fRl7").textContent = r7 != null ? Math.round(r7) + "%" : "–";
-  const reset = rlReset(rl.h5Reset);
-  $("fRlReset").textContent = reset != null ? ` · resets ${fmtClock(reset)}` : "";
   $("fEngine").textContent = engineDef(termEngine).label;
+  if ($("usagePop").classList.contains("show")) renderUsagePop();
 }
+// One usage window (session/5h or weekly/7d): label, % meter, and reset time.
+function usageRow(label: string, sub: string, pct: number | null, reset: number | null): string {
+  const cls = pct == null ? "" : mc(pct);
+  const w = pct == null ? 0 : Math.min(100, Math.round(pct));
+  const pctTxt = pct == null ? "–" : Math.round(pct) + "%";
+  const resetTxt = reset != null
+    ? `resets ${fmtClock(reset)} · in ${fmtUntil(reset)}`
+    : (pct == null ? "no reading yet" : "no active window");
+  return `<div class="up-row">
+    <div class="up-top"><span class="up-l">${label}</span><span class="up-sub">${sub}</span><span class="up-pct ${cls}">${pctTxt}</span></div>
+    <div class="up-bar ${cls}"><i style="width:${w}%"></i></div>
+    <div class="up-reset">${resetTxt}</div>
+  </div>`;
+}
+function renderUsagePop() {
+  const noData = rl.h5 == null && rl.d7 == null;
+  $("usagePop").innerHTML = `<div class="up-h">Claude usage limits</div>
+    ${usageRow("Session", "5-hour window", rlPct(rl.h5, rl.h5Reset), rlReset(rl.h5Reset))}
+    ${usageRow("Weekly", "7-day window", rlPct(rl.d7, rl.d7Reset), rlReset(rl.d7Reset))}
+    <div class="up-foot"><span>today <b>$${(usage[todayKey()] || 0).toFixed(2)}</b></span><span>${sessions.size} live · account-wide</span></div>
+    ${noData ? `<div class="up-note">Appears once a running session reports a statusLine.</div>` : ""}`;
+}
+function openUsagePop() {
+  const r = $("fUsageSeg").getBoundingClientRect();
+  const pop = $("usagePop");
+  renderUsagePop();
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 260)) + "px";
+  pop.style.bottom = (window.innerHeight - r.top + 6) + "px";
+  pop.style.top = "auto";
+  pop.classList.add("show");
+}
+function closeUsagePop() { $("usagePop").classList.remove("show"); }
 // The fleet's "needs you" set — sessions with a blocking permission, an error, or
 // finished and awaiting your reply — most urgent first (waiting wins), longest in
 // that state first. Independent of the sidebar sort so the reactor is stable.
@@ -2033,6 +2073,7 @@ document.addEventListener("click", (e) => {
   if (!t.closest("#colorPop, .pdot, .rm-dot")) closeColorPop();
   if (!t.closest("#enginePop, #fEngineSeg")) closeEnginePop();
   if (!t.closest("#cafPop, #caf")) closeCafPop();
+  if (!t.closest("#usagePop, #fUsageSeg")) closeUsagePop();
   if (!t.closest("#attnPop, #attnBadge")) closeAttnPop();
   const dot = t.closest<HTMLElement>(".pdot, .rm-dot");
   if (dot) { const owner = dot.closest<HTMLElement>("[data-key]"); if (owner?.dataset.key) { openColorPopover(owner.dataset.key, e.clientX, e.clientY); return; } }
@@ -2454,6 +2495,7 @@ $("btnWorktree").addEventListener("click", () => { const c = activeProjectCtx();
 $("btnTerm").addEventListener("click", openPlainTerminal);
 $("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
 $("fEngineSeg").addEventListener("click", (e) => { e.stopPropagation(); $("enginePop").classList.contains("show") ? closeEnginePop() : openEnginePopover(); });
+$("fUsageSeg").addEventListener("click", (e) => { e.stopPropagation(); $("usagePop").classList.contains("show") ? closeUsagePop() : openUsagePop(); });
 $("btnClose").addEventListener("click", () => { if (activeId) closeSession(activeId); });
 $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);

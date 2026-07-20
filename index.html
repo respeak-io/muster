@@ -82,9 +82,17 @@
         <span class="fver" id="fVer" title="Installed Muster version · click to check for updates"></span>
         <button class="fupdate" id="fUpdate" title="Download the new version and restart Muster" hidden></button>
         <span class="fseg"><span id="fSessions">0</span> sessions</span>
+        <span class="fdiv"></span>
         <span class="fseg">today <b id="fCost">$0.00</b></span>
-        <span class="fseg">5h <b id="fRl">–</b><span class="fsub" id="fRlReset"></span></span>
-        <span class="fseg">7d <b id="fRl7">–</b></span>
+        <span class="fdiv"></span>
+        <span class="fseg fclick" id="fUsageSeg" title="Claude usage limits — click for detail">
+          <span class="flabel">limits</span>
+          <b id="fRl">–</b><span class="fsub">5h</span>
+          <span class="fmid">·</span>
+          <b id="fRl7">–</b><span class="fsub">7d</span>
+          <span class="fcaret">▴</span>
+        </span>
+        <span class="fdiv"></span>
         <span class="fseg fclick" id="fEngineSeg" title="Choose where new sessions open">new in <b id="fEngine">embedded</b> <span class="fcaret">▴</span></span>
         <span class="spacer"></span>
         <span class="fseg fk">⌘K · ⌘1–9 switch · ⌘B sidebar · ⌘I inspector · ⌘± font</span>
@@ -137,5 +145,6 @@
     <div class="menupop" id="enginePop"></div>
     <div class="menupop cafpop" id="cafPop"></div>
     <div class="menupop attnpop" id="attnPop"></div>
+    <div class="menupop usagepop" id="usagePop"></div>
   </body>
 </html>

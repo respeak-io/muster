@@ -470,12 +470,16 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .foot .fseg { display: flex; align-items: center; gap: 6px; }
 .foot .fseg b { color: var(--text); font-weight: 700; }
 .foot .fdot { width: 5px; height: 5px; border-radius: 50%; background: var(--muted-2); }
+.foot .fdiv { width: 1px; height: 12px; background: var(--hair-strong); flex: none; }
+.foot .flabel { color: var(--muted); }
+.foot .fmid { color: var(--muted-2); margin: 0 -2px; }
+.foot .fseg .fsub { margin-left: -3px; }
 .foot .spacer { margin-left: auto; }
 .foot .fk { color: var(--muted-2); }
 .foot .fsub { color: var(--muted-2); }
 .foot .fver { color: var(--muted-2); letter-spacing: .02em; cursor: pointer; padding: 0 4px; margin: 0 -4px; border-radius: 5px; }
 .foot .fver:hover { color: var(--accent-ink); background: var(--surface); }
-.foot .fupdate { display: flex; align-items: center; font: inherit; letter-spacing: .02em; cursor: pointer; padding: 2px 8px; border-radius: 999px; color: #16121f; background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white 12%), var(--accent)); border: 1px solid transparent; box-shadow: 0 4px 12px -8px var(--accent-glow); }
+.foot .fupdate { display: flex; align-items: center; font: 700 9px var(--font-mono); letter-spacing: .01em; cursor: pointer; padding: 1px 7px; border-radius: 999px; color: #16121f; background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white 12%), var(--accent)); border: 1px solid transparent; box-shadow: 0 2px 7px -7px var(--accent-glow); }
 .foot .fupdate:hover { filter: brightness(1.06); }
 @media (prefers-reduced-motion: no-preference) { .foot .fupdate { animation: pulse 1.6s ease-in-out infinite; } }
 .foot .fclick { cursor: pointer; padding: 0 4px; margin: 0 -4px; border-radius: 5px; }
@@ -564,6 +568,26 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .attnpop .ap-proj { font: 700 11.5px var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .attnpop .ap-ttl { font-size: 10px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .attnpop .ap-reason { flex: none; max-width: 40%; font-size: 9px; font-weight: 600; color: var(--st-attention); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* account usage-limits popover (5-hour session + 7-day weekly windows) */
+.usagepop { min-width: 244px; gap: 4px; padding: 10px; }
+.usagepop .up-h { font: 700 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted-2); padding: 0 2px 3px; }
+.usagepop .up-row { display: flex; flex-direction: column; gap: 4px; padding: 6px 2px; }
+.usagepop .up-row + .up-row { border-top: 1px solid var(--hair); }
+.usagepop .up-top { display: flex; align-items: baseline; gap: 6px; }
+.usagepop .up-l { font: 650 12px var(--font-ui); color: var(--text); }
+.usagepop .up-sub { font-size: 10px; color: var(--muted-2); }
+.usagepop .up-pct { margin-left: auto; font: 700 12px var(--font-mono); color: var(--text); }
+.usagepop .up-pct.warn { color: var(--st-working); }
+.usagepop .up-pct.hot { color: var(--st-error); }
+.usagepop .up-bar { height: 5px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.usagepop .up-bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .3s ease; }
+.usagepop .up-bar.warn i { background: var(--st-working); }
+.usagepop .up-bar.hot i { background: var(--st-error); }
+.usagepop .up-reset { font: 500 10px var(--font-mono); color: var(--muted-2); }
+.usagepop .up-foot { display: flex; justify-content: space-between; font: 600 10px var(--font-mono); color: var(--muted); padding: 5px 2px 1px; border-top: 1px solid var(--hair); }
+.usagepop .up-foot b { color: var(--text); }
+.usagepop .up-note { font-size: 10px; color: var(--muted-2); padding: 2px; line-height: 1.4; }
 
 /* ---------- external (non-Muster) sessions ---------- */
 /* sidebar row for a session running in another terminal */
