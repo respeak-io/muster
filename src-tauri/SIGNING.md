@@ -29,7 +29,7 @@ colleague / the password manager).
 
 What's still needed (identical to `pii-reduction/installer/SIGNING.md`):
 
-- A **service principal** (App Registration) holding the built-in role **"Trusted Signing
+- A **service principal** (App Registration) holding the built-in role **"Artifact Signing
   Certificate Profile Signer"**, scoped to the account or profile. Creating the profile is
   not enough — without this role signing returns **403**. It yields `AZURE_TENANT_ID` /
   `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, which become GitHub repo secrets.
@@ -55,7 +55,7 @@ SCOPE=$(az resource show -g "$AZURE_RESOURCE_GROUP" -n "$TRUSTED_SIGNING_ACCOUNT
 # Create the SP AND assign only the signer role at that scope, in one shot.
 az ad sp create-for-rbac \
   --name "muster-ci-signer" \
-  --role "Trusted Signing Certificate Profile Signer" \
+  --role "Artifact Signing Certificate Profile Signer" \
   --scopes "$SCOPE"
 ```
 
@@ -76,9 +76,10 @@ gh secret set AZURE_CLIENT_SECRET --body "<password>"
 Notes:
 - **Tightest scope** (profile, not account): grab the certificate profile's *Resource ID*
   from the portal (profile → JSON/Properties) and pass it as `$SCOPE` instead.
-- If the role name errors it may be the renamed **"Artifact Signing Certificate Profile
-  Signer"** — find the exact string with
-  `az role definition list --query "[?contains(roleName,'Signing')].roleName" -o tsv`.
+- The role is **"Artifact Signing Certificate Profile Signer"** — Azure renamed "Trusted
+  Signing" → "Artifact Signing", so the old `Trusted Signing …` name no longer resolves.
+  If in doubt, list the current names:
+  `az role definition list --query "[?contains(roleName,'Signing')].{role:roleName,id:name}" -o table`.
 - `create-for-rbac`'s secret defaults to a **1-year expiry** → rotate before it lapses
   (`az ad app credential reset --id <appId>`), or drop the stored secret entirely with
   **GitHub OIDC**: `az ad app federated-credential create` for the repo + `azure/login@v2`
