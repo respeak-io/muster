@@ -1907,6 +1907,10 @@ $("enginePop").addEventListener("click", (e) => {
 // reconcileCaf() is the single choke point — called on every renderAll(), it
 // diffs the desired flags against what's running and only pokes the backend on a
 // real change (same guarded-invoke pattern as updateTray).
+// `caffeinate` is a macOS binary with no Windows equivalent wired up yet, so the
+// whole control is hidden there (see initCaf) and reconcileCaf() bails out —
+// otherwise every renderAll() would fire an invoke that can only ever error.
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
 type CafKind = "static" | "timer" | "agents";
 interface CafPreset { id: string; kind: CafKind; label: string; desc: string; glyph: string; flags?: string[] }
 const CAF_PRESETS: CafPreset[] = [
@@ -1960,6 +1964,7 @@ function cafArmTimer() {
   }
 }
 function reconcileCaf() {
+  if (IS_WINDOWS) return; // control hidden; the backend command only errors there
   const flags = cafDesiredFlags();
   const key = flags ? flags.join(" ") : "";
   if (key !== cafAssertKey) {
@@ -2399,6 +2404,9 @@ setInterval(refreshBranches, 4000);
 
 setSort(sortMode, false); // paint the sort button's glyph/title for the persisted mode
 initProjectDnD();
+// No `caffeinate` on Windows — drop the control rather than leave a button whose
+// every click reports an error. Its listeners stay wired but unreachable.
+if (IS_WINDOWS) $("caf").style.display = "none";
 // caffeinate always starts off (its -w guard died with the last run); renderAll's
 // reconcileCaf() paints the button. Note this is the ONE place agent-mode could
 // auto-assert on launch — but cafArmed is false at boot, so it stays dormant.

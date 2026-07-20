@@ -42,6 +42,7 @@ struct AppState {
     /// The single running `caffeinate` child, if the user has toggled it on.
     /// Started with `-w <our pid>` so it self-terminates if Muster ever dies
     /// without a clean stop — no orphaned process keeps the Mac awake forever.
+    #[cfg(not(windows))]
     caffeinate: Mutex<Option<std::process::Child>>,
 }
 
@@ -792,6 +793,7 @@ fn kill_session(state: State<AppState>, session_id: String) -> Result<(), String
 /// the `-t` timeout switch, or a bare decimal number (its seconds argument).
 /// Everything the UI sends is a fixed preset, so this is just belt-and-braces
 /// against ever handing an arbitrary string to the shell-less spawn.
+#[cfg(not(windows))]
 fn valid_caffeinate_flag(f: &str) -> bool {
     if let Some(rest) = f.strip_prefix('-') {
         return !rest.is_empty() && rest.chars().all(|c| "dimsut".contains(c));
@@ -802,6 +804,7 @@ fn valid_caffeinate_flag(f: &str) -> bool {
 /// Toggle a macOS `caffeinate` power-assertion on or off. Only ever one child
 /// runs: any existing one is killed first, so switching presets is just a
 /// stop+restart. `active=false` (or an empty `flags`) simply stops it.
+#[cfg(not(windows))]
 #[tauri::command]
 fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> Result<(), String> {
     let mut guard = state.caffeinate.lock().unwrap();
@@ -829,6 +832,16 @@ fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> R
     let child = cmd.spawn().map_err(|e| format!("caffeinate: {e}"))?;
     *guard = Some(child);
     Ok(())
+}
+
+/// Windows has no `caffeinate` binary and no power-assertion equivalent wired up
+/// yet (that would be `SetThreadExecutionState`). The UI hides the control there,
+/// so this only exists to keep the command registered for the shared
+/// `invoke_handler!` list — reaching it means the frontend guard was bypassed.
+#[cfg(windows)]
+#[tauri::command]
+fn set_caffeinate(_state: State<AppState>, _active: bool, _flags: Vec<String>) -> Result<(), String> {
+    Err("keep-awake is not supported on Windows yet".into())
 }
 
 /// Create a git worktree with a new (or existing) branch off `repo_dir`.
@@ -1971,6 +1984,7 @@ pub fn run() {
                 owned_pids: Mutex::new(HashSet::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_perm: std::sync::atomic::AtomicU64::new(1),
+                #[cfg(not(windows))]
                 caffeinate: Mutex::new(None),
             });
 
