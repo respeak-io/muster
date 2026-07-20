@@ -1,3 +1,22 @@
+/* Bundled Nerd Font so the embedded terminal renders powerline / devicon glyphs
+   (oh-my-posh, starship, git prompts) identically on every OS — no OS font ships
+   these, so without this the glyphs fall back to tofu boxes. The "Mono" variant
+   keeps icons single-cell-width. TTF is fine: assets load from disk, not the net. */
+@font-face {
+  font-family: "JetBrainsMono Nerd Font";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("./assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+}
+@font-face {
+  font-family: "JetBrainsMono Nerd Font";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("./assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf") format("truetype");
+}
+
 :root {
   --bg: #100e15; --bg-2: #0b0a10; --panel: #16141d; --surface: #1b1824; --surface-2: #221e2d;
   --hair: rgba(255,255,255,.07); --hair-strong: rgba(255,255,255,.12); --lift: rgba(255,255,255,.05);
@@ -12,7 +31,7 @@
   --tool-read:#7cc7ff; --tool-edit:#c3b0ff; --tool-bash:#e0a44a; --tool-task:#6ad0b0; --tool-web:#f0a6d0; --tool-mcp:#9aa0b4;
   --radius:11px; --radius-sm:8px; --radius-lg:13px;
   --font-ui: -apple-system, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Berkeley Mono", Menlo, monospace;
+  --font-mono: "JetBrainsMono Nerd Font", ui-monospace, "SF Mono", "JetBrains Mono", "Berkeley Mono", Menlo, monospace;
   color-scheme: dark;
 }
 :root[data-theme="light"] {

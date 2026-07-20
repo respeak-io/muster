@@ -1,10 +1,13 @@
 name: release
 
 # Cut a release by pushing a version tag, e.g.:
-#   git tag v0.4.2 && git push origin v0.4.2
-# tauri-action builds the macOS (aarch64) bundle, signs the updater artifact with
-# the minisign key, creates the GitHub Release, and uploads the .dmg, the
-# .app.tar.gz(+.sig) updater artifact, and a latest.json the app's updater reads.
+#   git tag v0.4.4 && git push origin v0.4.4
+# A build matrix runs tauri-action on each OS: macOS (aarch64) produces the .dmg +
+# .app.tar.gz(+.sig) updater artifact, Windows (x64) produces the NSIS .exe / .msi +
+# their updater artifact. Every job targets the SAME tag, so tauri-action appends
+# its assets to the one GitHub Release and merges each platform into a single
+# latest.json the app's updater reads. The minisign key signs the updater artifacts
+# on every platform (OS code-signing is separate and not configured).
 on:
   push:
     tags:
@@ -15,7 +18,16 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-latest # arm64 runner → aarch64-apple-darwin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # arm64 runner → aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - platform: windows-latest # x64 → NSIS .exe + .msi
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +39,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          # The Apple-Silicon target is only needed on the macOS runner; Windows
+          # builds for its host target (x86_64-pc-windows-msvc) with no extra target.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -50,9 +64,13 @@ jobs:
           releaseName: "Muster ${{ github.ref_name }}"
           # Install instructions are embedded in every release body so the
           # top-of-list (latest) release always carries them — GitHub can't pin
-          # a release, so "always in the newest one" is the equivalent.
+          # a release, so "always in the newest one" is the equivalent. The first
+          # matrix job to run creates the release with this body; later jobs append
+          # their assets, so it must cover every platform.
           releaseBody: |
-            ## Install (macOS, Apple Silicon)
+            ## Install
+
+            **macOS (Apple Silicon)**
 
             1. Download **Muster_*_aarch64.dmg** from the assets below.
             2. Muster is self-signed (not notarized by Apple), so macOS Gatekeeper blocks the first launch. Clear the quarantine flag once:
@@ -63,10 +81,16 @@ jobs:
                ```sh
                xattr -dr com.apple.quarantine /Applications/Muster.app
                ```
+            Apple Silicon (M-series) only — Intel Macs aren't supported by this build.
 
-            Requires `claude` on your `PATH`. Apple Silicon (M-series) only — Intel Macs aren't supported by this build. Muster keeps itself up to date after install (checks the latest release on launch; never auto-installs).
+            **Windows (x64)**
+
+            1. Download **Muster_*_x64-setup.exe** (or the **.msi**) from the assets below.
+            2. Muster isn't code-signed, so Windows SmartScreen may warn on first run — click **More info → Run anyway**.
+
+            Requires `claude` on your `PATH`. Muster keeps itself up to date after install (checks the latest release on launch; never auto-installs).
           releaseDraft: false
           prerelease: false
           # tauri-action generates and uploads latest.json when the updater is
           # configured; the app's endpoint points at the release's latest.json.
-          args: --target aarch64-apple-darwin
+          args: ${{ matrix.args }}

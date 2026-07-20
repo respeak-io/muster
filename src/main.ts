@@ -67,10 +67,14 @@ function setEngine(id: Engine) {
 // Home dir resolves at runtime (for `~` path abbreviation). Favorites start
 // empty and are added by the user — persisted to localStorage.
 let HOME = "";
-homeDir().then((h) => { HOME = h.replace(/\/+$/, ""); }).catch(() => {});
+homeDir().then((h) => { HOME = h.replace(/[/\\]+$/, ""); }).catch(() => {});
 interface Favorite { name: string; path: string }
 const DEFAULT_FAVORITES: Favorite[] = [];
-let FAVORITES: Favorite[] = JSON.parse(localStorage.getItem("cc-favorites") || "null") || DEFAULT_FAVORITES;
+// Re-derive each display name from its path on load: it's always the basename, and
+// this self-heals favorites persisted before the Windows-path fix (whose stored name
+// was the full backslash path). `basename` is hoisted, so it's usable here.
+let FAVORITES: Favorite[] = (JSON.parse(localStorage.getItem("cc-favorites") || "null") || DEFAULT_FAVORITES)
+  .map((f: Favorite) => ({ ...f, name: basename(f.path) }));
 function saveFavorites() { localStorage.setItem("cc-favorites", JSON.stringify(FAVORITES)); }
 // User-defined sidebar order (project path keys), set by drag-drop. Projects not
 // listed here keep their natural order after the listed ones.
@@ -93,7 +97,9 @@ if (!SORT_MODES.includes(sortMode)) sortMode = "manual";
 // killing the drop. Telemetry ticks call renderAll() constantly, so this guard
 // is what makes reordering actually work during live sessions.
 let draggingProjects = false;
-const MONO = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+// Leads with the bundled Nerd Font (see @font-face in styles.css) so the terminal
+// draws powerline / devicon glyphs on every OS; the rest stay as graceful fallbacks.
+const MONO = '"JetBrainsMono Nerd Font", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
 
 // ---------- model ----------
 type Phase = "idle" | "thinking" | "working" | "done" | "error" | "ended";
@@ -126,6 +132,22 @@ interface Sess {
 const sessions = new Map<string, Sess>();
 let activeId: string | null = null;
 let termFontSize = parseFloat(localStorage.getItem("cc-term-font") || "") || 12.5;
+
+// The WebGL/canvas renderer bakes a glyph texture atlas on first paint. If the
+// bundled Nerd Font (font-display:block) isn't ready yet, that atlas caches tofu
+// boxes for the icon glyphs and never repaints them on its own. So force the font
+// to load, then drop every open terminal's atlas once it's ready — the next frame
+// re-rasterizes with real glyphs. Terminals opened after this point are already fine.
+void (async () => {
+  try {
+    await Promise.all([
+      document.fonts.load(`${termFontSize}px "JetBrainsMono Nerd Font"`),
+      document.fonts.load(`bold ${termFontSize}px "JetBrainsMono Nerd Font"`),
+    ]);
+    await document.fonts.ready;
+  } catch { /* Font Loading API unavailable — the browser still applies the @font-face */ }
+  for (const s of sessions.values()) s.term?.clearTextureAtlas();
+})();
 
 // Account-wide rate limits. Every session's statusLine reports the same account
 // numbers, but only as fresh as *that* session last refreshed them — an idle
@@ -227,7 +249,9 @@ function accentFor(key: string): string {
   for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
   return hslToHex(h % 360, 0.68, 0.63);
 }
-function basename(p: string) { const parts = p.replace(/\/+$/, "").split("/"); return parts[parts.length - 1] || p; }
+// Split on both separators so Windows paths (E:\proj\sub) collapse to the leaf,
+// not the whole string — otherwise the sidebar shows the full path as the name.
+function basename(p: string) { const parts = p.replace(/[/\\]+$/, "").split(/[/\\]/); return parts[parts.length - 1] || p; }
 // Claude prepends an animated spinner to its OSC title: it cycles through braille
 // dots (U+2800-U+28FF) and an eight-spoked asterisk (U+2733), e.g. a braille dot or
 // a star before "Fixing the bug". Strip any leading run of those so the sidebar
@@ -516,7 +540,7 @@ function toolArg(tool: string, input: any): string {
   if (!input || typeof input !== "object") return "";
   const v = input.file_path ?? input.path ?? input.command ?? input.pattern ?? input.url ?? input.query ?? input.prompt ?? input.description;
   if (typeof v !== "string" || !v.trim()) return "";
-  if ((tool === "Read" || tool === "Edit" || tool === "Write") && v.includes("/")) return v.split("/").pop() || v;
+  if ((tool === "Read" || tool === "Edit" || tool === "Write") && /[/\\]/.test(v)) return v.split(/[/\\]/).pop() || v;
   return abbr(v, 64);
 }
 // Open a timeline entry on PreToolUse; closeActivity fills its latency on the
@@ -1837,7 +1861,18 @@ async function checkForUpdates(manual: boolean) {
       if (manual) toast("You're on the latest version");
     }
   } catch (e) {
-    dlog("error", `update check failed: ${String(e)}`);
+    const msg = String(e);
+    // The update manifest (latest.json) may not list this platform yet — e.g. no
+    // Windows release has been published. The updater reports that as "None of the
+    // fallback platforms [...] were found in the response platforms object". That's
+    // "no update for this platform", not a failure — surface it quietly.
+    if (msg.includes("were found in the response")) {
+      $("fUpdate").hidden = true;
+      dlog("info", "no update published for this platform yet");
+      if (manual) toast("No update published for this platform yet");
+      return;
+    }
+    dlog("error", `update check failed: ${msg}`);
     if (manual) toast("Update check failed — see debug console");
   }
 }

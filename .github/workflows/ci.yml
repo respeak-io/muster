@@ -1,0 +1,59 @@
+name: ci
+
+# Compile gate for every PR and every push to main. There is no runtime test suite
+# (verification is running the app — see CLAUDE.md), so this proves the far cheaper
+# thing: the frontend typechecks and both supported OSes still build. It's what
+# catches "someone broke the Windows build" (or the macOS one) before it merges,
+# since the cfg-gated platform code only compiles on its own OS.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # Typechecks (tsc) and builds the frontend. Must run before cargo, because
+      # Tauri's `generate_context!` embeds `frontendDist` (../dist) at compile time
+      # and errors if it's missing.
+      - name: Build frontend (tsc + vite)
+        run: npm run build
+
+      - name: Cargo check
+        working-directory: ./src-tauri
+        run: cargo check --locked
+
+      # Lint signal only — does not fail the build on warnings, so a pre-existing
+      # style nit can't block an unrelated PR.
+      - name: Clippy (non-blocking)
+        working-directory: ./src-tauri
+        run: cargo clippy --all-targets || true

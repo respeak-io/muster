@@ -94,9 +94,47 @@ fn run_telemetry_server(server: tiny_http::Server, app: AppHandle) {
     }
 }
 
+/// User's home directory — `USERPROFILE` on Windows, `HOME` elsewhere.
+fn home_dir() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE").unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_default()
+    }
+}
+
+/// A `std::process::Command` that never flashes a console window on Windows. A GUI
+/// app spawning a console subprocess (git, where, curl, taskkill) pops a black
+/// window for each call without `CREATE_NO_WINDOW`; on other platforms this is a
+/// plain `Command::new`.
+fn sys_command<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    let c = std::process::Command::new(program);
+    #[cfg(windows)]
+    let mut c = c;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
 /// Per-session settings file layered on top of the user's ~/.claude via
-/// `claude --settings`. Absolute /usr/bin/curl + /bin/cat because Claude runs
-/// hooks/statusline with a stripped PATH.
+/// `claude --settings`. The generated hook/statusLine commands POST their stdin
+/// payload to our telemetry server. Both platforms use absolute paths to a
+/// guaranteed `curl` because Claude runs hooks/statusLine with a stripped PATH:
+/// `/usr/bin/curl` (macOS/Linux) or `C:\Windows\System32\curl.exe` (Windows,
+/// present since Win10 1803). On Windows the command is PowerShell — forced via
+/// the hook's `shell` field, since Claude Code's default hook shell there is Git
+/// Bash. curl reads Claude's payload straight from the shell's *inherited* stdin
+/// (`--data-binary @-`); we deliberately do NOT round-trip it through a PowerShell
+/// string (`$x=[Console]::In.ReadToEnd(); $x | curl`), because PowerShell prepends
+/// a UTF-8 BOM when piping a string to a native process, which `serde_json` then
+/// refuses to parse — silently dropping every payload. (Verified empirically.)
 fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<String> {
     let mut dir = std::env::temp_dir();
     dir.push("cc-launcher");
@@ -106,12 +144,34 @@ fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<Str
     // so telemetry keeps routing to the right pane even after Claude rotates its own
     // runtime session_id (/clear, /compact, /resume all mint a new one). The id is
     // baked into the generated command — no dependence on env propagation.
-    let statusline_cmd = format!(
-        "i=$(/bin/cat); printf '%s' \"$i\" | /usr/bin/curl -s --max-time 1 -X POST 'http://127.0.0.1:{port}/statusline' -H 'X-CC-Session: {session_id}' --data-binary @- >/dev/null 2>&1; printf 'cc-launcher'"
-    );
-    let hook_cmd = format!(
-        "/usr/bin/curl -s --max-time 2 -X POST 'http://127.0.0.1:{port}/hook' -H 'X-CC-Session: {session_id}' --data-binary @- >/dev/null 2>&1 || true"
-    );
+    #[cfg(windows)]
+    let (statusline_cmd, hook_cmd, shell): (String, String, Option<&str>) = {
+        let curl = r"C:\Windows\System32\curl.exe";
+        let statusline = format!(
+            "& '{curl}' -s --max-time 1 -X POST 'http://127.0.0.1:{port}/statusline' -H 'X-CC-Session: {session_id}' --data-binary '@-' 1>$null 2>$null; Write-Output 'cc-launcher'"
+        );
+        let hook = format!(
+            "& '{curl}' -s --max-time 2 -X POST 'http://127.0.0.1:{port}/hook' -H 'X-CC-Session: {session_id}' --data-binary '@-' 1>$null 2>$null"
+        );
+        (statusline, hook, Some("powershell"))
+    };
+    #[cfg(not(windows))]
+    let (statusline_cmd, hook_cmd, shell): (String, String, Option<&str>) = {
+        let statusline = format!(
+            "i=$(/bin/cat); printf '%s' \"$i\" | /usr/bin/curl -s --max-time 1 -X POST 'http://127.0.0.1:{port}/statusline' -H 'X-CC-Session: {session_id}' --data-binary @- >/dev/null 2>&1; printf 'cc-launcher'"
+        );
+        let hook = format!(
+            "/usr/bin/curl -s --max-time 2 -X POST 'http://127.0.0.1:{port}/hook' -H 'X-CC-Session: {session_id}' --data-binary @- >/dev/null 2>&1 || true"
+        );
+        (statusline, hook, None)
+    };
+
+    // Build the command-hook leaf once (adding `shell` on Windows) and clone it per
+    // event, so the platform choice lives in exactly one place.
+    let mut hook_leaf = serde_json::json!({ "type": "command", "command": hook_cmd, "async": true, "timeout": 5 });
+    if let Some(sh) = shell {
+        hook_leaf["shell"] = serde_json::Value::String(sh.to_string());
+    }
 
     let events = [
         "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
@@ -122,12 +182,12 @@ fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<Str
     for ev in events {
         hooks.insert(
             ev.to_string(),
-            serde_json::json!([
-                { "matcher": "", "hooks": [ { "type": "command", "command": hook_cmd, "async": true, "timeout": 5 } ] }
-            ]),
+            serde_json::json!([ { "matcher": "", "hooks": [ hook_leaf.clone() ] } ]),
         );
     }
-    // PermissionRequest is a BLOCKING http hook — Claude waits for the app's decision.
+    // PermissionRequest is a BLOCKING http hook — Claude waits for the app's
+    // decision. It's `type:"http"`, so it's shell-independent and identical on
+    // every platform.
     hooks.insert(
         "PermissionRequest".to_string(),
         serde_json::json!([
@@ -135,8 +195,13 @@ fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<Str
         ]),
     );
 
+    let mut statusline = serde_json::json!({ "type": "command", "command": statusline_cmd, "refreshInterval": 3, "padding": 0 });
+    if let Some(sh) = shell {
+        statusline["shell"] = serde_json::Value::String(sh.to_string());
+    }
+
     let settings = serde_json::json!({
-        "statusLine": { "type": "command", "command": statusline_cmd, "refreshInterval": 3, "padding": 0 },
+        "statusLine": statusline,
         "hooks": hooks
     });
 
@@ -145,11 +210,12 @@ fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<Str
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Resolve the absolute path to the `claude` binary. GUI apps launched from
-/// Finder get a stripped PATH, so we check common install locations and fall
-/// back to the user's login shell.
+/// Resolve the absolute path to the `claude` binary. GUI apps get a stripped PATH
+/// (Finder on macOS, no inherited shell env on Windows), so we check common install
+/// locations first and fall back to a `which`/`where` probe.
+#[cfg(not(windows))]
 fn resolve_claude() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir();
     let candidates = [
         format!("{home}/.local/bin/claude"),
         format!("{home}/.claude/local/claude"),
@@ -163,7 +229,7 @@ fn resolve_claude() -> String {
         }
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    if let Ok(o) = std::process::Command::new(&shell).args(["-lic", "command -v claude"]).output() {
+    if let Ok(o) = sys_command(&shell).args(["-lic", "command -v claude"]).output() {
         let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if !p.is_empty() && std::path::Path::new(&p).exists() {
             return p;
@@ -172,12 +238,52 @@ fn resolve_claude() -> String {
     "claude".to_string()
 }
 
+/// Windows: prefer the native installer's `claude.exe` (spawnable directly via
+/// CreateProcess, unlike the npm `.cmd` shim which needs a shell), then `where`.
+#[cfg(windows)]
+fn resolve_claude() -> String {
+    let home = home_dir();
+    let candidates = [
+        format!(r"{home}\.local\bin\claude.exe"),
+        format!(r"{home}\.claude\local\claude.exe"),
+        format!(r"{home}\AppData\Local\Programs\claude\claude.exe"),
+    ];
+    for c in &candidates {
+        if std::path::Path::new(c).exists() {
+            return c.clone();
+        }
+    }
+    // `where` may print several lines (claude.exe + claude.cmd); prefer a .exe.
+    if let Ok(o) = sys_command("where").arg("claude").output() {
+        let text = String::from_utf8_lossy(&o.stdout);
+        let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        if let Some(exe) = lines.iter().find(|l| l.to_lowercase().ends_with(".exe")) {
+            return exe.to_string();
+        }
+        if let Some(first) = lines.first() {
+            return first.to_string();
+        }
+    }
+    "claude".to_string()
+}
+
 /// A PATH that includes the usual per-user bin dirs, so the spawned `claude`
-/// (and anything it shells out to) is found even under Finder's stripped PATH.
+/// (and anything it shells out to) is found even under a stripped PATH.
+#[cfg(not(windows))]
 fn augmented_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir();
     let base = std::env::var("PATH").unwrap_or_default();
     format!("{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{base}")
+}
+
+/// Windows uses `;` as the PATH separator; include the native-installer bin dir and
+/// System32 (where `curl.exe` lives), then whatever we inherited.
+#[cfg(windows)]
+fn augmented_path() -> String {
+    let home = home_dir();
+    let base = std::env::var("PATH").unwrap_or_default();
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{home}\.local\bin;{home}\.claude\local;{sysroot}\System32;{base}")
 }
 
 /// Force a UTF-8 locale on a PTY child. A macOS app launched from Finder inherits no
@@ -186,6 +292,13 @@ fn augmented_path() -> String {
 /// UTF-8 locale on startup; mirror that. Preserve an already-UTF-8 `LANG` (e.g. Muster
 /// launched from a terminal), else default one; and pin `LC_CTYPE` so an inherited
 /// `LC_CTYPE=C` can't re-break the charset behind a good `LANG`.
+#[cfg(windows)]
+fn apply_utf8_locale(_cmd: &mut CommandBuilder) {
+    // No-op on Windows: the C-locale charset mangling this guards against is a
+    // POSIX/Finder concern. ConPTY + claude.exe handle console encoding themselves.
+}
+
+#[cfg(not(windows))]
 fn apply_utf8_locale(cmd: &mut CommandBuilder) {
     let is_utf8 = |var: &str| {
         std::env::var(var)
@@ -302,6 +415,29 @@ fn stream_pty_session(
     });
 }
 
+/// The interactive shell for a scratch terminal pane: `(program, args)`.
+/// macOS/Linux: the user's `$SHELL` as a login shell. Windows: PowerShell 7
+/// (`pwsh`) if installed, else Windows PowerShell, else `cmd.exe` — no login flag.
+#[cfg(not(windows))]
+fn interactive_shell() -> (String, Vec<String>) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    (shell, vec!["-l".to_string()])
+}
+
+#[cfg(windows)]
+fn interactive_shell() -> (String, Vec<String>) {
+    let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
+    if std::path::Path::new(pwsh).exists() {
+        return (pwsh.to_string(), vec!["-NoLogo".to_string()]);
+    }
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let powershell = format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    if std::path::Path::new(&powershell).exists() {
+        return (powershell, vec!["-NoLogo".to_string()]);
+    }
+    (format!(r"{sysroot}\System32\cmd.exe"), vec![])
+}
+
 /// Open a plain login shell in an embedded PTY (no Claude, no instrumentation) — a
 /// scratch terminal that lives in a Muster pane just like a session. Wired to the
 /// same `pty-output` / `write_pty` / `pty-exit` path as `spawn_claude`.
@@ -320,9 +456,11 @@ fn spawn_shell(
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| e.to_string())?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let (shell, shell_args) = interactive_shell();
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l"); // login shell, so the user's normal prompt/aliases load
+    for a in &shell_args {
+        cmd.arg(a);
+    }
     cmd.cwd(&workdir);
     for (k, v) in std::env::vars() {
         cmd.env(k, v);
@@ -348,8 +486,15 @@ fn spawn_shell(
     Ok(())
 }
 
+/// No Ghostty engine on Windows — the embedded xterm.js pane is the only engine.
+#[cfg(windows)]
 fn find_ghostty() -> Option<String> {
-    if let Ok(o) = std::process::Command::new("which").arg("ghostty").output() {
+    None
+}
+
+#[cfg(not(windows))]
+fn find_ghostty() -> Option<String> {
+    if let Ok(o) = sys_command("which").arg("ghostty").output() {
         if o.status.success() {
             let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !p.is_empty() {
@@ -407,7 +552,16 @@ fn spawn_ghostty(
 }
 
 /// Which external terminals are installed, so the UI only offers ones that work.
-/// (The embedded terminal is always available and isn't listed here.)
+/// (The embedded terminal is always available and isn't listed here.) Windows has
+/// no external-terminal engine yet, so this is empty there and the UI falls back to
+/// the embedded pane.
+#[cfg(windows)]
+#[tauri::command]
+fn available_terminals() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
 #[tauri::command]
 fn available_terminals() -> Vec<String> {
     let mut v = Vec::new();
@@ -427,8 +581,22 @@ fn available_terminals() -> Vec<String> {
 }
 
 /// Single-quote a string for safe inclusion in a POSIX shell script.
+#[cfg(not(windows))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// No external-terminal engine on Windows yet — the frontend won't offer one (see
+/// `available_terminals`), but guard the command so a stray call fails cleanly.
+#[cfg(windows)]
+#[tauri::command]
+fn spawn_external_terminal(
+    _session_id: String,
+    _workdir: String,
+    _engine: String,
+    _title: String,
+) -> Result<(), String> {
+    Err("external terminals aren't supported on Windows yet — use the embedded terminal".to_string())
 }
 
 /// Launch an instrumented `claude` session in a generic external terminal app
@@ -436,6 +604,7 @@ fn sh_quote(s: &str) -> String {
 /// up PATH, cd's into the workdir and execs claude, then hand it to `open -a`.
 /// Telemetry still flows via the per-session settings hooks, so the session shows
 /// up in Muster's cockpit just like an embedded/Ghostty one.
+#[cfg(not(windows))]
 #[tauri::command]
 fn spawn_external_terminal(
     state: State<AppState>,
@@ -484,11 +653,37 @@ fn spawn_external_terminal(
     Ok(())
 }
 
+/// Windows: pop a plain scratch terminal at `workdir` — Windows Terminal (`wt.exe`)
+/// if installed, else a PowerShell window via `cmd /c start`. `engine` is ignored
+/// (there's only the embedded engine on Windows).
+#[cfg(windows)]
+#[tauri::command]
+fn open_terminal_here(workdir: String, _engine: String) -> Result<(), String> {
+    if !std::path::Path::new(&workdir).is_dir() {
+        return Err(format!("not a directory: {workdir}"));
+    }
+    // Windows Terminal opens a new tab/window rooted at a directory via `-d`.
+    if sys_command("wt.exe").arg("-d").arg(&workdir).spawn().is_ok() {
+        return Ok(());
+    }
+    // Fallback: `cmd /c start` spawns a *new console window* (a bare Command::spawn
+    // of powershell from a GUI app gets no window). `-NoExit` keeps it open.
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let powershell = format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    std::process::Command::new(format!(r"{sysroot}\System32\cmd.exe"))
+        .args(["/C", "start", "", &powershell, "-NoExit"])
+        .current_dir(&workdir)
+        .spawn()
+        .map_err(|e| format!("open terminal: {e}"))?;
+    Ok(())
+}
+
 /// Open a plain (non-Claude) shell in an external terminal at `workdir` — a quick
 /// scratch terminal for running commands next to a session. There's no
 /// instrumentation here: it's just a shell, so it does NOT appear in Muster's
 /// cockpit. `engine` is a hint (the user's chosen launch engine); embedded has no
 /// external window, so it falls back to Terminal.app.
+#[cfg(not(windows))]
 #[tauri::command]
 fn open_terminal_here(workdir: String, engine: String) -> Result<(), String> {
     if !std::path::Path::new(&workdir).is_dir() {
@@ -598,7 +793,7 @@ fn create_worktree(repo_dir: String, branch: String) -> Result<String, String> {
     // text for control flow (as this used to) silently broke worktree creation on
     // non-English gits. We now branch on exit codes / an explicit existence probe.
     let git = |args: &[&str]| {
-        std::process::Command::new("git")
+        sys_command("git")
             .env("LC_ALL", "C")
             .args(args)
             .output()
@@ -664,7 +859,7 @@ struct Worktree {
 /// The first entry is the main working tree.
 #[tauri::command]
 fn list_worktrees(repo_dir: String) -> Vec<Worktree> {
-    let out = std::process::Command::new("git")
+    let out = sys_command("git")
         .arg("-C").arg(&repo_dir).args(["worktree", "list", "--porcelain"])
         .output();
     let out = match out {
@@ -698,7 +893,7 @@ fn list_worktrees(repo_dir: String) -> Vec<Worktree> {
 /// Current git branch for a working directory (None if not a repo / detached).
 #[tauri::command]
 fn git_branch(workdir: String) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = sys_command("git")
         .arg("-C")
         .arg(&workdir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -726,7 +921,7 @@ struct HeadInfo {
 #[tauri::command]
 fn git_head(workdir: String) -> Option<HeadInfo> {
     let git = |args: &[&str]| {
-        std::process::Command::new("git")
+        sys_command("git")
             .env("LC_ALL", "C")
             .arg("-C").arg(&workdir)
             .args(args)
@@ -762,17 +957,25 @@ fn git_head(workdir: String) -> Option<HeadInfo> {
 ///   do keys already loaded in ssh-agent. Anything else fails fast and readably —
 ///   which is exactly when we hand the user a terminal.
 fn git_cmd(workdir: &str, args: &[&str]) -> std::process::Command {
-    let mut c = std::process::Command::new("git");
+    let mut c = sys_command("git");
     c.env("LC_ALL", "C")
         .env("PATH", augmented_path())
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/usr/bin/false")
-        .env("SSH_ASKPASS", "/usr/bin/false")
         .env("SSH_ASKPASS_REQUIRE", "never")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
-        .arg("-C")
-        .arg(workdir)
-        .args(args);
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    #[cfg(not(windows))]
+    {
+        c.env("GIT_ASKPASS", "/usr/bin/false").env("SSH_ASKPASS", "/usr/bin/false");
+    }
+    #[cfg(windows)]
+    {
+        // No `/usr/bin/false` to point an askpass at; instead forbid Git Credential
+        // Manager's interactive GUI prompt, so a missing credential fails fast rather
+        // than popping a dialog that hangs the invoke thread. `git_run`'s hard
+        // timeout is the ultimate backstop. Stored creds (GCM cache) still work.
+        c.arg("-c").arg("credential.interactive=false");
+    }
+    c.arg("-C").arg(workdir).args(args);
     c
 }
 
@@ -796,7 +999,10 @@ fn git_run(mut cmd: std::process::Command, secs: u64) -> Result<std::process::Ou
     match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
         Ok(r) => r.map_err(|e| e.to_string()),
         Err(_) => {
-            let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            #[cfg(not(windows))]
+            let _ = sys_command("kill").arg("-9").arg(pid.to_string()).status();
+            #[cfg(windows)]
+            let _ = sys_command("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).status();
             Err(format!("no answer after {secs}s — remote unreachable, or it wants credentials"))
         }
     }
@@ -861,7 +1067,7 @@ struct DiffStat {
 #[tauri::command]
 fn git_diffstat(workdir: String) -> Option<DiffStat> {
     let git = |args: &[&str]| {
-        std::process::Command::new("git")
+        sys_command("git")
             .env("LC_ALL", "C")
             .arg("-C").arg(&workdir)
             .args(args)
@@ -1220,9 +1426,16 @@ struct ExternalSession {
 }
 
 /// One `ps -o <fields>=` line for a single pid (trimmed), or None if the process
-/// is gone / no output.
+/// is gone / no output. Windows has no `ps`; process introspection (per-session
+/// resources, external-session ownership) is macOS-only for now, so this is None.
+#[cfg(windows)]
+fn ps_one(_pid: u32, _fields: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
 fn ps_one(pid: u32, fields: &str) -> Option<String> {
-    let out = std::process::Command::new("ps")
+    let out = sys_command("ps")
         .args(["-p", &pid.to_string(), "-o", fields])
         .output()
         .ok()?;
@@ -1233,6 +1446,7 @@ fn ps_one(pid: u32, fields: &str) -> Option<String> {
 /// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
 /// Used to recognise `claude` processes Muster launched — directly (embedded
 /// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session id.
+#[cfg(not(windows))]
 fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
     let mut cur = pid;
     for _ in 0..24 {
@@ -1247,10 +1461,19 @@ fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
     false
 }
 
+/// Surfacing sessions started outside Muster relies on `ps` liveness/ownership
+/// checks that don't exist on Windows yet, so this is empty there.
+#[cfg(windows)]
+#[tauri::command]
+fn list_external_sessions(_state: State<AppState>, _exclude: Vec<String>) -> Vec<ExternalSession> {
+    Vec::new()
+}
+
 /// List interactive Claude Code sessions running OUTSIDE Muster. `exclude` is the
 /// set of session ids Muster already owns (belt-and-suspenders — ours don't
 /// register anyway). Dead/stale registry files are filtered by verifying the pid
 /// is still a live `claude` process.
+#[cfg(not(windows))]
 #[tauri::command]
 fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<ExternalSession> {
     let home = match std::env::var("HOME") {
@@ -1345,6 +1568,7 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
 
 /// Walk up the process tree from `pid` to the owning GUI terminal app.
 /// Returns (app_pid, app_exe_path) — e.g. (719, "/…/Terminal.app/Contents/MacOS/Terminal").
+#[cfg(not(windows))]
 fn owning_terminal(pid: u32) -> Option<(u32, String)> {
     let mut cur = pid;
     for _ in 0..16 {
@@ -1364,9 +1588,17 @@ fn owning_terminal(pid: u32) -> Option<(u32, String)> {
     None
 }
 
+/// External-session surfacing (and thus focusing) is macOS-only for now.
+#[cfg(windows)]
+#[tauri::command]
+fn focus_external_session(_pid: u32) -> Result<(), String> {
+    Err("focusing external sessions isn't supported on Windows yet".to_string())
+}
+
 /// Bring the terminal window/tab hosting an external session to the front.
 /// Exact tab focus for Terminal.app + iTerm2 (matched by tty); best-effort app
 /// activation for anything else.
+#[cfg(not(windows))]
 #[tauri::command]
 fn focus_external_session(pid: u32) -> Result<(), String> {
     let tty = ps_one(pid, "tty=").unwrap_or_default().trim().to_string();
@@ -1428,7 +1660,10 @@ struct TranscriptMsg {
 #[tauri::command]
 fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<TranscriptMsg>, String> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
-    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let home = home_dir();
+    if home.is_empty() {
+        return Err("no home directory".to_string());
+    }
     let enc: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
