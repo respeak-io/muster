@@ -989,6 +989,28 @@ fn git_head(workdir: String) -> Option<HeadInfo> {
     Some(HeadInfo { branch, short })
 }
 
+/// Resolve `cwd` to its repo's MAIN worktree root and current branch. This is what
+/// lets external sessions running in different worktrees of one repo group under that
+/// repo (and merge into its project) instead of each cwd becoming its own top-level
+/// entry in the sidebar. One git call: line 1 = the common `.git` dir (its parent is
+/// the main worktree, identical for the main checkout AND every linked worktree),
+/// line 2 = the branch ("HEAD" when detached). (None, None) when `cwd` isn't a repo.
+fn git_repo_info(cwd: &str) -> (Option<String>, Option<String>) {
+    let out = match git_cmd(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir", "--abbrev-ref", "HEAD"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return (None, None),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let common = lines.next().unwrap_or("").trim();
+    let branch = lines.next().unwrap_or("").trim();
+    let root = std::path::Path::new(common).parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+    let branch = if branch.is_empty() || branch == "HEAD" { None } else { Some(branch.to_string()) };
+    (root, branch)
+}
+
 /// A `git` command hardened for running under a GUI app.
 ///
 /// Three things are non-negotiable here, and each one has bitten this codebase's
@@ -1533,6 +1555,11 @@ struct ExternalSession {
     status_updated_at: Option<i64>,
     started_at: Option<i64>,
     version: String,
+    /// Main worktree root of this session's repo — the key the sidebar groups by, so
+    /// every worktree of one repo lands under it. None when cwd isn't a git repo.
+    repo_root: Option<String>,
+    /// Branch checked out in this session's cwd (None when detached / not a repo).
+    branch: Option<String>,
 }
 
 /// One `ps -o <fields>=` line for a single pid (trimmed), or None if the process
@@ -1632,6 +1659,8 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
             status_updated_at: v.get("statusUpdatedAt").and_then(|x| x.as_i64()),
             started_at: v.get("startedAt").and_then(|x| x.as_i64()),
             version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            repo_root: None,
+            branch: None,
         });
     }
     if parsed.is_empty() {
@@ -1670,6 +1699,15 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     let self_pid = std::process::id();
     let owned = state.owned_pids.lock().unwrap().clone();
     parsed.retain(|s| !owned.contains(&s.pid) && !is_descendant_of(s.pid, self_pid));
+
+    // Enrich survivors with their repo root + branch so worktrees of one repo group
+    // together (and merge into that repo's project) rather than each cwd becoming its
+    // own top-level entry. After the filters, so no git runs on stale or owned pids.
+    for s in parsed.iter_mut() {
+        let (root, branch) = git_repo_info(&s.cwd);
+        s.repo_root = root;
+        s.branch = branch;
+    }
 
     // most-recently-active first
     parsed.sort_by(|a, b| b.status_updated_at.unwrap_or(0).cmp(&a.status_updated_at.unwrap_or(0)));

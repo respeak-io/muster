@@ -216,6 +216,26 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .g-work{color:var(--st-working);} .g-attn{color:var(--st-attention);} .g-done{color:var(--st-done);} .g-idle{color:var(--st-idle);} .g-error{color:var(--st-error);} .g-ended{color:var(--muted-2);}
 @media (prefers-reduced-motion: no-preference) { .g-work,.g-attn{ animation: pulse 1.5s ease-in-out infinite; } @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}} }
 
+/* ---- worktree grouping ---- */
+/* subheader mode: a ⑃-branch cluster header, its sessions nested under a tinted rule */
+/* padding-left 0 + a 13px glyph box centres the ⑃ (box centre 6.5px) on the
+   .wtsessions border-left below it (margin-left 6px + 0.5px half-border) */
+.wthead { display: flex; align-items: center; gap: 7px; padding: 4px 8px 2px 0; margin-top: 1px; }
+.wtglyph { flex: none; width: 13px; text-align: center; font-size: 11px; line-height: 1; }
+.wtname { min-width: 0; font-size: 11px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wtcount { flex: none; margin-left: auto; font: 600 9px var(--font-mono); color: var(--muted-2); }
+.wtsessions { padding-left: 8px; margin-left: 6px; border-left: 1px solid color-mix(in srgb, var(--wtc, var(--hair)) 45%, transparent); display: flex; flex-direction: column; gap: 1px; }
+/* toplevel mode: the branch suffix on a per-worktree group header */
+.pwt { margin-left: 5px; color: var(--muted-2); font-weight: 550; }
+/* chip mode: a colour-coded ⑃ that expands to the branch name on row hover */
+.srow.o3 { grid-template-columns: 14px minmax(0,1fr) auto auto; }
+.srow.extrow.o3e { grid-template-columns: 14px minmax(0,1fr) auto auto auto; }
+.chip { display: inline-flex; align-items: center; overflow: hidden; font: 600 10px var(--font-mono); color: var(--wtc, var(--muted-2)); }
+.chip .fork { flex: none; }
+.chip .lbl { max-width: 0; opacity: 0; white-space: nowrap; transform: translateX(-3px); transition: max-width .22s ease, opacity .18s ease, transform .22s ease, margin-left .22s ease; }
+.srow.o3:hover .chip .lbl, .srow.o3e:hover .chip .lbl { max-width: 130px; opacity: 1; transform: none; margin-left: 4px; }
+@media (prefers-reduced-motion: reduce) { .chip .lbl { transition: none; } }
+
 /* minified icon-rail */
 .railmini { display: none; flex-direction: column; align-items: center; gap: 8px; padding: 10px 0; overflow-y: auto; }
 .app.rail-mini .rail-scroll { display: none; }
