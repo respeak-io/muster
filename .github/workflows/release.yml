@@ -114,7 +114,7 @@ jobs:
             **Windows (x64)**
 
             1. Download **Muster_*_x64-setup.exe** (or the **.msi**) from the assets below.
-            2. Muster isn't code-signed, so Windows SmartScreen may warn on first run — click **More info → Run anyway**.
+            2. Muster is code-signed by Respeak GmbH. SmartScreen may still warn until the new certificate builds download reputation — if so, click **More info → Run anyway**.
 
             Requires `claude` on your `PATH`. Muster keeps itself up to date after install (checks the latest release on launch; never auto-installs).
           releaseDraft: false
