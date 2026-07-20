@@ -88,6 +88,30 @@ const SORT_META: Record<SortMode, { glyph: string; label: string }> = {
 };
 let sortMode: SortMode = (localStorage.getItem("cc-sort") as SortMode) || "manual";
 if (!SORT_MODES.includes(sortMode)) sortMode = "manual";
+// --- sidebar worktree grouping -------------------------------------------------
+// Sessions of a repo already collapse into one project group (colorKey = repo root);
+// this decides how the worktrees WITHIN that group are shown. The distinguishing key
+// per worktree is s.workdir (the actual checkout dir); s.worktree holds its branch.
+//   off       — flat rows, branch only as a fallback label (legacy behaviour)
+//   subheader — a ⑃-branch header per worktree cluster, sessions nested under it
+//   toplevel  — each worktree becomes its own top-level group ("repo · branch")
+//   chip      — flat rows, each worktree row carries a colour-coded ⑃ chip
+// off/subheader/chip differ purely in the render layer; toplevel also splits
+// projectList() so close-navigation and the mini-rail stay coherent. A project with a
+// single checkout always renders flat, whatever the mode. Persisted under
+// cc-worktree-group; no in-app control yet — the settings window (separate branch)
+// will own the picker, until then flip it via setWtGroup() / localStorage.
+type WtGroup = "off" | "subheader" | "toplevel" | "chip";
+const WT_GROUPS: WtGroup[] = ["off", "subheader", "toplevel", "chip"];
+let wtGroup: WtGroup = (localStorage.getItem("cc-worktree-group") as WtGroup) || "subheader";
+if (!WT_GROUPS.includes(wtGroup)) wtGroup = "subheader";
+function setWtGroup(m: WtGroup) {
+  wtGroup = WT_GROUPS.includes(m) ? m : "subheader";
+  localStorage.setItem("cc-worktree-group", wtGroup);
+  renderAll();
+}
+// Dev affordance until the settings window ships: musterWtGroup("chip") in the console.
+(window as unknown as { musterWtGroup: typeof setWtGroup }).musterWtGroup = setWtGroup;
 // While a project group is being dragged, renderSidebar() must not rebuild the
 // #projects DOM — doing so would destroy the node the browser is dragging,
 // killing the drop. Telemetry ticks call renderAll() constantly, so this guard
@@ -165,6 +189,9 @@ function rlReset(reset: number | null): number | null {
 interface ExtSession {
   pid: number; session_id: string; cwd: string; name: string;
   status: string; status_updated_at?: number | null; started_at?: number | null; version: string;
+  // repo_root = the main worktree of this session's repo (backend-resolved), so all
+  // worktrees of one repo group under it; branch = the branch checked out in cwd.
+  repo_root?: string | null; branch?: string | null;
 }
 let externals: ExtSession[] = [];
 let activeExtId: string | null = null;      // session_id of the external session being mirrored
@@ -420,6 +447,10 @@ async function refreshExternals() {
   try {
     const list = await invoke<ExtSession[]>("list_external_sessions", { exclude: [...sessions.keys()] });
     externals = list;
+    // Scour each external repo for its logo, keyed by the same repo_root the sidebar
+    // groups by — otherwise ext-only projects would forever show the accent dot.
+    // probeIcon dedupes by key, so this hits the backend at most once per repo.
+    for (const e of externals) probeIcon(e.repo_root || e.cwd);
     if (activeExtId && !externals.some((e) => e.session_id === activeExtId)) {
       // the mirrored session ended — fall back to a Muster session or the empty state
       closeExternalView();
@@ -645,7 +676,49 @@ function applyStatusline(s: Sess, data: any) {
 }
 
 // ---------- rendering ----------
-interface ProjGroup { name: string; path: string; accent: string; sessions: Sess[]; externals: ExtSession[] }
+interface ProjGroup { name: string; path: string; accent: string; sessions: Sess[]; externals: ExtSession[]; wtBranch?: string }
+// A worktree cluster = the sessions of one project that share a checkout dir. Order
+// follows first appearance in the (already-sorted) session list, so the active/
+// attention sort still decides which worktree floats up. The repo-root checkout
+// (worktree === null) is the "main" cluster; its label is the live branch.
+interface WtCluster { key: string; branch: string; isMain: boolean; sessions: Sess[]; externals: ExtSession[] }
+function clusterByWorktree(p: ProjGroup): WtCluster[] {
+  const by = new Map<string, WtCluster>();
+  const order: WtCluster[] = [];
+  const bucket = (key: string, branch: string): WtCluster => {
+    let c = by.get(key);
+    if (!c) { c = { key, branch, isMain: key === p.path, sessions: [], externals: [] }; by.set(key, c); order.push(c); }
+    else if (!c.branch && branch) c.branch = branch;
+    return c;
+  };
+  for (const s of p.sessions) bucket(s.workdir || p.path, s.branch || s.worktree || "").sessions.push(s);
+  for (const e of p.externals) bucket(e.cwd || p.path, e.branch || "").externals.push(e);
+  // Label clusters that never carried a branch: the repo-root checkout is "main",
+  // any other bare dir falls back to its folder name.
+  for (const c of order) if (!c.branch) c.branch = c.isMain ? "main" : basename(c.key);
+  return order;
+}
+// A stable colour per branch, from the same hash as project accents so the sidebar's
+// colour language stays consistent (a branch and a project just seed different hues).
+const branchHue = (c: WtCluster) => accentFor(c.branch || c.key);
+// toplevel mode: explode any project whose sessions span >1 worktree into one group
+// per worktree. The root checkout keeps the project's identity (path/favourite/
+// externals); each worktree gets its own group keyed by its checkout dir, carrying
+// the branch in wtBranch. Single-checkout projects pass through untouched.
+function splitByWorktree(list: ProjGroup[]): ProjGroup[] {
+  const out: ProjGroup[] = [];
+  for (const p of list) {
+    const cl = clusterByWorktree(p);
+    const wts = cl.filter((c) => !c.isMain);
+    if (!wts.length) { out.push(p); continue; }
+    const root = cl.find((c) => c.isMain);
+    // Keep the root group only when it carries something — root-checkout rows or a
+    // favourite (a launch target). Drops the phantom empty root of a worktree-only repo.
+    if (root || FAVORITES.some((f) => f.path === p.path)) out.push({ ...p, sessions: root?.sessions ?? [], externals: root?.externals ?? [] });
+    for (const c of wts) out.push({ name: p.name, path: c.key, accent: p.accent, sessions: c.sessions, externals: c.externals, wtBranch: c.branch });
+  }
+  return out;
+}
 function projectList(): ProjGroup[] {
   const list: ProjGroup[] = FAVORITES.map((f) => ({ name: f.name, path: f.path, accent: accentFor(f.path), sessions: [], externals: [] }));
   const byName = new Map(list.map((p) => [p.name, p]));
@@ -656,23 +729,31 @@ function projectList(): ProjGroup[] {
     p.sessions.push(s);
   }
   for (const e of externals) {
-    let p = byPath.get(e.cwd);
-    if (!p) { p = { name: basename(e.cwd), path: e.cwd, accent: accentFor(e.cwd), sessions: [], externals: [] }; list.push(p); byPath.set(e.cwd, p); byName.set(p.name, p); }
+    // Group by the repo's main worktree, not the raw cwd, so every worktree of one
+    // repo lands under it (and merges into that repo's favourite when paths match).
+    const key = e.repo_root || e.cwd;
+    let p = byPath.get(key);
+    if (!p) { p = { name: basename(key), path: key, accent: accentFor(key), sessions: [], externals: [] }; list.push(p); byPath.set(key, p); byName.set(p.name, p); }
     p.externals.push(e);
   }
+  // Sort sessions within each project first, then (in toplevel mode) split by
+  // worktree so each split group inherits the sorted order, then order the groups.
+  const sessCmp = sortMode === "active" ? (a: Sess, b: Sess) => b.lastActivity - a.lastActivity
+    : sortMode === "attention" ? (a: Sess, b: Sess) => urgencyRank(a) - urgencyRank(b) || a.phaseSince - b.phaseSince
+    : null;
+  if (sessCmp) for (const p of list) p.sessions.sort(sessCmp);
+  const groups = wtGroup === "toplevel" ? splitByWorktree(list) : list;
   if (sortMode === "active") {
-    for (const p of list) p.sessions.sort((a, b) => b.lastActivity - a.lastActivity);
-    list.sort((a, b) => projActivity(b) - projActivity(a));
+    groups.sort((a, b) => projActivity(b) - projActivity(a));
   } else if (sortMode === "attention") {
-    for (const p of list) p.sessions.sort((a, b) => urgencyRank(a) - urgencyRank(b) || a.phaseSince - b.phaseSince);
-    list.sort((a, b) => projUrgency(a) - projUrgency(b) || projWaitSince(a) - projWaitSince(b));
+    groups.sort((a, b) => projUrgency(a) - projUrgency(b) || projWaitSince(a) - projWaitSince(b));
   } else {
     // manual: the user's drag-drop order; unlisted projects keep their natural
     // order after listed ones (stable sort preserves ties).
     const rank = (path: string) => { const i = projOrder.indexOf(path); return i === -1 ? Number.MAX_SAFE_INTEGER : i; };
-    list.sort((a, b) => rank(a.path) - rank(b.path));
+    groups.sort((a, b) => rank(a.path) - rank(b.path));
   }
-  return list;
+  return groups;
 }
 // How much a session wants the user's attention (lower = more urgent). Shared by
 // the sidebar's "attention" sort and the header reactor.
@@ -705,7 +786,9 @@ function nextAfterClose(s: Sess): Sess | null {
   return flat[fi + 1] || flat[fi - 1] || null;
 }
 
-function sessionRow(s: Sess): string {
+// `chip` (chip mode only) tags the row with its worktree's colour-coded branch,
+// which expands from a bare ⑃ to the branch name on row hover.
+function sessionRow(s: Sess, chip?: WtCluster): string {
   const k = statusKey(s);
   // Prefer the abbreviated title; fall back to the branch/worktree only until
   // Claude sets a title, so idle rows stay identifiable. (Branch is kept in the
@@ -714,17 +797,50 @@ function sessionRow(s: Sess): string {
   // shells have no telemetry phase — show a terminal prompt glyph (a dot once exited)
   const glyph = s.shell ? (s.phase === "ended" ? GLYPH.ended : "❯") : GLYPH[k];
   const gcls = s.shell ? (s.phase === "ended" ? GCLASS.ended : "g-idle") : GCLASS[k];
-  return `<div class="srow ${s.id === activeId ? "active" : ""}" data-sel="${s.id}">
+  const chipHtml = chip
+    ? `<span class="chip" style="--wtc:${branchHue(chip)}"><span class="fork">⑃</span><span class="lbl">${esc(chip.branch)}</span></span>`
+    : "";
+  return `<div class="srow${chip ? " o3" : ""} ${s.id === activeId ? "active" : ""}" data-sel="${s.id}">
     <span class="sglyph ${gcls}">${glyph}</span>
-    <span class="sbranch" title="${esc(label)}">${esc(label)}</span>
+    <span class="sbranch" title="${esc(label)}">${esc(label)}</span>${chipHtml}
     <span class="sctx">${s.ctxPct != null ? Math.round(s.ctxPct) + "%" : ""}</span>
     <span class="sclose" data-close="${s.id}" title="Close session">✕</span></div>`;
 }
-function extRow(e: ExtSession): string {
+// The full body of a project group (owned sessions + external rows), shaped by the
+// worktree-grouping mode. subheader → ⑃ cluster headers with nested rows; chip →
+// flat rows each tagged with a colour-coded branch chip; off/toplevel → plain flat
+// rows. A single-checkout project (one cluster) always renders flat — nothing to
+// disambiguate. Externals cluster right alongside owned sessions (same checkout dir).
+function groupBody(p: ProjGroup): string {
+  const flat = () => p.sessions.map((s) => sessionRow(s)).join("") + p.externals.map((e) => extRow(e)).join("");
+  if (wtGroup === "subheader") {
+    const cl = clusterByWorktree(p);
+    if (cl.length >= 2) return cl.map((c) => {
+      const col = branchHue(c), n = c.sessions.length + c.externals.length;
+      const body = c.sessions.map((s) => sessionRow(s)).join("") + c.externals.map((e) => extRow(e)).join("");
+      return `<div class="wthead"><span class="wtglyph" style="color:${col}">⑃</span>`
+        + `<span class="wtname" style="color:${col}" title="${esc(c.branch)}">${esc(c.branch)}</span>`
+        + `<span class="wtcount">${n}</span></div>`
+        + `<div class="wtsessions" style="--wtc:${col}">${body}</div>`;
+    }).join("");
+  } else if (wtGroup === "chip") {
+    const cl = clusterByWorktree(p);
+    if (cl.length >= 2) {
+      const byKey = new Map(cl.map((c) => [c.key, c]));
+      return p.sessions.map((s) => sessionRow(s, byKey.get(s.workdir || p.path))).join("")
+        + p.externals.map((e) => extRow(e, byKey.get(e.cwd || p.path))).join("");
+    }
+  }
+  return flat();
+}
+function extRow(e: ExtSession, chip?: WtCluster): string {
   const working = extWorking(e);
-  return `<div class="srow extrow ${e.session_id === activeExtId ? "active" : ""}" data-ext="${e.session_id}" data-key="${esc(e.cwd)}">
+  const chipHtml = chip
+    ? `<span class="chip" style="--wtc:${branchHue(chip)}"><span class="fork">⑃</span><span class="lbl">${esc(chip.branch)}</span></span>`
+    : "";
+  return `<div class="srow extrow${chip ? " o3e" : ""} ${e.session_id === activeExtId ? "active" : ""}" data-ext="${e.session_id}" data-key="${esc(e.cwd)}">
     <span class="sglyph ${working ? "g-work" : "g-idle"}">${working ? "●" : "○"}</span>
-    <span class="sbranch">${esc(e.name || basename(e.cwd))}</span>
+    <span class="sbranch">${esc(e.name || basename(e.cwd))}</span>${chipHtml}
     <span class="ext-tag" title="Running outside Muster · Claude v${esc(e.version)} · pid ${e.pid}">ext</span>
     <span class="sjump" data-jump="${e.pid}" title="Jump to its terminal ↗">↗</span></div>`;
 }
@@ -732,12 +848,13 @@ function renderSidebar() {
   // Don't stomp the DOM the browser is mid-drag on — see draggingProjects.
   if (draggingProjects) return;
   $("projects").innerHTML = projectList().map((p) => {
-    const rows = p.sessions.map(sessionRow).join("") + p.externals.map(extRow).join("");
+    const rows = groupBody(p);
     const total = p.sessions.length + p.externals.length;
     const isFav = FAVORITES.some((f) => f.path === p.path);
+    const wtSuffix = p.wtBranch ? `<span class="pwt">· ${esc(p.wtBranch)}</span>` : "";
     let head: string;
     if (p.sessions.length) {
-      head = `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span><span class="pcount">${total}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`;
+      head = `<div class="phead" data-sel="${p.sessions[0].id}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}${wtSuffix}</span><span class="pcount">${total}</span><span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}">＋</span></div>`;
     } else if (isFav) {
       const tail = p.externals.length ? `<span class="pcount ext">${p.externals.length} ext</span>` : `<span class="plaunch">launch →</span>`;
       head = `<div class="phead empty-p" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" data-key="${esc(p.path)}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${tail}<span class="premove" data-remove="${esc(p.path)}" title="Remove project">✕</span></div>`;
