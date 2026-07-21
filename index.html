@@ -31,6 +31,7 @@
             <button class="caf-caret" id="cafCaret" aria-label="Choose caffeinate mode">▾</button>
           </div>
           <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+          <button class="ibtn" id="setBtn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
         </div>
       </header>
 
@@ -130,6 +131,17 @@
         <button class="diff-x" id="diffClose" title="Close (Esc)">✕</button>
       </div>
       <div class="diff-body" id="diffBody"></div>
+    </div>
+
+    <div class="setdlg" id="setDlg" role="dialog" aria-modal="true" aria-label="Settings">
+      <nav class="set-rail">
+        <div class="set-title">Settings</div>
+        <div class="set-tabs" id="setTabs"></div>
+      </nav>
+      <section class="set-pane">
+        <button class="set-x" id="setClose" title="Close (Esc)" aria-label="Close settings">✕</button>
+        <div class="set-body" id="setBody"></div>
+      </section>
     </div>
 
     <div class="dbg-panel" id="dbgPanel" hidden>

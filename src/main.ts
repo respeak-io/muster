@@ -64,6 +64,14 @@ function setEngine(id: Engine) {
   renderFoot();
 }
 
+// Persisted theme override (cc-theme). Absent → follow the OS via the CSS
+// `color-scheme` default; an explicit value pins light/dark across restarts.
+// Applied here at module start (before first paint) so the settings choice sticks.
+{
+  const savedTheme = localStorage.getItem("cc-theme");
+  if (savedTheme === "dark" || savedTheme === "light") document.documentElement.setAttribute("data-theme", savedTheme);
+}
+
 // ---------- config ----------
 // Home dir resolves at runtime (for `~` path abbreviation). Favorites start
 // empty and are added by the user — persisted to localStorage.
@@ -1488,10 +1496,16 @@ async function openDiff(workdir: string, title: string) {
     $("diffBody").innerHTML = `<div class="diff-empty">Couldn't read the diff.<br><span class="mono">${esc(String(e))}</span></div>`;
   }
 }
+// Several dialogs share the one #scrim, so closing any of them must only drop it
+// once none of the others are still up.
+const SCRIM_DLGS = ["palette", "wtDlg", "diffDlg", "setDlg"];
+function dropScrim() {
+  if (!SCRIM_DLGS.some((id) => $(id).classList.contains("show"))) $("scrim").classList.remove("show");
+}
 function closeDiff() {
   diffOpen = false;
   $("diffDlg").classList.remove("show");
-  if (!$("palette").classList.contains("show") && !$("wtDlg").classList.contains("show")) $("scrim").classList.remove("show");
+  dropScrim();
 }
 function renderDiffBody(files: DiffFile[], truncated: boolean) {
   const tot = files.reduce((a, f) => ({ add: a.add + f.added, rem: a.rem + f.removed }), { add: 0, rem: 0 });
@@ -1953,7 +1967,18 @@ function setSort(m: SortMode, announce = true) {
 function cycleSort() { setSort(SORT_MODES[(SORT_MODES.indexOf(sortMode) + 1) % SORT_MODES.length]); }
 function toggleRail() { $("app").classList.toggle("rail-mini"); }
 function toggleInsp() { $("app").classList.toggle("insp-off"); $("inspBtn").classList.toggle("on", !$("app").classList.contains("insp-off")); refit(); }
-function toggleTheme() { const cur = document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark"); }
+// The effective theme = an explicit data-theme override, else the OS preference.
+function effectiveTheme(): "dark" | "light" {
+  const a = document.documentElement.getAttribute("data-theme");
+  if (a === "dark" || a === "light") return a;
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function setTheme(t: "dark" | "light") {
+  document.documentElement.setAttribute("data-theme", t);
+  localStorage.setItem("cc-theme", t);
+  renderSettings(); // keep the settings picker in sync if it's open
+}
+function toggleTheme() { setTheme(effectiveTheme() === "dark" ? "light" : "dark"); }
 function refit() { if (!activeId) return; const s = sessions.get(activeId); if (!s?.term || !s.fit) return; try { s.fit.fit(); invoke("resize_pty", { sessionId: s.id, rows: s.term.rows, cols: s.term.cols }); } catch { /* */ } }
 function applyFontSize() { for (const s of sessions.values()) if (s.term) s.term.options.fontSize = termFontSize; refit(); localStorage.setItem("cc-term-font", String(termFontSize)); }
 function bumpFont(d: number) { termFontSize = Math.max(8, Math.min(28, termFontSize + d)); applyFontSize(); toast(`Terminal font ${termFontSize}px`); }
@@ -2045,7 +2070,7 @@ function openWorktreeSession(path: string, branch: string) {
   if (existing) { setActive(existing.id); return; }
   launch(project, path, { colorKey: repoDir, worktree: branch, branch });
 }
-function closeWt() { $("wtDlg").classList.remove("show"); if (!$("palette").classList.contains("show")) $("scrim").classList.remove("show"); wtCtx = null; }
+function closeWt() { $("wtDlg").classList.remove("show"); dropScrim(); wtCtx = null; }
 // Create a worktree on `branch` (new or existing) and launch a session in it. Shared
 // by the free-text field (wtCreate) and one-click branch rows (data-branch).
 async function createWorktreeOn(branch: string) {
@@ -2062,6 +2087,108 @@ function wtCreate() {
   const branch = ($("wtBranch") as HTMLInputElement).value.trim();
   if (!branch) { toast("Enter a branch name"); return; }
   createWorktreeOn(branch);
+}
+
+// ---------- settings dialog ----------
+// A sidebar-tab settings window built on the shared #scrim + `.show` overlay (same
+// pattern as #wtDlg / #palette). Every control is a small declarative descriptor
+// that writes its cc-* key through the SAME setter the rest of the app uses, so a
+// change here is instantly live and persisted — there is no separate settings store.
+type SetSeg = { value: string; label: string; sub?: string; glyph?: string };
+// A control is either a segmented picker (radio-style) or the font stepper.
+type SetControl =
+  | { kind: "seg"; set: string; label: string; hint?: string; active: () => string; segs: () => SetSeg[] }
+  | { kind: "font"; label: string; hint?: string };
+interface SetTab { id: string; label: string; glyph: string; controls: () => SetControl[] }
+
+const SORT_SHORT: Record<SortMode, string> = { manual: "Manual", active: "Active", attention: "Attention" };
+// One-line descriptions of each worktree-grouping mode (mirrors the WtGroup comment block).
+const WT_GROUP_SEGS: SetSeg[] = [
+  { value: "off",       label: "Off",       glyph: "≡", sub: "Flat rows; branch shown only as a fallback label" },
+  { value: "subheader", label: "Subheader", glyph: "⑃", sub: "A branch header per worktree, sessions nested beneath" },
+  { value: "toplevel",  label: "Top level", glyph: "⊞", sub: "Each worktree becomes its own top-level project group" },
+  { value: "chip",      label: "Chip",      glyph: "◆", sub: "Flat rows; each worktree row carries a colour-coded chip" },
+];
+
+const SET_TABS: SetTab[] = [
+  {
+    id: "appearance", label: "Appearance", glyph: "◐",
+    controls: () => [
+      { kind: "seg", set: "theme", label: "Theme", hint: "Light or dark surfaces across the whole app.",
+        active: () => effectiveTheme(),
+        segs: () => [
+          { value: "light", label: "Light", glyph: "☀", sub: "Bright surfaces" },
+          { value: "dark",  label: "Dark",  glyph: "☾", sub: "Dim surfaces" },
+        ] },
+      { kind: "font", label: "Terminal font size", hint: "Text size in embedded terminals (also ⌘+ / ⌘− / ⌘0)." },
+    ],
+  },
+  {
+    id: "sessions", label: "Sessions", glyph: "▤",
+    controls: () => [
+      { kind: "seg", set: "engine", label: "Launch engine", hint: "Where a new session's terminal opens.",
+        active: () => termEngine,
+        segs: () => availEngines.map((id) => { const d = engineDef(id); return { value: id, label: d.label, sub: d.sub, glyph: id === "embedded" ? "▤" : "⧉" }; }) },
+      { kind: "seg", set: "sort", label: "Sidebar sort", hint: "How projects and sessions are ordered in the sidebar.",
+        active: () => sortMode,
+        segs: () => SORT_MODES.map((m) => ({ value: m, label: SORT_SHORT[m], sub: SORT_META[m].label, glyph: SORT_META[m].glyph })) },
+    ],
+  },
+  {
+    id: "worktrees", label: "Worktrees", glyph: "⑃",
+    controls: () => [
+      { kind: "seg", set: "wtgroup", label: "Worktree grouping", hint: "How several checkouts of one repo are shown within its project group.",
+        active: () => wtGroup,
+        segs: () => WT_GROUP_SEGS },
+    ],
+  },
+];
+
+let setTab = "appearance";
+function settingsOpen() { return $("setDlg").classList.contains("show"); }
+function openSettings() { $("scrim").classList.add("show"); $("setDlg").classList.add("show"); renderSettings(); }
+function closeSettings() {
+  $("setDlg").classList.remove("show");
+  dropScrim();
+}
+function renderSettings() {
+  if (!settingsOpen()) return;
+  $("setTabs").innerHTML = SET_TABS.map((t) =>
+    `<button class="set-tab ${t.id === setTab ? "on" : ""}" data-settab="${t.id}"><span class="set-tglyph">${t.glyph}</span>${esc(t.label)}</button>`
+  ).join("");
+  const tab = SET_TABS.find((t) => t.id === setTab) || SET_TABS[0];
+  $("setBody").innerHTML = tab.controls().map(renderSetControl).join("");
+}
+function renderSetControl(c: SetControl): string {
+  const head = `<div class="set-glabel">${esc(c.label)}</div>${c.hint ? `<div class="set-hint">${esc(c.hint)}</div>` : ""}`;
+  if (c.kind === "font") {
+    return `<div class="set-group">${head}<div class="set-font">
+      <button class="set-fbtn" data-setfont="-0.5" title="Smaller" aria-label="Smaller">−</button>
+      <span class="set-fval mono">${termFontSize}px</span>
+      <button class="set-fbtn" data-setfont="0.5" title="Larger" aria-label="Larger">+</button>
+      <button class="set-freset" data-setfont="reset">Reset</button>
+    </div></div>`;
+  }
+  const active = c.active();
+  const opts = c.segs().map((s) =>
+    `<button class="seg-opt ${s.value === active ? "on" : ""}" data-set="${c.set}" data-val="${esc(s.value)}">` +
+      `<span class="seg-top">${s.glyph ? `<span class="seg-glyph">${s.glyph}</span>` : ""}<span class="seg-l">${esc(s.label)}</span><span class="seg-check">✓</span></span>` +
+      `${s.sub ? `<span class="seg-s">${esc(s.sub)}</span>` : ""}</button>`
+  ).join("");
+  return `<div class="set-group">${head}<div class="seg">${opts}</div></div>`;
+}
+// Dispatch a segmented pick to the existing setter, then repaint the picker.
+function applySetting(set: string, val: string) {
+  if (set === "theme") setTheme(val as "dark" | "light");
+  else if (set === "engine") setEngine(val as Engine);
+  else if (set === "sort") setSort(val as SortMode);
+  else if (set === "wtgroup") setWtGroup(val as WtGroup);
+  renderSettings();
+}
+function setFontFromSettings(cmd: string) {
+  if (cmd === "reset") { termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
+  else bumpFont(parseFloat(cmd));
+  renderSettings();
 }
 
 // ---------- events ----------
@@ -2390,6 +2517,18 @@ $("attnBadge").addEventListener("click", () => {
 
 $("kbar").addEventListener("click", openPalette);
 $("themeBtn").addEventListener("click", toggleTheme);
+$("setBtn").addEventListener("click", () => settingsOpen() ? closeSettings() : openSettings());
+$("setClose").addEventListener("click", closeSettings);
+$("setTabs").addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>("[data-settab]");
+  if (b) { setTab = b.dataset.settab!; renderSettings(); }
+});
+$("setBody").addEventListener("click", (e) => {
+  const f = (e.target as HTMLElement).closest<HTMLElement>("[data-setfont]");
+  if (f) { setFontFromSettings(f.dataset.setfont!); return; }
+  const o = (e.target as HTMLElement).closest<HTMLElement>("[data-set]");
+  if (o) applySetting(o.dataset.set!, o.dataset.val!);
+});
 $("railCollapse").addEventListener("click", toggleRail);
 $("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);
@@ -2546,7 +2685,7 @@ $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);
 $("wtMain").addEventListener("click", () => { if (!wtCtx) return; const { project, repoDir } = wtCtx; closeWt(); launch(project, repoDir, { colorKey: repoDir }); });
 $("wtBranch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtCreate(); } else if (e.key === "Escape") closeWt(); });
-$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); });
+$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); closeSettings(); });
 $("diffClose").addEventListener("click", closeDiff);
 // Collapse / expand a file section by clicking its header.
 $("diffBody").addEventListener("click", (e) => {
@@ -2579,7 +2718,9 @@ window.addEventListener("keydown", (e) => {
   else if (meta && (e.key === "=" || e.key === "+")) { e.preventDefault(); bumpFont(0.5); }
   else if (meta && e.key === "-") { e.preventDefault(); bumpFont(-0.5); }
   else if (meta && e.key === "0") { e.preventDefault(); termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
+  else if (meta && e.key === ",") { e.preventDefault(); settingsOpen() ? closeSettings() : openSettings(); }
   else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
+  else if (e.key === "Escape" && settingsOpen()) { e.preventDefault(); closeSettings(); }
 });
 new ResizeObserver(() => refit()).observe($("terminals"));
 
