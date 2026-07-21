@@ -32,4 +32,8 @@ tauri-plugin-process = "2"
 # logs at all — a panic that unwound out of main left zero trace on disk.
 log = "0.4"
 tauri-plugin-log = "2"
+# Process-table introspection (external-session liveness + ancestry) without
+# spawning `ps`/`tasklist` — one in-process snapshot, same code on every OS.
+# 0.38 (not latest) because newer sysinfo raises MSRV past our rustc.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 

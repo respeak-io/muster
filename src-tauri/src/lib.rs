@@ -1728,6 +1728,13 @@ fn find_project_icon(dir: String) -> Option<ProjectIcon> {
 // own live session as "external". What remains is the sessions started outside
 // Muster (a plain terminal, an IDE, etc.) — we jump to their terminal window and
 // show a read-only mirror of their transcript.
+//
+// The registry format and directory are identical on Windows (verified on CC
+// 2.1.216: `%USERPROFILE%\.claude\sessions\<pid>.json`, VS Code-hosted sessions
+// included), so LISTING is fully cross-platform: liveness/ownership checks go
+// through `ProcTable`, an in-process `sysinfo` snapshot that works the same on
+// macOS, Windows and Linux. Only `focus_external_session` (jumping to the
+// owning terminal window) remains platform-specific — macOS-only today.
 
 #[derive(serde::Serialize)]
 struct ExternalSession {
@@ -1747,8 +1754,10 @@ struct ExternalSession {
 }
 
 /// One `ps -o <fields>=` line for a single pid (trimmed), or None if the process
-/// is gone / no output. Windows has no `ps`; process introspection (per-session
-/// resources, external-session ownership) is macOS-only for now, so this is None.
+/// is gone / no output. Windows has no `ps`; the remaining `ps` consumers
+/// (per-session CPU/RAM, terminal-window focus) are macOS-only for now, so this
+/// is None there. External-session listing does NOT go through here — it uses
+/// the cross-platform `ProcTable` below.
 #[cfg(windows)]
 fn ps_one(_pid: u32, _fields: &str) -> Option<String> {
     None
@@ -1764,43 +1773,104 @@ fn ps_one(pid: u32, fields: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
-/// Used to recognise `claude` processes Muster launched — directly (embedded
-/// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session id.
-#[cfg(not(windows))]
-fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
-    let mut cur = pid;
-    for _ in 0..24 {
-        if cur == ancestor {
-            return true;
-        }
-        match ps_one(cur, "ppid=").and_then(|s| s.trim().parse::<u32>().ok()) {
-            Some(ppid) if ppid > 1 => cur = ppid,
-            _ => return false,
-        }
-    }
-    false
+/// A point-in-time snapshot of the system process table (pid → parent + name),
+/// taken in-process via `sysinfo` so the exact same code serves macOS, Windows
+/// and Linux — no `ps`/`tasklist` child processes. The frontend polls external
+/// sessions every ~3s; refreshing only the bare process list (no CPU/memory/
+/// exe/cmd lookups) keeps a snapshot to a few milliseconds.
+struct ProcTable {
+    /// pid → (ppid, lowercased process name)
+    procs: std::collections::HashMap<u32, (Option<u32>, String)>,
 }
 
-/// Surfacing sessions started outside Muster relies on `ps` liveness/ownership
-/// checks that don't exist on Windows yet, so this is empty there.
-#[cfg(windows)]
-#[tauri::command]
-fn list_external_sessions(_state: State<AppState>, _exclude: Vec<String>) -> Vec<ExternalSession> {
-    Vec::new()
+impl ProcTable {
+    fn snapshot() -> Self {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let procs = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| {
+                (
+                    pid.as_u32(),
+                    (p.parent().map(|pp| pp.as_u32()), p.name().to_string_lossy().to_lowercase()),
+                )
+            })
+            .collect();
+        Self { procs }
+    }
+
+    /// True if `pid` is currently a live process whose name contains "claude" —
+    /// the identity check that guards against stale registry files and pid
+    /// reuse. Matched loosely because the name varies: `claude` on macOS/Linux,
+    /// `claude.exe` on Windows, and self-update renames like
+    /// `claude.exe.old.<ts>` for a binary updated while running.
+    fn is_live_claude(&self, pid: u32) -> bool {
+        self.procs.get(&pid).is_some_and(|(_, name)| name.contains("claude"))
+    }
+
+    /// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
+    /// Used to recognise `claude` processes Muster launched — directly (embedded
+    /// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session
+    /// id. The iteration cap also bounds ppid cycles, which Windows can produce
+    /// after pid reuse (a dead parent's pid handed to a new process).
+    fn is_descendant_of(&self, pid: u32, ancestor: u32) -> bool {
+        let mut cur = pid;
+        for _ in 0..24 {
+            if cur == ancestor {
+                return true;
+            }
+            match self.procs.get(&cur).and_then(|(ppid, _)| *ppid) {
+                Some(ppid) if ppid > 1 && ppid != cur => cur = ppid,
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
+/// Parse one `~/.claude/sessions/<pid>.json` registry file into an
+/// `ExternalSession` (repo_root/branch enriched later). None for malformed
+/// files and non-interactive entries (`claude -p`, SDK runs).
+fn parse_registry_entry(txt: &str) -> Option<ExternalSession> {
+    let v: serde_json::Value = serde_json::from_str(txt).ok()?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some("interactive") {
+        return None;
+    }
+    let pid = v.get("pid").and_then(|x| x.as_u64())? as u32;
+    let session_id = v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(ExternalSession {
+        pid,
+        session_id,
+        cwd: v.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        status: v.get("status").and_then(|x| x.as_str()).unwrap_or("idle").to_string(),
+        status_updated_at: v.get("statusUpdatedAt").and_then(|x| x.as_i64()),
+        started_at: v.get("startedAt").and_then(|x| x.as_i64()),
+        version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        repo_root: None,
+        branch: None,
+    })
 }
 
 /// List interactive Claude Code sessions running OUTSIDE Muster. `exclude` is the
 /// set of session ids Muster already owns (belt-and-suspenders — ours don't
 /// register anyway). Dead/stale registry files are filtered by verifying the pid
 /// is still a live `claude` process.
-#[cfg(not(windows))]
 #[tauri::command]
 fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<ExternalSession> {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return vec![],
-    };
+    let home = home_dir();
+    if home.is_empty() {
+        return vec![];
+    }
     let dir = std::path::Path::new(&home).join(".claude").join("sessions");
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -1809,70 +1879,22 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     let exclude: std::collections::HashSet<String> =
         exclude.into_iter().map(|s| s.to_lowercase()).collect();
 
-    let mut parsed: Vec<ExternalSession> = Vec::new();
-    for ent in entries.flatten() {
-        let p = ent.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let txt = match std::fs::read_to_string(&p) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let v: serde_json::Value = match serde_json::from_str(&txt) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("kind").and_then(|k| k.as_str()) != Some("interactive") {
-            continue;
-        }
-        let pid = match v.get("pid").and_then(|x| x.as_u64()) {
-            Some(n) => n as u32,
-            None => continue,
-        };
-        let session_id = v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        if session_id.is_empty() || exclude.contains(&session_id.to_lowercase()) {
-            continue;
-        }
-        parsed.push(ExternalSession {
-            pid,
-            session_id,
-            cwd: v.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or("idle").to_string(),
-            status_updated_at: v.get("statusUpdatedAt").and_then(|x| x.as_i64()),
-            started_at: v.get("startedAt").and_then(|x| x.as_i64()),
-            version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            repo_root: None,
-            branch: None,
-        });
-    }
+    let mut parsed: Vec<ExternalSession> = entries
+        .flatten()
+        .map(|ent| ent.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|txt| parse_registry_entry(&txt))
+        .filter(|s| !exclude.contains(&s.session_id.to_lowercase()))
+        .collect();
     if parsed.is_empty() {
         return parsed;
     }
 
-    // Liveness + identity: one `ps` for all pids; keep those still running `claude`
-    // (guards against stale files and pid reuse).
-    let pids_csv = parsed.iter().map(|s| s.pid.to_string()).collect::<Vec<_>>().join(",");
-    let live: std::collections::HashSet<u32> = std::process::Command::new("ps")
-        .args(["-p", &pids_csv, "-o", "pid=,comm="])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let l = l.trim();
-                    let mut it = l.splitn(2, char::is_whitespace);
-                    let pid = it.next()?.trim().parse::<u32>().ok()?;
-                    let comm = it.next().unwrap_or("");
-                    if comm.to_lowercase().contains("claude") { Some(pid) } else { None }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    parsed.retain(|s| live.contains(&s.pid));
+    // Liveness + identity: one process-table snapshot for all pids; keep those
+    // still running `claude` (guards against stale files and pid reuse).
+    let table = ProcTable::snapshot();
+    parsed.retain(|s| table.is_live_claude(s.pid));
 
     // Drop Muster's OWN sessions, matched by pid — NOT by session id. Their id on
     // disk changes when the user runs /resume or /clear (the pid file is rewritten
@@ -1882,7 +1904,7 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     // catches sessions launched into a child terminal (e.g. Ghostty).
     let self_pid = std::process::id();
     let owned = state.owned_pids.lock().unwrap().clone();
-    parsed.retain(|s| !owned.contains(&s.pid) && !is_descendant_of(s.pid, self_pid));
+    parsed.retain(|s| !owned.contains(&s.pid) && !table.is_descendant_of(s.pid, self_pid));
 
     // Enrich survivors with their repo root + branch so worktrees of one repo group
     // together (and merge into that repo's project) rather than each cwd becoming its
@@ -2161,22 +2183,18 @@ fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<
         match content {
             Some(serde_json::Value::String(s)) => text.push_str(s),
             Some(serde_json::Value::Array(arr)) => {
+                // Only "text" blocks: tool calls (Bash, Read, Edit, …), tool_result
+                // echoes and thinking blocks are noise in a read-only conversation
+                // mirror — keep the human/assistant prose. An assistant turn that is
+                // only tool calls collapses to empty and is dropped below.
                 for blk in arr {
-                    match blk.get("type").and_then(|x| x.as_str()) {
-                        Some("text") => {
-                            if let Some(s) = blk.get("text").and_then(|x| x.as_str()) {
-                                if !text.is_empty() {
-                                    text.push('\n');
-                                }
-                                text.push_str(s);
+                    if blk.get("type").and_then(|x| x.as_str()) == Some("text") {
+                        if let Some(s) = blk.get("text").and_then(|x| x.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
                             }
+                            text.push_str(s);
                         }
-                        // Tool calls (Bash, Read, Edit, …), tool_result echoes and
-                        // thinking blocks are noise in a read-only conversation
-                        // mirror — keep only the human/assistant prose. An assistant
-                        // turn that is only tool calls collapses to empty and is
-                        // dropped below.
-                        _ => {}
                     }
                 }
             }
@@ -2715,5 +2733,63 @@ mod tests {
         assert!(body.len() as u64 > 512 * 1024, "fixture must exceed the tail cap");
         assert_eq!(transcript_meta(&path).unwrap().0, "Fresh tail title");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn table(entries: &[(u32, Option<u32>, &str)]) -> ProcTable {
+        ProcTable {
+            procs: entries.iter().map(|&(pid, ppid, name)| (pid, (ppid, name.to_string()))).collect(),
+        }
+    }
+
+    #[test]
+    fn proc_table_identity_and_ancestry() {
+        // muster(100) → ghostty(200) → claude(300); unrelated claude(400) under init.
+        let t = table(&[
+            (100, Some(1), "muster"),
+            (200, Some(100), "ghostty"),
+            (300, Some(200), "claude"),
+            (400, Some(1), "claude.exe"),
+        ]);
+        assert!(t.is_descendant_of(300, 100), "grandchild via child terminal");
+        assert!(t.is_descendant_of(100, 100), "a pid is its own ancestor");
+        assert!(!t.is_descendant_of(400, 100), "unrelated session must stay external");
+        assert!(t.is_live_claude(300));
+        assert!(t.is_live_claude(400), "windows .exe name still matches");
+        assert!(!t.is_live_claude(200), "live but not claude");
+        assert!(!t.is_live_claude(999), "dead pid");
+    }
+
+    #[test]
+    fn proc_table_ancestry_survives_ppid_cycles() {
+        // Windows pid reuse can produce ppid cycles; the walk must terminate.
+        let t = table(&[(10, Some(20), "a"), (20, Some(10), "b")]);
+        assert!(!t.is_descendant_of(10, 99));
+    }
+
+    #[test]
+    fn proc_table_snapshot_sees_this_process() {
+        // Real sysinfo snapshot on whatever OS runs the tests: our own pid must
+        // be present and count as its own descendant.
+        let t = ProcTable::snapshot();
+        let me = std::process::id();
+        assert!(t.procs.contains_key(&me), "own pid missing from process snapshot");
+        assert!(t.is_descendant_of(me, me));
+    }
+
+    #[test]
+    fn parse_registry_entry_accepts_interactive_rejects_rest() {
+        // Shape verified against a real CC 2.1.216 registry file on Windows;
+        // the keys are identical on macOS.
+        let win = r#"{"pid":41708,"sessionId":"20283E01-6874-4FBB-B696-C29A89F13CC6","cwd":"E:\\Programming\\Work\\Respeak\\muster","startedAt":1784613714619,"procStart":"639202177128968910","version":"2.1.216","peerProtocol":1,"kind":"interactive","entrypoint":"cli","name":"muster-15","nameSource":"derived","status":"busy","updatedAt":1784614124255,"statusUpdatedAt":1784614124255}"#;
+        let s = parse_registry_entry(win).expect("interactive entry should parse");
+        assert_eq!(s.pid, 41708);
+        assert_eq!(s.cwd, r"E:\Programming\Work\Respeak\muster");
+        assert_eq!(s.status, "busy");
+        assert_eq!(s.status_updated_at, Some(1784614124255));
+
+        // Non-interactive (`claude -p`, SDK) and malformed entries are skipped.
+        assert!(parse_registry_entry(r#"{"pid":1,"sessionId":"x","kind":"print"}"#).is_none());
+        assert!(parse_registry_entry(r#"{"sessionId":"x","kind":"interactive"}"#).is_none());
+        assert!(parse_registry_entry("not json").is_none());
     }
 }
