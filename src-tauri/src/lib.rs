@@ -44,6 +44,10 @@ struct AppState {
     /// without a clean stop — no orphaned process keeps the Mac awake forever.
     #[cfg(not(windows))]
     caffeinate: Mutex<Option<std::process::Child>>,
+    /// The single live `SetThreadExecutionState` assertion, if the user has
+    /// toggled keep-awake on. Windows' equivalent of the `caffeinate` child.
+    #[cfg(windows)]
+    caffeinate: Mutex<Option<KeepAwake>>,
 }
 
 /// Find a request header by (case-insensitive) name.
@@ -887,14 +891,107 @@ fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> R
     Ok(())
 }
 
-/// Windows has no `caffeinate` binary and no power-assertion equivalent wired up
-/// yet (that would be `SetThreadExecutionState`). The UI hides the control there,
-/// so this only exists to keep the command registered for the shared
-/// `invoke_handler!` list — reaching it means the frontend guard was bypassed.
+/// A live Windows power assertion. `SetThreadExecutionState` is scoped to the
+/// *calling thread* — the assertion dies with that thread — so we park a thread
+/// for exactly as long as the user wants the machine awake. That thread-scoping
+/// is also the safety net the macOS side gets from `caffeinate -w <our pid>`: a
+/// panic or a hard exit can't leave a Windows box pinned awake, because the
+/// thread goes with the process.
+#[cfg(windows)]
+struct KeepAwake {
+    /// Dropping this releases the assertion: the parked thread's `recv()` fails,
+    /// it clears the execution state and exits.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        // Join so the state is provably cleared before a replacement assertion
+        // is set up — otherwise a preset switch could race the old thread's
+        // clearing call and land on ES_CONTINUOUS (i.e. silently off).
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Translate the macOS `caffeinate` flags the UI speaks into Windows execution
+/// state bits, so the frontend keeps one vocabulary for both platforms.
+///
+///   `-d` (display) → `ES_DISPLAY_REQUIRED`   `-i` / `-s` (idle/system) → `ES_SYSTEM_REQUIRED`
+///   `-m` (disk) and `-u` (user active) have no Windows equivalent and are dropped.
+///   `-t <sec>` is dropped too — the frontend's own timer disarms the preset.
+///
+/// Anything that asks for the display also implies the system, matching what a
+/// user means by "keep the screen on". Returns 0 when nothing was requested.
+///
+/// Deliberately *not* mapped: `ES_AWAYMODE_REQUIRED`. It's only honoured where
+/// the power policy enables away mode, and where it isn't the whole call fails
+/// (returns 0) — so asking for it would silently assert nothing at all.
+#[cfg(windows)]
+fn execution_state_for(flags: &[String]) -> u32 {
+    use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+    let mut es = 0u32;
+    for f in flags {
+        let Some(rest) = f.strip_prefix('-') else { continue }; // bare `-t` argument
+        for c in rest.chars() {
+            match c {
+                'd' => es |= ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED,
+                'i' | 's' => es |= ES_SYSTEM_REQUIRED,
+                _ => {} // m / u / t — nothing to assert
+            }
+        }
+    }
+    es
+}
+
+/// Toggle a Windows power assertion on or off — the `caffeinate` counterpart.
+/// Only ever one assertion is live: an existing one is dropped (which joins its
+/// thread and clears the state) first, so switching presets is a stop+restart.
 #[cfg(windows)]
 #[tauri::command]
-fn set_caffeinate(_state: State<AppState>, _active: bool, _flags: Vec<String>) -> Result<(), String> {
-    Err("keep-awake is not supported on Windows yet".into())
+fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> Result<(), String> {
+    use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
+    let mut guard = state.caffeinate.lock().unwrap();
+    guard.take(); // drop → releases whatever was asserted
+    if !active || flags.is_empty() {
+        return Ok(());
+    }
+    let es = execution_state_for(&flags);
+    if es == 0 {
+        return Err(format!("no Windows keep-awake equivalent for: {}", flags.join(" ")));
+    }
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    // The assertion must be set *and* released on the same thread, so the whole
+    // lifetime lives inside this closure: assert, park, clear.
+    let (ready, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: a plain flags-in/flags-out Win32 call with no pointers.
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS | es) };
+        if prev == 0 {
+            let _ = ready.send(Err("SetThreadExecutionState refused the request".into()));
+            return;
+        }
+        let _ = ready.send(Ok(()));
+        let _ = rx.recv(); // park until the sender is dropped
+        // SAFETY: same call; ES_CONTINUOUS alone clears our assertion.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    });
+    // Surface a refusal as a command error instead of a thread that quietly did
+    // nothing — the UI would otherwise paint the cup lit over a sleeping PC.
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            return Err(e);
+        }
+        Err(_) => return Err("keep-awake thread died before asserting".into()),
+    }
+    *guard = Some(KeepAwake { stop: Some(stop), thread: Some(thread) });
+    Ok(())
 }
 
 /// Create a git worktree with a new (or existing) branch off `repo_dir`.
@@ -2257,7 +2354,6 @@ pub fn run() {
                 owned_pids: Mutex::new(HashSet::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_perm: std::sync::atomic::AtomicU64::new(1),
-                #[cfg(not(windows))]
                 caffeinate: Mutex::new(None),
             });
 
@@ -2429,6 +2525,27 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The one piece of the Windows keep-awake path that isn't a Win32 call: the
+    /// translation of the UI's `caffeinate` flags into execution-state bits.
+    #[cfg(windows)]
+    #[test]
+    fn caffeinate_flags_map_to_execution_state() {
+        use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+        let f = |args: &[&str]| execution_state_for(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // Asking for the display implies the system stays powered too.
+        assert_eq!(f(&["-d"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-i"]), ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-dimsu"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // The timer preset: `-t` and its bare seconds argument assert nothing on
+        // their own, and must not be mistaken for a flag cluster.
+        assert_eq!(f(&["-di", "-t", "3600"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // Nothing translatable → 0, which the command reports as an error rather
+        // than lighting the cup over a machine that will happily sleep.
+        assert_eq!(f(&["-m"]), 0);
+        assert_eq!(f(&[]), 0);
+    }
 
     /// A fresh, empty scratch directory under the OS temp dir. No randomness (pid +
     /// an atomic counter keep it unique even under cargo's parallel test threads).

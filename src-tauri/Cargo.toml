@@ -29,3 +29,9 @@ tauri-plugin-dialog = "2.7.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
+# `SetThreadExecutionState` for the keep-awake control — Windows' answer to
+# macOS `caffeinate`. 0.61 is the version tauri already resolves, so this adds
+# a feature to an existing crate rather than a second copy of windows-sys.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+

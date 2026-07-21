@@ -2240,19 +2240,32 @@ $("enginePop").addEventListener("click", (e) => {
 // reconcileCaf() is the single choke point — called on every renderAll(), it
 // diffs the desired flags against what's running and only pokes the backend on a
 // real change (same guarded-invoke pattern as updateTray).
-// `caffeinate` is a macOS binary with no Windows equivalent wired up yet, so the
-// whole control is hidden there (see initCaf) and reconcileCaf() bails out —
-// otherwise every renderAll() would fire an invoke that can only ever error.
+// The flags below are macOS `caffeinate` switches, and they stay the wire format
+// on both platforms: the Windows backend maps them onto `SetThreadExecutionState`
+// bits (see `execution_state_for`) rather than making the UI speak two dialects.
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
+const CAF_HOST = IS_WINDOWS ? "PC" : "Mac";
 type CafKind = "static" | "timer" | "agents";
 interface CafPreset { id: string; kind: CafKind; label: string; desc: string; glyph: string; flags?: string[] }
-const CAF_PRESETS: CafPreset[] = [
+const ALL_CAF_PRESETS: CafPreset[] = [
   { id: "display", kind: "static", label: "Keep display awake", desc: "Screen + system stay on",     glyph: "☀", flags: ["-d"] },
   { id: "system",  kind: "static", label: "Keep system awake",  desc: "Runs on; screen may sleep",   glyph: "⏻", flags: ["-i"] },
   { id: "full",    kind: "static", label: "Fully caffeinated",  desc: "Display, disk & system",      glyph: "✺", flags: ["-dimsu"] },
   { id: "timer",   kind: "timer",  label: "Timed",              desc: "Stay awake, then auto-off",   glyph: "◷" },
   { id: "agents",  kind: "agents", label: "Until agents idle",  desc: "Awake only while agents work", glyph: "⟳" },
 ];
+// Windows has no disk (`-m`) or user-active (`-u`) assertion, so "Fully
+// caffeinated" would be a second, identical "Keep display awake" row there.
+// Drop it — the validity check below rewrites a stored "full" to the first preset.
+const CAF_PRESETS: CafPreset[] = IS_WINDOWS ? ALL_CAF_PRESETS.filter((p) => p.id !== "full") : ALL_CAF_PRESETS;
+// The popover's right-hand chip: the literal flags on macOS, the execution state
+// they translate to on Windows, where the raw flags would be meaningless jargon.
+function cafChip(p: CafPreset): string {
+  const flags = p.kind === "agents" ? ["-i"] : (p.flags ?? []);
+  if (!flags.length) return "";
+  if (!IS_WINDOWS) return flags.join(" ");
+  return flags.some((f) => f.includes("d")) ? "display" : "system";
+}
 const CAF_DURATIONS: { sec: number; label: string }[] = [
   { sec: 900, label: "15m" }, { sec: 3600, label: "1h" }, { sec: 7200, label: "2h" }, { sec: 14400, label: "4h" },
 ];
@@ -2297,7 +2310,6 @@ function cafArmTimer() {
   }
 }
 function reconcileCaf() {
-  if (IS_WINDOWS) return; // control hidden; the backend command only errors there
   const flags = cafDesiredFlags();
   const key = flags ? flags.join(" ") : "";
   if (key !== cafAssertKey) {
@@ -2310,7 +2322,7 @@ function renderCaf() {
   const p = cafPreset(cafPresetId);
   $("caf").classList.toggle("on", cafArmed);
   $("caf").classList.toggle("asserting", cafAssertKey !== "");
-  $("cafMain").title = !cafArmed ? `Keep this Mac awake · ${p.label}`
+  $("cafMain").title = !cafArmed ? `Keep this ${CAF_HOST} awake · ${p.label}`
     : p.kind === "agents" ? (cafAssertKey ? "Awake — agents are working" : "Armed — sleeps until agents work")
     : p.kind === "timer" ? `Awake · ${cafDurLabel(cafTimerSec)} timer — click to stop`
     : `Awake · ${p.label} — click to stop`;
@@ -2328,9 +2340,8 @@ function fillCafPop() {
   const rows = CAF_PRESETS.map((p) => {
     const active = cafArmed && p.id === cafPresetId;
     const last = !cafArmed && p.id === cafPresetId; // what a plain click would use
-    let right = "";
-    if (p.kind === "static") right = `<span class="mp-flags">${esc((p.flags ?? []).join(" "))}</span>`;
-    else if (p.kind === "agents") right = `<span class="mp-flags">-i</span>`;
+    const chip = p.kind === "timer" ? "" : cafChip(p);
+    const right = chip ? `<span class="mp-flags">${esc(chip)}</span>` : "";
     const item = `<button class="mp-item ${active ? "on" : last ? "cur" : ""}" data-caf="${p.id}">`
       + `<span class="mp-ic">${p.glyph}</span>`
       + `<span class="mp-main"><span class="mp-l">${esc(p.label)}</span><span class="mp-s">${esc(p.desc)}</span></span>`
@@ -2764,10 +2775,8 @@ setInterval(refreshBranches, 4000);
 
 setSort(sortMode, false); // paint the sort button's glyph/title for the persisted mode
 initProjectDnD();
-// No `caffeinate` on Windows — drop the control rather than leave a button whose
-// every click reports an error. Its listeners stay wired but unreachable.
-if (IS_WINDOWS) $("caf").style.display = "none";
-// caffeinate always starts off (its -w guard died with the last run); renderAll's
+// caffeinate always starts off — the assertion is bound to the last run's process
+// (`-w <pid>` on macOS, the parked thread on Windows) and died with it; renderAll's
 // reconcileCaf() paints the button. Note this is the ONE place agent-mode could
 // auto-assert on launch — but cafArmed is false at boot, so it stays dormant.
 renderAll();
