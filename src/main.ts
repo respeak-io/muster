@@ -342,7 +342,12 @@ if (localStorage.getItem("cc-icons-v") !== ICON_CACHE_VERSION) {
   localStorage.setItem("cc-icons-v", ICON_CACHE_VERSION);
   saveIcons();
 }
-function iconFor(key: string): string | null { const v = icons[key]; return v ? v : null; }
+// A logo the user picked by hand. Kept in its own key — and consulted first — so
+// that neither a re-probe nor an ICON_CACHE_VERSION bump can overwrite a
+// deliberate choice with whatever discovery happens to find.
+const customIcons: Record<string, string> = JSON.parse(localStorage.getItem("cc-custom-icons") || "{}");
+function saveCustomIcons() { localStorage.setItem("cc-custom-icons", JSON.stringify(customIcons)); }
+function iconFor(key: string): string | null { const v = customIcons[key] || icons[key]; return v ? v : null; }
 async function probeIcon(key: string) {
   if (key in icons) return; // already probed
   icons[key] = ""; // mark in-flight so we don't double-probe
@@ -353,12 +358,47 @@ async function probeIcon(key: string) {
   saveIcons();
   renderSidebar(); renderMini();
 }
-function clearIcon(key: string) { icons[key] = ""; saveIcons(); renderSidebar(); renderMini(); }
+// "Use the color dot instead" — drops the hand-picked logo *and* marks discovery
+// as "probed, none", so the row falls back to its accent dot and stays there.
+function clearIcon(key: string) {
+  delete customIcons[key]; saveCustomIcons();
+  icons[key] = ""; saveIcons();
+  renderSidebar(); renderMini();
+}
+// Pick an image file to use as this project's glyph, in place of whatever the
+// backend scoured out of the repo (or the color dot, when it found nothing).
+async function pickCustomIcon(key: string) {
+  const file = await open({
+    multiple: false,
+    title: `Logo for ${basename(key)}`,
+    defaultPath: key,
+    filters: [{ name: "Images", extensions: ["png", "svg", "ico", "jpg", "jpeg", "webp", "gif"] }],
+  });
+  if (!file || typeof file !== "string") return;
+  try {
+    const r = await invoke<{ data_uri: string }>("read_custom_icon", { path: file });
+    customIcons[key] = r.data_uri;
+    saveCustomIcons();
+    renderSidebar(); renderMini();
+    toast(`Logo set for ${basename(key)}`);
+  } catch (e) { toast(String(e)); }
+}
+// Forget the hand-picked logo and let discovery have another go at the repo.
+function resetCustomIcon(key: string) {
+  delete customIcons[key]; saveCustomIcons();
+  delete icons[key]; saveIcons();
+  probeIcon(key); // re-probes, then renders
+  renderSidebar(); renderMini();
+}
+async function openProjectFolder(key: string) {
+  try { await invoke("open_folder", { dir: key }); }
+  catch (e) { toast(String(e)); }
+}
 function projGlyph(key: string, accent: string): string {
   const ic = iconFor(key);
   return ic
-    ? `<img class="picon" src="${ic}" alt="" title="${esc(basename(key))} — right-click to recolor / reset icon" />`
-    : `<span class="pdot" title="Click to recolor" style="background:${accent};color:${accent}"></span>`;
+    ? `<img class="picon" src="${ic}" alt="" title="${esc(basename(key))} — right-click for project actions" />`
+    : `<span class="pdot" title="Click to recolor · right-click for project actions" style="background:${accent};color:${accent}"></span>`;
 }
 function hslToHex(h: number, s: number, l: number): string {
   const a = s * Math.min(l, 1 - l);
@@ -471,6 +511,11 @@ async function requestLaunch(project: string, path: string) {
 async function addProject() {
   const dir = await open({ directory: true, multiple: false, title: "Add a project folder" });
   if (!dir || typeof dir !== "string") return;
+  addProjectPath(dir);
+}
+// Pin a folder to the sidebar. Also reachable from the context menu of a folder
+// Muster knows about but hasn't been asked to keep (an external session's cwd).
+function addProjectPath(dir: string) {
   if (FAVORITES.some((f) => f.path === dir)) { toast("Already a project"); return; }
   FAVORITES.push({ name: basename(dir), path: dir });
   saveFavorites();
@@ -2444,14 +2489,15 @@ listen<{ id: string; data: any }>("permission", (e) => {
 // delegated clicks (sidebar / mini / inspector buttons)
 document.addEventListener("click", (e) => {
   const t = e.target as HTMLElement;
-  if (!t.closest("#colorPop, .pdot, .rm-dot")) closeColorPop();
+  if (!t.closest("#colorPop, #ctxMenu, .pdot, .rm-dot")) closeColorPop();
+  if (!t.closest("#ctxMenu, #colorPop")) closeCtxMenu();
   if (!t.closest("#enginePop, #fEngineSeg")) closeEnginePop();
   if (!t.closest("#cafPop, #caf")) closeCafPop();
   if (!t.closest("#usagePop, #fUsageSeg")) closeUsagePop();
   if (!t.closest("#attnPop, #attnBadge")) closeAttnPop();
   if (!t.closest("#shortPop, #fShortSeg")) closeShortPop();
   const dot = t.closest<HTMLElement>(".pdot, .rm-dot");
-  if (dot) { const owner = dot.closest<HTMLElement>("[data-key]"); if (owner?.dataset.key) { openColorPopover(owner.dataset.key, e.clientX, e.clientY); return; } }
+  if (dot) { const owner = dot.closest<HTMLElement>("[data-key]"); if (owner?.dataset.key) { openColorPopover(owner.dataset.key, e.clientX, e.clientY + 6); return; } }
   // data-forget and data-resume sit INSIDE a data-past row, so they must be matched
   // (and dispatched) ahead of it or the row's own click would swallow them.
   const el = t.closest<HTMLElement>("[data-perm],[data-git],[data-diff],[data-wtrm],[data-wt],[data-branch],[data-close],[data-remove],[data-add],[data-jump],[data-resume],[data-forget],[data-ext],[data-past],[data-sel],[data-launch],[data-pal],[data-rail],[data-toast]");
@@ -2487,7 +2533,19 @@ function normalizeHex(v: string): string | null {
   if (/^[0-9a-fA-F]{3}$/.test(x)) x = x.split("").map((c) => c + c).join("");
   return /^[0-9a-fA-F]{6}$/.test(x) ? "#" + x.toLowerCase() : null;
 }
-function openColorPopover(key: string, x: number, y: number) {
+// Show a floating panel, then clamp it inside the viewport against its *measured*
+// size — these panels change height with their optional rows, so a hard-coded
+// estimate would hang them off-screen.
+function placePop(el: HTMLElement, x: number, y: number) {
+  el.classList.add("show");
+  el.style.left = Math.max(8, Math.min(x, window.innerWidth - el.offsetWidth - 8)) + "px";
+  el.style.top = Math.max(8, Math.min(y, window.innerHeight - el.offsetHeight - 8)) + "px";
+}
+// The appearance panel: colour swatches + logo. Opens standalone at the cursor
+// (clicking a colour dot) or as the context menu's submenu — `flipFrom` is the
+// parent menu's rect, so a panel that won't fit to its right lands on its left
+// instead of being shoved back over the menu it belongs to.
+function openColorPopover(key: string, x: number, y: number, flipFrom?: DOMRect) {
   popKey = key;
   closeFootMenus("colorPop");
   const cur = accentFor(key).toLowerCase();
@@ -2496,12 +2554,18 @@ function openColorPopover(key: string, x: number, y: number) {
     SWATCHES.map((c) => `<button class="sw-btn ${c === cur ? "on" : ""}" style="background:${c}" data-c="${c}"></button>`).join("") +
     `<div class="sw-row"><input class="sw-hex" type="text" spellcheck="false" placeholder="#hex" value="${cur}" maxlength="7" /><button class="sw-apply">Set</button></div>` +
     `<button class="sw-auto" data-c="auto">Auto color</button>` +
+    `<button class="sw-auto" data-c="seticon">Set custom logo…</button>` +
+    (customIcons[key] ? `<button class="sw-auto" data-c="reseticon">Restore repo logo</button>` : "") +
     (iconFor(key) ? `<button class="sw-auto" data-c="delicon">Use color dot (hide icon)</button>` : "");
-  pop.style.left = Math.min(x, window.innerWidth - 210) + "px";
-  pop.style.top = Math.min(y + 6, window.innerHeight - 182) + "px";
-  pop.classList.add("show");
+  pop.classList.add("show"); // shown before measuring, or offsetWidth reads 0
+  if (flipFrom && x + pop.offsetWidth > window.innerWidth - 8) x = flipFrom.left - pop.offsetWidth - 6;
+  placePop(pop, x, y);
 }
-function closeColorPop() { $("colorPop").classList.remove("show"); popKey = null; }
+function closeColorPop() {
+  $("colorPop").classList.remove("show");
+  popKey = null;
+  $("ctxMenu").querySelector(".sub-open")?.classList.remove("sub-open");
+}
 function applyColor(key: string) {
   renderAll();
   const s = activeId ? sessions.get(activeId) : null;
@@ -2524,18 +2588,134 @@ $("colorPop").addEventListener("click", (e) => {
   if (t.classList.contains("sw-apply")) { const inp = $("colorPop").querySelector<HTMLInputElement>(".sw-hex"); if (inp) commitHex(inp.value); return; }
   const b = t.closest<HTMLElement>("[data-c]");
   if (!b || !popKey) return;
-  if (b.dataset.c === "delicon") { clearIcon(popKey); closeColorPop(); return; }
-  setColor(popKey, b.dataset.c === "auto" ? null : b.dataset.c!);
+  // Every button here commits something, so the whole stack (submenu + the menu
+  // that opened it) closes with it.
+  const key = popKey;
+  closeCtxMenu();
+  if (b.dataset.c === "delicon") { clearIcon(key); closeColorPop(); return; }
+  if (b.dataset.c === "seticon") { closeColorPop(); pickCustomIcon(key); return; }
+  if (b.dataset.c === "reseticon") { resetCustomIcon(key); closeColorPop(); return; }
+  setColor(key, b.dataset.c === "auto" ? null : b.dataset.c!);
 });
 $("colorPop").addEventListener("keydown", (e: KeyboardEvent) => {
   const t = e.target as HTMLElement;
   if (t.classList.contains("sw-hex") && e.key === "Enter") { e.preventDefault(); commitHex((t as HTMLInputElement).value); }
 });
+// ---------- project context menu ----------
+// Right-clicking anything that carries a project folder (`data-key` — a project
+// head, an external row, a rail button) opens a real menu: one verb per row, with
+// colour and logo tucked into an Appearance submenu (the swatch panel above,
+// reused verbatim) so the everyday actions stay one click deep.
+let ctxKey: string | null = null;
+const projName = (key: string) => FAVORITES.find((f) => f.path === key)?.name || basename(key);
+// Where "Open project folder" actually lands, so the row can name it.
+const FILE_MANAGER = navigator.userAgent.includes("Windows") ? "Explorer" : navigator.userAgent.includes("Mac") ? "Finder" : "file manager";
+
+type CtxRow = { act: string; ic: string; label: string; sub?: string; cls?: string; chev?: boolean };
+const ctxRowHtml = (r: CtxRow) =>
+  `<button class="mp-item ${r.cls || ""}" data-ctx="${r.act}"><span class="mp-ic">${r.ic}</span>`
+  + `<span class="mp-main"><span class="mp-l">${esc(r.label)}</span>${r.sub ? `<span class="mp-s">${esc(r.sub)}</span>` : ""}</span>`
+  + (r.chev ? `<span class="mp-chev">›</span>` : "") + `</button>`;
+
+function openCtxMenu(key: string, x: number, y: number) {
+  closeColorPop();
+  ctxKey = key;
+  const fav = FAVORITES.some((f) => f.path === key);
+  const live = [...sessions.values()].filter((s) => s.colorKey === key && !s.shell).length;
+  const ic = iconFor(key);
+  const rows: (CtxRow | null)[] = [
+    { act: "launch", ic: "＋", label: "New session", sub: live ? `${live} already running here` : "start Claude Code in this folder" },
+    { act: "worktree", ic: "⑃", label: "New worktree session…", sub: "on a branch of its own" },
+    { act: "terminal", ic: "❯", label: "Open terminal here", sub: termEngine === "embedded" ? "shell pane inside Muster" : engineDef(termEngine).label },
+    null,
+    { act: "folder", ic: "⌂", label: "Open project folder", sub: FILE_MANAGER },
+    { act: "copypath", ic: "⧉", label: "Copy path" },
+    null,
+    { act: "appearance", ic: "◐", label: "Appearance", sub: "color, logo", chev: true },
+    null,
+    // Not every group in the sidebar is pinned: a folder also shows up while it has
+    // a live or external session, then vanishes with it. So the row is about
+    // *permanence*, not presence — say so, or "add" reads as a lie about a project
+    // that's plainly already listed.
+    fav
+      ? { act: "removeproj", ic: "✕", label: "Remove project", sub: "unpins it — sessions keep running", cls: "mp-danger" }
+      : { act: "addproj", ic: "☆", label: "Pin to sidebar", sub: "keeps it listed with no session running" },
+  ];
+  const menu = $("ctxMenu");
+  menu.innerHTML =
+    `<div class="mp-head">`
+    + (ic ? `<img class="mp-hico" src="${ic}" alt="" />` : `<span class="mp-hsw" style="background:${accentFor(key)}"></span>`)
+    + `<span class="mp-hmain"><span class="mp-hname">${esc(projName(key))}</span><span class="mp-hpath">${esc(tilde(key))}</span></span></div>`
+    + rows.map((r) => (r ? ctxRowHtml(r) : `<div class="mp-sep"></div>`)).join("");
+  placePop(menu, x, y);
+  // A worktree only means something in a git repo. Ask *after* opening — the menu
+  // must feel instant — then either name the branch it would fork from or drop the
+  // row entirely. (A detached HEAD also answers None and loses the row; forking a
+  // worktree from one is a corner case not worth a second probe.)
+  invoke<string | null>("git_branch", { workdir: key }).then((b) => {
+    if (ctxKey !== key) return; // menu closed or moved to another project meanwhile
+    const row = menu.querySelector<HTMLElement>('[data-ctx="worktree"]');
+    if (!row) return;
+    if (!b) { row.remove(); placePop(menu, x, y); return; }
+    const sub = row.querySelector(".mp-s");
+    if (sub) sub.textContent = `branch off ${b}`;
+  }).catch(() => {});
+}
+function closeCtxMenu() { $("ctxMenu").classList.remove("show"); ctxKey = null; }
+const ctxMenuOpen = () => $("ctxMenu").classList.contains("show");
+
+// A plain shell in this project's folder — embedded gets an in-app pane, the
+// external engines their own window (the same split as openPlainTerminal).
+function openTerminalIn(project: string, dir: string) {
+  if (termEngine !== "embedded") { invoke("open_terminal_here", { workdir: dir, engine: termEngine }).catch((e) => toast("terminal: " + e)); return; }
+  void launchShell(project, dir, { colorKey: dir });
+}
+async function copyPath(dir: string) {
+  try { await navigator.clipboard.writeText(dir); toast("Path copied"); }
+  catch { toast(dir); } // clipboard denied — at least show what it was
+}
+
+// Appearance is the one row that opens rather than commits: the menu stays put and
+// the swatch panel hangs off its edge. Re-entrant — `mouseover` fires again for
+// every child span the pointer crosses, and re-rendering the panel under the
+// cursor would wipe a half-typed hex.
+function openAppearanceSub(row: HTMLElement) {
+  if (!ctxKey || row.classList.contains("sub-open")) return;
+  row.classList.add("sub-open");
+  const m = $("ctxMenu").getBoundingClientRect(), r = row.getBoundingClientRect();
+  openColorPopover(ctxKey, m.right + 6, r.top - 6, m);
+}
+// Hover opens the submenu, the way a menu should. Moving onto any *other* row
+// folds it away again; moving right, into the panel itself, leaves the menu
+// entirely, so nothing here fires and it stays put.
+$("ctxMenu").addEventListener("mouseover", (e) => {
+  const row = (e.target as HTMLElement).closest<HTMLElement>("[data-ctx]");
+  if (!row) return;
+  if (row.dataset.ctx === "appearance") openAppearanceSub(row);
+  else closeColorPop();
+});
+$("ctxMenu").addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLElement>("[data-ctx]");
+  if (!b || !ctxKey) return;
+  const key = ctxKey, name = projName(key);
+  // Clicking it is the keyboard/touch path to the same thing hover already did.
+  if (b.dataset.ctx === "appearance") { openAppearanceSub(b); return; }
+  closeCtxMenu(); closeColorPop();
+  switch (b.dataset.ctx) {
+    case "launch": requestLaunch(name, key); break;
+    case "worktree": openWt(name, key, false); break;
+    case "terminal": openTerminalIn(name, key); break;
+    case "folder": openProjectFolder(key); break;
+    case "copypath": copyPath(key); break;
+    case "addproj": addProjectPath(key); break;
+    case "removeproj": removeFavorite(key); toast(`Removed ${name}`); break;
+  }
+});
 document.addEventListener("contextmenu", (e) => {
   const el = (e.target as HTMLElement).closest<HTMLElement>("[data-key]");
   if (!el || !el.dataset.key) return;
   e.preventDefault();
-  openColorPopover(el.dataset.key, e.clientX, e.clientY);
+  openCtxMenu(el.dataset.key, e.clientX, e.clientY);
 });
 
 // ---------- terminal-engine popover (footer "new in …") ----------
@@ -2941,6 +3121,7 @@ window.addEventListener("keydown", (e) => {
   else if (meta && e.key === "-") { e.preventDefault(); bumpFont(-0.5); }
   else if (meta && e.key === "0") { e.preventDefault(); termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
   else if (meta && e.key === ",") { e.preventDefault(); settingsOpen() ? closeSettings() : openSettings(); }
+  else if (e.key === "Escape" && ctxMenuOpen()) { e.preventDefault(); closeColorPop(); closeCtxMenu(); }
   else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
   else if (e.key === "Escape" && settingsOpen()) { e.preventDefault(); closeSettings(); }
 });

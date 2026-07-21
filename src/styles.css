@@ -681,6 +681,22 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .menupop .mp-check { margin-left: auto; color: var(--accent-ink); font-size: 11px; opacity: 0; }
 .menupop .mp-item.on .mp-check { opacity: 1; }
 
+/* project context menu (right-click a project head / session row / rail button) */
+.ctxmenu { min-width: 244px; max-width: 300px; }
+.ctxmenu .mp-main { flex: 1; min-width: 0; }
+.ctxmenu .mp-l, .ctxmenu .mp-s { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctxmenu .mp-sep { height: 1px; margin: 4px 7px; background: var(--hair); }
+/* who the menu is about — icon/colour, name, and the path it will act on */
+.ctxmenu .mp-head { display: flex; align-items: center; gap: 9px; padding: 4px 9px 7px; min-width: 0; }
+.ctxmenu .mp-hico { flex: none; width: 18px; height: 18px; border-radius: 4px; object-fit: contain; }
+.ctxmenu .mp-hsw { flex: none; width: 10px; height: 10px; margin: 0 4px; border-radius: 50%; }
+.ctxmenu .mp-hmain { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ctxmenu .mp-hname { font: 700 12px var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctxmenu .mp-hpath { font: 500 10px var(--font-mono); color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctxmenu .mp-chev { margin-left: auto; padding-left: 6px; color: var(--muted-2); font-size: 13px; }
+.ctxmenu .mp-item.sub-open { background: var(--surface); }
+.ctxmenu .mp-danger .mp-ic, .ctxmenu .mp-danger .mp-l { color: var(--st-attention); }
+
 /* "x needs you" dropdown (multiple sessions awaiting attention) */
 .attn-badge.multi::after { content: "▾"; font-size: 8px; margin-left: 1px; opacity: .7; }
 .attnpop { min-width: 250px; max-width: 340px; }

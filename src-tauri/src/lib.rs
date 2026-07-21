@@ -804,6 +804,41 @@ fn open_terminal_here(workdir: String, engine: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Open a project's folder in the OS file manager (Explorer / Finder / the
+/// desktop's default handler). Refuses a vanished directory rather than silently
+/// doing nothing — deleted worktrees are real.
+#[tauri::command]
+fn open_folder(dir: String) -> Result<(), String> {
+    if !std::path::Path::new(&dir).is_dir() {
+        return Err(format!("not a directory: {dir}"));
+    }
+    #[cfg(windows)]
+    {
+        // explorer.exe is fire-and-forget: it hands off to the running shell and
+        // exits non-zero even when the window opened, so never wait on its status.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        std::process::Command::new(format!(r"{sysroot}\explorer.exe"))
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("open Explorer: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("open Finder: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Persist a debug snapshot (JSON built by the frontend) to a fixed, discoverable
 /// path so an external tool — or an LLM agent debugging the running app — can read
 /// live state and the recent event log. Returns the path written.
@@ -1971,6 +2006,16 @@ fn find_project_icon(dir: String) -> Option<ProjectIcon> {
     subs.iter().find_map(|p| probe_icon_dir(p))
 }
 
+/// Load a user-picked image as a project's logo. Deliberately runs the same
+/// sniff/size gate as discovery (`read_icon`), so a file that isn't really an
+/// image — or one too big to sit in localStorage as a data-URI — is rejected here
+/// instead of becoming a broken `<img>` in the sidebar.
+#[tauri::command]
+fn read_custom_icon(path: String) -> Result<ProjectIcon, String> {
+    read_icon(std::path::Path::new(&path))
+        .ok_or_else(|| "Not a usable image (PNG, SVG, ICO, JPEG, WEBP or GIF, max 512 KB)".to_string())
+}
+
 // ---------- external (non-Muster) Claude Code sessions ----------
 //
 // Claude Code writes a per-process registry file at
@@ -2783,6 +2828,8 @@ pub fn run() {
             read_transcript,
             list_past_sessions,
             find_project_icon,
+            read_custom_icon,
+            open_folder,
             write_debug_file,
             log_frontend,
             update_tray,
