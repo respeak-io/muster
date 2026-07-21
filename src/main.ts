@@ -19,6 +19,20 @@ function loadWebgl(term: Terminal) {
     term.loadAddon(w);
   } catch { /* WebGL unavailable — DOM renderer is fine */ }
 }
+// Platform-aware shortcut hints. Display only: the key handlers already accept
+// both modifiers (`e.metaKey || e.ctrlKey`), so only the glyphs differ per OS.
+const IS_MAC = navigator.userAgent.includes("Mac");
+const MOD = IS_MAC ? "⌘" : "Ctrl";
+/** Inline chord text: "⌘K" on macOS, "Ctrl+K" elsewhere. */
+const chord = (k: string) => (IS_MAC ? `⌘${k}` : `Ctrl+${k}`);
+// index.html hard-codes the mac glyphs; rewrite its static bits once on other
+// platforms (everything rendered from TS goes through MOD/chord instead).
+if (!IS_MAC) {
+  document.querySelectorAll("kbd").forEach((k) => { if (k.textContent === "⌘") k.textContent = "Ctrl"; });
+  document.querySelectorAll<HTMLElement>("[title]").forEach((el) => { if (el.title.includes("⌘")) el.title = el.title.replace(/⌘/g, "Ctrl+"); });
+  const fk = document.querySelector(".fseg.fk");
+  if (fk) fk.textContent = `${chord("K")} · ${chord("1")}–9 switch · ${chord("B")} sidebar · ${chord("I")} inspector · ${chord("±")} font`;
+}
 // macOS terminal key conventions for the embedded shell. xterm.js emits xterm's
 // modified-arrow sequences (Option+Left = \e[1;3D etc.), which a plain login zsh
 // doesn't bind by default — so word-nav keys self-insert garbage like ";3D".
@@ -1238,7 +1252,7 @@ function initProjectDnD() {
 function renderMini() {
   const activeProj = activeId ? sessions.get(activeId)?.project : null;
   $("railmini").innerHTML =
-    `<button class="rm-btn" data-rail="1" title="Expand sidebar (⌘B)">»</button>` +
+    `<button class="rm-btn" data-rail="1" title="Expand sidebar (${chord("B")})">»</button>` +
     projectList().map((p) => {
       const first = p.sessions[0];
       const firstExt = p.externals[0];
@@ -1252,7 +1266,7 @@ function renderMini() {
       const extOnly = !first && firstExt ? "ext" : "";
       return `<button class="rm-proj ${onCls} ${extOnly}" style="--rc:${p.accent}" title="${esc(p.name)}${extOnly ? " (external)" : ""}" data-key="${esc(p.path)}" ${sel}>${glyph}${attn ? '<span class="rm-badge"></span>' : ""}</button>`;
     }).join("") +
-    `<button class="rm-btn rm-add" data-pal="1" title="New session (⌘K)">＋</button>`;
+    `<button class="rm-btn rm-add" data-pal="1" title="New session (${chord("K")})">＋</button>`;
 }
 function renderHeader(s: Sess | null) {
   ($("btnClose") as HTMLButtonElement).hidden = !s;
@@ -1923,8 +1937,8 @@ const PAL_CMDS: { key: string; label: string; glyph: string; run: () => void; sc
   { key: "cmd:add", label: "Add a project folder…", glyph: "＋", run: addProject },
   { key: "cmd:term", label: "Open a terminal in the current project", glyph: "❯", run: openPlainTerminal, sc: ["⌘", "T"] },
   { key: "cmd:sort", label: "Change the sidebar sort order", glyph: "≡", run: cycleSort },
-  { key: "cmd:insp", label: "Toggle the inspector", glyph: "◨", run: toggleInsp, sc: ["⌘", "I"] },
-  { key: "cmd:rail", label: "Toggle the sidebar", glyph: "◧", run: toggleRail, sc: ["⌘", "B"] },
+  { key: "cmd:insp", label: "Toggle the inspector", glyph: "◨", run: toggleInsp, sc: [MOD, "I"] },
+  { key: "cmd:rail", label: "Toggle the sidebar", glyph: "◧", run: toggleRail, sc: [MOD, "B"] },
   { key: "cmd:theme", label: "Toggle the theme", glyph: "◐", run: toggleTheme },
 ];
 function buildPalGroups(raw: string): PalGroup[] {
@@ -1947,7 +1961,7 @@ function buildPalGroups(raw: string): PalGroup[] {
     const i = order.get(s.id);
     const label = `${s.project} · ${s.title || s.branch || (s.shell ? "shell" : "session")}`;
     const sub = s.shell ? "shell" : `${verbFor(s).toLowerCase()}${s.ctxPct != null ? ` · ${Math.round(s.ctxPct)}% ctx` : ""}${s.cost != null ? ` · $${s.cost.toFixed(2)}` : ""}`;
-    return { kind: "session", key: "session:" + s.id, label, labelHtml: esc(label), sub, sw: accentFor(s.colorKey), icon: iconFor(s.colorKey) || undefined, shortcut: i != null && i < 9 ? ["⌘", String(i + 1)] : undefined, session: s, run: () => setActive(s.id) };
+    return { kind: "session", key: "session:" + s.id, label, labelHtml: esc(label), sub, sw: accentFor(s.colorKey), icon: iconFor(s.colorKey) || undefined, shortcut: i != null && i < 9 ? [MOD, String(i + 1)] : undefined, session: s, run: () => setActive(s.id) };
   });
   const launchCands: PalItem[] = FAVORITES.map((f) => ({ kind: "launch", key: "launch:" + f.path, label: `Launch ${f.name}`, labelHtml: esc(`Launch ${f.name}`), sub: tilde(f.path), sw: accentFor(f.path), icon: iconFor(f.path) || undefined, run: () => requestLaunch(f.name, f.path) }));
   const cmdCands: PalItem[] = PAL_CMDS.map((c) => ({ kind: "command", key: c.key, label: c.label, labelHtml: esc(c.label), sub: "command", glyph: c.glyph, shortcut: c.sc, run: c.run }));
@@ -1986,7 +2000,7 @@ function renderPal() {
       const i = idx++;
       const ic = it.icon ? `<img class="pal-icimg" src="${it.icon}" alt="" />` : it.sw ? `<span class="sw" style="background:${it.sw}"></span>` : (it.glyph || "›");
       const sh = it.shortcut ? `<span class="pal-sh">${it.shortcut.map((k) => `<span class="k">${esc(k)}</span>`).join("")}</span>`
-        : it.session ? `<span class="pal-sh actions"><span class="k">⌘K</span></span>` : "";
+        : it.session ? `<span class="pal-sh actions"><span class="k">${chord("K")}</span></span>` : "";
       return `<div class="pal-item ${i === palSel ? "on" : ""}" data-i="${i}"><span class="pal-ic">${ic}</span><span class="pal-main"><span class="pm">${it.labelHtml}</span>${it.sub ? `<span class="ps">${esc(it.sub)}</span>` : ""}</span>${sh}</div>`;
     }).join("");
     return `<div class="pal-gh">${esc(g.name)}${g.count ? `<span class="gc">${g.count}</span>` : ""}</div>${rows}`;
@@ -1996,7 +2010,7 @@ function renderPal() {
   const foot = $("palFoot");
   foot.innerHTML = palPage === "actions"
     ? `<span>↵ run</span><span>⌫ back</span><span class="sp"></span><span>esc close</span>`
-    : `<span class="pf-mode">⟩ command</span><span>@ project</span><span>/ state</span><span class="sp"></span><span>⌘K actions · esc</span>`;
+    : `<span class="pf-mode">⟩ command</span><span>@ project</span><span>/ state</span><span class="sp"></span><span>${chord("K")} actions · esc</span>`;
   $("palList").querySelector(".pal-item.on")?.scrollIntoView({ block: "nearest" });
 }
 function refreshPal() { palGroups = buildPalGroups(($("palInput") as HTMLInputElement).value); palFlat = palGroups.flatMap((g) => g.items); palSel = 0; renderPal(); }
@@ -2561,19 +2575,32 @@ $("enginePop").addEventListener("click", (e) => {
 // reconcileCaf() is the single choke point — called on every renderAll(), it
 // diffs the desired flags against what's running and only pokes the backend on a
 // real change (same guarded-invoke pattern as updateTray).
-// `caffeinate` is a macOS binary with no Windows equivalent wired up yet, so the
-// whole control is hidden there (see initCaf) and reconcileCaf() bails out —
-// otherwise every renderAll() would fire an invoke that can only ever error.
+// The flags below are macOS `caffeinate` switches, and they stay the wire format
+// on both platforms: the Windows backend maps them onto `SetThreadExecutionState`
+// bits (see `execution_state_for`) rather than making the UI speak two dialects.
 const IS_WINDOWS = navigator.userAgent.includes("Windows");
+const CAF_HOST = IS_WINDOWS ? "PC" : "Mac";
 type CafKind = "static" | "timer" | "agents";
 interface CafPreset { id: string; kind: CafKind; label: string; desc: string; glyph: string; flags?: string[] }
-const CAF_PRESETS: CafPreset[] = [
+const ALL_CAF_PRESETS: CafPreset[] = [
   { id: "display", kind: "static", label: "Keep display awake", desc: "Screen + system stay on",     glyph: "☀", flags: ["-d"] },
   { id: "system",  kind: "static", label: "Keep system awake",  desc: "Runs on; screen may sleep",   glyph: "⏻", flags: ["-i"] },
   { id: "full",    kind: "static", label: "Fully caffeinated",  desc: "Display, disk & system",      glyph: "✺", flags: ["-dimsu"] },
   { id: "timer",   kind: "timer",  label: "Timed",              desc: "Stay awake, then auto-off",   glyph: "◷" },
   { id: "agents",  kind: "agents", label: "Until agents idle",  desc: "Awake only while agents work", glyph: "⟳" },
 ];
+// Windows has no disk (`-m`) or user-active (`-u`) assertion, so "Fully
+// caffeinated" would be a second, identical "Keep display awake" row there.
+// Drop it — the validity check below rewrites a stored "full" to the first preset.
+const CAF_PRESETS: CafPreset[] = IS_WINDOWS ? ALL_CAF_PRESETS.filter((p) => p.id !== "full") : ALL_CAF_PRESETS;
+// The popover's right-hand chip: the literal flags on macOS, the execution state
+// they translate to on Windows, where the raw flags would be meaningless jargon.
+function cafChip(p: CafPreset): string {
+  const flags = p.kind === "agents" ? ["-i"] : (p.flags ?? []);
+  if (!flags.length) return "";
+  if (!IS_WINDOWS) return flags.join(" ");
+  return flags.some((f) => f.includes("d")) ? "display" : "system";
+}
 const CAF_DURATIONS: { sec: number; label: string }[] = [
   { sec: 900, label: "15m" }, { sec: 3600, label: "1h" }, { sec: 7200, label: "2h" }, { sec: 14400, label: "4h" },
 ];
@@ -2618,7 +2645,6 @@ function cafArmTimer() {
   }
 }
 function reconcileCaf() {
-  if (IS_WINDOWS) return; // control hidden; the backend command only errors there
   const flags = cafDesiredFlags();
   const key = flags ? flags.join(" ") : "";
   if (key !== cafAssertKey) {
@@ -2631,7 +2657,7 @@ function renderCaf() {
   const p = cafPreset(cafPresetId);
   $("caf").classList.toggle("on", cafArmed);
   $("caf").classList.toggle("asserting", cafAssertKey !== "");
-  $("cafMain").title = !cafArmed ? `Keep this Mac awake · ${p.label}`
+  $("cafMain").title = !cafArmed ? `Keep this ${CAF_HOST} awake · ${p.label}`
     : p.kind === "agents" ? (cafAssertKey ? "Awake — agents are working" : "Armed — sleeps until agents work")
     : p.kind === "timer" ? `Awake · ${cafDurLabel(cafTimerSec)} timer — click to stop`
     : `Awake · ${p.label} — click to stop`;
@@ -2649,9 +2675,8 @@ function fillCafPop() {
   const rows = CAF_PRESETS.map((p) => {
     const active = cafArmed && p.id === cafPresetId;
     const last = !cafArmed && p.id === cafPresetId; // what a plain click would use
-    let right = "";
-    if (p.kind === "static") right = `<span class="mp-flags">${esc((p.flags ?? []).join(" "))}</span>`;
-    else if (p.kind === "agents") right = `<span class="mp-flags">-i</span>`;
+    const chip = p.kind === "timer" ? "" : cafChip(p);
+    const right = chip ? `<span class="mp-flags">${esc(chip)}</span>` : "";
     const item = `<button class="mp-item ${active ? "on" : last ? "cur" : ""}" data-caf="${p.id}">`
       + `<span class="mp-ic">${p.glyph}</span>`
       + `<span class="mp-main"><span class="mp-l">${esc(p.label)}</span><span class="mp-s">${esc(p.desc)}</span></span>`
@@ -3003,9 +3028,11 @@ setTimeout(() => checkForUpdates(false), 3000);
 // either way ("you're on the latest version"), so the menu item always answers.
 listen("tray-check-updates", () => { void checkForUpdates(true); });
 
-// Cmd+Q guard. Cmd+Q is bound to our own menu item in the backend (macOS doesn't
-// reliably surface the OS quit as a Tauri event — see tauri#9198), so the keystroke
-// arrives here as `quit-requested` rather than tearing the app down. We only nag
+// Quit guard. On macOS, Cmd+Q is bound to our own menu item in the backend (macOS
+// doesn't reliably surface the OS quit as a Tauri event — see tauri#9198); on
+// Windows the backend intercepts CloseRequested (closing the window is the quit
+// gesture there — it has no app menu). Both arrive here as `quit-requested`
+// rather than tearing the app down. We only nag
 // when something would actually be lost — an idle Muster quits immediately, keeping
 // the Cmd+Q muscle memory intact.
 listen("quit-requested", async () => {
@@ -3102,10 +3129,8 @@ setInterval(refreshBranches, 4000);
 
 setSort(sortMode, false); // paint the sort button's glyph/title for the persisted mode
 initProjectDnD();
-// No `caffeinate` on Windows — drop the control rather than leave a button whose
-// every click reports an error. Its listeners stay wired but unreachable.
-if (IS_WINDOWS) $("caf").style.display = "none";
-// caffeinate always starts off (its -w guard died with the last run); renderAll's
+// caffeinate always starts off — the assertion is bound to the last run's process
+// (`-w <pid>` on macOS, the parked thread on Windows) and died with it; renderAll's
 // reconcileCaf() paints the button. Note this is the ONE place agent-mode could
 // auto-assert on launch — but cafArmed is false at boot, so it stays dormant.
 renderAll();

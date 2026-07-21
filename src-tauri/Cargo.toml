@@ -37,3 +37,9 @@ tauri-plugin-log = "2"
 # 0.38 (not latest) because newer sysinfo raises MSRV past our rustc.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
+# `SetThreadExecutionState` for the keep-awake control — Windows' answer to
+# macOS `caffeinate`. 0.61 is the version tauri already resolves, so this adds
+# a feature to an existing crate rather than a second copy of windows-sys.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+

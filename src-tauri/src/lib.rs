@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::MenuBuilder;
+#[cfg(target_os = "macos")]
+use tauri::menu::{MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -47,6 +49,10 @@ struct AppState {
     /// without a clean stop — no orphaned process keeps the Mac awake forever.
     #[cfg(not(windows))]
     caffeinate: Mutex<Option<std::process::Child>>,
+    /// The single live `SetThreadExecutionState` assertion, if the user has
+    /// toggled keep-awake on. Windows' equivalent of the `caffeinate` child.
+    #[cfg(windows)]
+    caffeinate: Mutex<Option<KeepAwake>>,
 }
 
 /// Find a request header by (case-insensitive) name.
@@ -926,14 +932,107 @@ fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> R
     Ok(())
 }
 
-/// Windows has no `caffeinate` binary and no power-assertion equivalent wired up
-/// yet (that would be `SetThreadExecutionState`). The UI hides the control there,
-/// so this only exists to keep the command registered for the shared
-/// `invoke_handler!` list — reaching it means the frontend guard was bypassed.
+/// A live Windows power assertion. `SetThreadExecutionState` is scoped to the
+/// *calling thread* — the assertion dies with that thread — so we park a thread
+/// for exactly as long as the user wants the machine awake. That thread-scoping
+/// is also the safety net the macOS side gets from `caffeinate -w <our pid>`: a
+/// panic or a hard exit can't leave a Windows box pinned awake, because the
+/// thread goes with the process.
+#[cfg(windows)]
+struct KeepAwake {
+    /// Dropping this releases the assertion: the parked thread's `recv()` fails,
+    /// it clears the execution state and exits.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        // Join so the state is provably cleared before a replacement assertion
+        // is set up — otherwise a preset switch could race the old thread's
+        // clearing call and land on ES_CONTINUOUS (i.e. silently off).
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Translate the macOS `caffeinate` flags the UI speaks into Windows execution
+/// state bits, so the frontend keeps one vocabulary for both platforms.
+///
+///   `-d` (display) → `ES_DISPLAY_REQUIRED`   `-i` / `-s` (idle/system) → `ES_SYSTEM_REQUIRED`
+///   `-m` (disk) and `-u` (user active) have no Windows equivalent and are dropped.
+///   `-t <sec>` is dropped too — the frontend's own timer disarms the preset.
+///
+/// Anything that asks for the display also implies the system, matching what a
+/// user means by "keep the screen on". Returns 0 when nothing was requested.
+///
+/// Deliberately *not* mapped: `ES_AWAYMODE_REQUIRED`. It's only honoured where
+/// the power policy enables away mode, and where it isn't the whole call fails
+/// (returns 0) — so asking for it would silently assert nothing at all.
+#[cfg(windows)]
+fn execution_state_for(flags: &[String]) -> u32 {
+    use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+    let mut es = 0u32;
+    for f in flags {
+        let Some(rest) = f.strip_prefix('-') else { continue }; // bare `-t` argument
+        for c in rest.chars() {
+            match c {
+                'd' => es |= ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED,
+                'i' | 's' => es |= ES_SYSTEM_REQUIRED,
+                _ => {} // m / u / t — nothing to assert
+            }
+        }
+    }
+    es
+}
+
+/// Toggle a Windows power assertion on or off — the `caffeinate` counterpart.
+/// Only ever one assertion is live: an existing one is dropped (which joins its
+/// thread and clears the state) first, so switching presets is a stop+restart.
 #[cfg(windows)]
 #[tauri::command]
-fn set_caffeinate(_state: State<AppState>, _active: bool, _flags: Vec<String>) -> Result<(), String> {
-    Err("keep-awake is not supported on Windows yet".into())
+fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> Result<(), String> {
+    use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
+    let mut guard = state.caffeinate.lock().unwrap();
+    guard.take(); // drop → releases whatever was asserted
+    if !active || flags.is_empty() {
+        return Ok(());
+    }
+    let es = execution_state_for(&flags);
+    if es == 0 {
+        return Err(format!("no Windows keep-awake equivalent for: {}", flags.join(" ")));
+    }
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    // The assertion must be set *and* released on the same thread, so the whole
+    // lifetime lives inside this closure: assert, park, clear.
+    let (ready, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: a plain flags-in/flags-out Win32 call with no pointers.
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS | es) };
+        if prev == 0 {
+            let _ = ready.send(Err("SetThreadExecutionState refused the request".into()));
+            return;
+        }
+        let _ = ready.send(Ok(()));
+        let _ = rx.recv(); // park until the sender is dropped
+        // SAFETY: same call; ES_CONTINUOUS alone clears our assertion.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    });
+    // Surface a refusal as a command error instead of a thread that quietly did
+    // nothing — the UI would otherwise paint the cup lit over a sleeping PC.
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            return Err(e);
+        }
+        Err(_) => return Err("keep-awake thread died before asserting".into()),
+    }
+    *guard = Some(KeepAwake { stop: Some(stop), thread: Some(thread) });
+    Ok(())
 }
 
 /// Create a git worktree with a new (or existing) branch off `repo_dir`.
@@ -2486,6 +2585,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Windows analog of the macOS Cmd+Q catcher in `setup` below: Windows gets
+        // no app menu (see there), so quitting means closing the window. Intercept
+        // the close and run the same frontend confirm flow — only `confirm_quit`
+        // actually exits, and the frontend calls it straight away when idle.
+        .on_window_event(|window, event| {
+            #[cfg(windows)]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.emit("quit-requested", ());
+            }
+            #[cfg(not(windows))]
+            let _ = (window, event);
+        })
         .setup(|app| {
             // Before anything that can panic: from here on, panics leave a trace.
             install_panic_hook(app.path().app_log_dir()?);
@@ -2502,7 +2614,6 @@ pub fn run() {
                 owned_pids: Mutex::new(HashSet::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_perm: std::sync::atomic::AtomicU64::new(1),
-                #[cfg(not(windows))]
                 caffeinate: Mutex::new(None),
             });
 
@@ -2576,7 +2687,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // ---- App menu with a Cmd+Q catcher ----
+            // ---- App menu with a Cmd+Q catcher (macOS only) ----
             // Cmd+Q is a "special Apple event" that Tauri does not reliably surface
             // as an app/window event on macOS (tauri-apps/tauri#9198), so
             // RunEvent::ExitRequested/prevent_exit can't be trusted to intercept it.
@@ -2585,50 +2696,63 @@ pub fn run() {
             // `terminate:`. The handler asks the frontend to confirm; only `confirm_quit`
             // actually exits. Replacing the default menu means we must re-add the Edit
             // submenu ourselves, or Cmd+C/X/V/Z/A stop working in the app's inputs.
-            let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Muster")
-                .accelerator("CmdOrCtrl+Q")
-                .build(app)?;
-            let app_menu = SubmenuBuilder::new(app, "Muster")
-                .about(None)
-                .separator()
-                .services()
-                .separator()
-                .hide()
-                .hide_others()
-                .show_all()
-                .separator()
-                .item(&quit_item)
-                .build()?;
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .fullscreen()
-                .separator()
-                .close_window()
-                .build()?;
-            let menu = MenuBuilder::new(app)
-                .items(&[&app_menu, &edit_menu, &window_menu])
-                .build()?;
-            app.set_menu(menu)?;
-            app.on_menu_event(|app, event| {
-                if event.id().0.as_str() == "quit-confirm" {
-                    // Surface the window so the confirm dialog has context, then let the
-                    // frontend decide (it quits straight away when nothing is running).
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
+            //
+            // Never install this on Windows: `set_menu` would render it as an
+            // in-window menu bar full of mac-only items — and muda's predefined
+            // Hide item there does a raw Win32 ShowWindow(SW_HIDE) behind tao's
+            // visibility flags, after which tao's show() no-ops and the window is
+            // unrecoverable, tray "Show Muster" included (muda 0.19.3
+            // windows/mod.rs:1217 vs tao 0.35.3 window_state.rs apply_diff).
+            // Windows needs no menu at all: WebView2 handles the edit shortcuts
+            // natively, and quitting goes through the CloseRequested hook on the
+            // builder above.
+            #[cfg(target_os = "macos")]
+            {
+                let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Muster")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+                let app_menu = SubmenuBuilder::new(app, "Muster")
+                    .about(None)
+                    .separator()
+                    .services()
+                    .separator()
+                    .hide()
+                    .hide_others()
+                    .show_all()
+                    .separator()
+                    .item(&quit_item)
+                    .build()?;
+                let edit_menu = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
+                let window_menu = SubmenuBuilder::new(app, "Window")
+                    .minimize()
+                    .fullscreen()
+                    .separator()
+                    .close_window()
+                    .build()?;
+                let menu = MenuBuilder::new(app)
+                    .items(&[&app_menu, &edit_menu, &window_menu])
+                    .build()?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    if event.id().0.as_str() == "quit-confirm" {
+                        // Surface the window so the confirm dialog has context, then let the
+                        // frontend decide (it quits straight away when nothing is running).
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app.emit("quit-requested", ());
                     }
-                    let _ = app.emit("quit-requested", ());
-                }
-            });
+                });
+            }
 
             Ok(())
         })
@@ -2688,6 +2812,27 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The one piece of the Windows keep-awake path that isn't a Win32 call: the
+    /// translation of the UI's `caffeinate` flags into execution-state bits.
+    #[cfg(windows)]
+    #[test]
+    fn caffeinate_flags_map_to_execution_state() {
+        use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+        let f = |args: &[&str]| execution_state_for(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // Asking for the display implies the system stays powered too.
+        assert_eq!(f(&["-d"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-i"]), ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-dimsu"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // The timer preset: `-t` and its bare seconds argument assert nothing on
+        // their own, and must not be mistaken for a flag cluster.
+        assert_eq!(f(&["-di", "-t", "3600"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // Nothing translatable → 0, which the command reports as an error rather
+        // than lighting the cup over a machine that will happily sleep.
+        assert_eq!(f(&["-m"]), 0);
+        assert_eq!(f(&[]), 0);
+    }
 
     /// A fresh, empty scratch directory under the OS temp dir. No randomness (pid +
     /// an atomic counter keep it unique even under cargo's parallel test threads).

@@ -2208,6 +2208,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tiny_http",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
