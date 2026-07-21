@@ -68,11 +68,11 @@ One ~2650-line `main.ts`, no framework. State lives in a `sessions: Map<session_
 
 ## External (non-Muster) sessions
 
-Muster surfaces Claude sessions started *outside* it, discovered from `~/.claude/sessions/<pid>.json` (one per running interactive session; format details in the `claude-code-local-session-registry` memory). `list_external_sessions` liveness-checks survivors via `ps`.
+Muster surfaces Claude sessions started *outside* it, discovered from `~/.claude/sessions/<pid>.json` (one per running interactive session — same path and format on Windows under `%USERPROFILE%`, VS Code-hosted sessions included, verified on CC 2.1.216; format details in the `claude-code-local-session-registry` memory). The **listing is OS-agnostic**: `list_external_sessions` liveness-checks survivors against `ProcTable`, one in-process `sysinfo` snapshot of the process table (no `ps`/`tasklist` spawns — the frontend polls every 3s), so discovery works on macOS, Windows and (untested) Linux alike.
 
-- **Filter owned sessions by pid, never by session id.** Muster's own sessions register there too (confirmed CC 2.1.211), and `/resume`/`/clear` rewrite `<pid>.json` with a *new* id — so an id-based exclude lets a live, Muster-owned session reappear as "external" showing the resumed transcript. `AppState.owned_pids` holds every claude pid Muster spawned; `is_descendant_of` also catches child-terminal launches.
+- **Filter owned sessions by pid, never by session id.** Muster's own sessions register there too (confirmed CC 2.1.211), and `/resume`/`/clear` rewrite `<pid>.json` with a *new* id — so an id-based exclude lets a live, Muster-owned session reappear as "external" showing the resumed transcript. `AppState.owned_pids` holds every claude pid Muster spawned; the ancestry walk (`ProcTable::is_descendant_of`) also catches child-terminal launches.
 - **That ancestry walk is deliberately broad, and it bites during development.** Anything started from a terminal *inside* Muster — notably `pnpm tauri dev` — becomes its descendant, so a second Muster instance's sessions are silently filtered out of the first's external list. **Run dev builds from a real terminal, not a Muster pane.** (Dev and installed also share one localStorage and one `muster-debug.json`, so prefer quitting the installed app entirely.)
-- `read_transcript` mirrors a session read-only (decoding the cwd→`<enc>` path scheme). `focus_external_session` jumps to its terminal: exact tab focus by tty via AppleScript for Terminal.app/iTerm2, else `open` on the owning top-level `.app`. That `.app` fallback is **required** for Electron hosts like VS Code — their integrated terminal runs under a *helper* process System Events can't target by unix id (fails `-1719`); the tradeoff is we can only front VS Code, not the specific panel.
+- `read_transcript` mirrors a session read-only (decoding the cwd→`<enc>` path scheme). `focus_external_session` — still **macOS-only** — jumps to its terminal: exact tab focus by tty via AppleScript for Terminal.app/iTerm2, else `open` on the owning top-level `.app`. That `.app` fallback is **required** for Electron hosts like VS Code — their integrated terminal runs under a *helper* process System Events can't target by unix id (fails `-1719`); the tradeoff is we can only front VS Code, not the specific panel.
 - **Known gap:** sessions launched into an external Terminal.app/iTerm (via `open -a`) aren't in Muster's process tree, so they still rely on the session-id `exclude` and can leak after a `/resume`.
 
 ## Restorable sessions (surviving a restart)
@@ -89,6 +89,6 @@ Muster's launch uuid **is** Claude's `--session-id`, so every session it launche
 
 ## Notes on scope & doc drift
 
-macOS-only assumptions are pervasive and intentional for now: `osascript`, `open -a`, `/bin/zsh` wrappers, hard-coded app paths, `/usr/bin/curl`. Windows would need a PowerShell/`curl.exe` variant of the generated hooks.
+macOS-first assumptions remain in the window/terminal layer: `osascript`, `open -a`, external-terminal engines, per-session CPU/RAM via `ps`, terminal-window focus. Windows has a working embedded-only port (PowerShell/`curl.exe` hook variants behind `#[cfg(windows)]`, cross-platform external-session listing); Linux is unported but the non-`ps` paths are written to be OS-agnostic.
 
 `SPIKE.md` and `README.md` describe an earlier state (single-session, "observe-only" permissions). The code has moved past both — it is multi-session and the permission hook is answerable. **Trust the code over the docs** when they disagree.
