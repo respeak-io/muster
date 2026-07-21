@@ -320,10 +320,42 @@ const dirtyByFolder = new Map<string, DiffStat | null>();
 const isDirty = (g?: DiffStat | null): boolean => !!g && (g.files > 0 || g.untracked > 0);
 const folderDirty = (f: string): boolean => isDirty(dirtyByFolder.get(f));
 
-// persisted daily usage rollup (survives app + system restarts)
+// The three Claude models collapse to a family so cost splits by tier, not by the
+// exact display name ("Opus 4.8", "Sonnet 4.5", …) which changes across releases.
+function modelFamily(m: string): string {
+  const s = (m || "").toLowerCase();
+  if (s.includes("opus")) return "Opus";
+  if (s.includes("sonnet")) return "Sonnet";
+  if (s.includes("haiku")) return "Haiku";
+  return m ? "Other" : "Unknown";
+}
+
+// Persisted daily usage rollup (survives app + system restarts). `cc-usage` is the
+// authoritative per-day *total* cost — untouched here so the footer keeps working —
+// and `cc-usage-detail` layers on the per-model / per-project split + session ids,
+// which the Usage analytics tab reads. The split is telemetry-only, so it records
+// from the day this ships forward; the totals (and the transcript-scanned tokens)
+// still carry full history. See the Usage panel section below.
+interface DayDetail { models: Record<string, number>; projects: Record<string, number>; sessions: string[] }
 const usage: Record<string, number> = JSON.parse(localStorage.getItem("cc-usage") || "{}");
+const usageDetail: Record<string, DayDetail> = JSON.parse(localStorage.getItem("cc-usage-detail") || "{}");
 function todayKey() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
-function addUsage(delta: number) { if (!(delta > 0)) return; const k = todayKey(); usage[k] = (usage[k] || 0) + delta; localStorage.setItem("cc-usage", JSON.stringify(usage)); }
+function addUsage(delta: number, s?: Sess) {
+  if (!(delta > 0)) return;
+  const k = todayKey();
+  usage[k] = (usage[k] || 0) + delta;
+  localStorage.setItem("cc-usage", JSON.stringify(usage));
+  if (!s || s.shell) return;
+  // Attribute the cost delta to whichever model is active right now and to the
+  // session's project — the closest honest split the statusLine data allows.
+  const d = usageDetail[k] || (usageDetail[k] = { models: {}, projects: {}, sessions: [] });
+  const fam = modelFamily(s.model);
+  d.models[fam] = (d.models[fam] || 0) + delta;
+  const proj = s.project || basename(s.workdir) || "unknown";
+  d.projects[proj] = (d.projects[proj] || 0) + delta;
+  if (s.id && !d.sessions.includes(s.id)) d.sessions.push(s.id);
+  localStorage.setItem("cc-usage-detail", JSON.stringify(usageDetail));
+}
 
 const $ = (id: string) => document.getElementById(id)!;
 const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -987,7 +1019,7 @@ function applyStatusline(s: Sess, data: any) {
   const tok = data.context_window?.used_tokens ?? data.context_window?.tokens;
   if (typeof tok === "number") s.ctxTokens = tok;
   const cost = data.cost?.total_cost_usd;
-  if (typeof cost === "number") { addUsage(cost - (s.cost ?? 0)); s.cost = cost; pushHist(s.costHist, cost); }
+  if (typeof cost === "number") { addUsage(cost - (s.cost ?? 0), s); s.cost = cost; pushHist(s.costHist, cost); }
   const dur = data.cost?.total_duration_ms; if (typeof dur === "number") s.durMs = dur;
   const r5 = data.rate_limits?.five_hour;
   if (r5) [rl.h5, rl.h5Reset] = mergeRl(rl.h5, rl.h5Reset, r5.used_percentage, r5.resets_at);
@@ -1742,6 +1774,268 @@ function openUsagePop() {
   pop.classList.add("show");
 }
 function closeUsagePop() { $("usagePop").classList.remove("show"); }
+
+// ---------- Usage analytics (the Usage settings tab) ----------
+// Money comes from the rollup above: full history for the daily *totals*, plus the
+// per-model / per-project split from cc-usage-detail (recorded going forward). Tokens
+// are the one figure telemetry can't give us, so they come from an async, cached scan
+// of Claude's transcripts (`token_usage_by_day`) and fill in the moment it returns —
+// the panel never blocks on the scan.
+// One day's transcript-scanned usage: token totals (by type and by model family),
+// distinct sessions active, and per-project token totals. Full history — unlike the
+// telemetry-only $ split, which records forward from install.
+interface DayUsage {
+  day: string; input: number; output: number; cache_read: number; cache_write: number;
+  opus: number; sonnet: number; haiku: number; other: number;
+  sessions: number; projects: Record<string, number>;
+}
+type UDay = { key: string; cost: number; tok: number; u?: DayUsage };
+let tokenDays: DayUsage[] = JSON.parse(localStorage.getItem("cc-usage-tokens") || "[]");
+let tokenScanAt = +(localStorage.getItem("cc-usage-tokens-at") || 0);
+let tokenScanning = false;
+let usageRange = 30;
+const USAGE_RANGES: [number, string][] = [[7, "7D"], [30, "30D"], [90, "90D"], [365, "12M"]];
+const MODEL_ORDER = ["Opus", "Sonnet", "Haiku", "Other"];
+const MODEL_VAR: Record<string, string> = { Opus: "--m-opus", Sonnet: "--m-sonnet", Haiku: "--m-haiku", Other: "--m-other" };
+// Sum a day's per-model tokens into a fixed-key record (backfill fields are lowercase).
+const uModels = (a: UDay[]): Record<string, number> => {
+  const m: Record<string, number> = { Opus: 0, Sonnet: 0, Haiku: 0, Other: 0 };
+  for (const d of a) if (d.u) { m.Opus += d.u.opus; m.Sonnet += d.u.sonnet; m.Haiku += d.u.haiku; m.Other += d.u.other; }
+  return m;
+};
+
+// Scan the transcripts for token totals, at most once per 10 min (a full read of
+// the recent corpus). Async + cached, so the tab paints instantly from localStorage
+// and re-paints when fresh numbers land. `force` bypasses the throttle.
+async function refreshTokens(force = false) {
+  if (tokenScanning) return;
+  if (!force && tokenDays.length && Date.now() - tokenScanAt < 6e5) return;
+  tokenScanning = true;
+  if (settingsOpen() && setTab === "usage") renderSettings(); // surface the "scanning…" hint
+  try {
+    tokenDays = await invoke<DayUsage[]>("token_usage_by_day", { days: 400 });
+    tokenScanAt = Date.now();
+    localStorage.setItem("cc-usage-tokens", JSON.stringify(tokenDays));
+    localStorage.setItem("cc-usage-tokens-at", String(tokenScanAt));
+  } catch (e) { dlog("warn", "token scan failed: " + e); }
+  finally { tokenScanning = false; if (settingsOpen() && setTab === "usage") renderSettings(); }
+}
+
+const uUsd = (n: number) => n >= 10000 ? "$" + (n / 1000).toFixed(1) + "k" : "$" + Math.round(n).toLocaleString();
+const uUsd2 = (n: number) => "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const uTok = (n: number) => n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "K" : String(Math.round(n));
+const uDkey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const U_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const U_WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// The last n calendar days ending today, oldest→newest, each joined to its cost,
+// per-model/project detail and scanned token total.
+function usageWindow(n: number): UDay[] {
+  const tk = new Map(tokenDays.map((t) => [t.day, t]));
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const out: UDay[] = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(today); d.setDate(d.getDate() - i);
+    const key = uDkey(d); const t = tk.get(key);
+    out.push({ key, cost: usage[key] || 0, tok: t ? t.input + t.output + t.cache_read + t.cache_write : 0, u: t });
+  }
+  return out;
+}
+
+// A smooth (Catmull-Rom) sparkline; long series are averaged down to ~22 points so
+// a 90D/12M spark reads as a trend, not a jagged comb.
+function uSpark(raw: number[], w = 64, h = 26): string {
+  let series = raw;
+  if (series.length > 22) {
+    const size = Math.ceil(series.length / 22); const o: number[] = [];
+    for (let i = 0; i < series.length; i += size) { const c = series.slice(i, i + size); o.push(c.reduce((s, v) => s + v, 0) / c.length); }
+    series = o;
+  }
+  if (!series.length) return "";
+  const max = Math.max(...series, 1), n = series.length, pad = 2.5;
+  const pts = series.map((v, i) => [pad + (n <= 1 ? 0 : i / (n - 1)) * (w - pad * 2), h - pad - (v / max) * (h - pad * 2)]);
+  let line = `M${pts[0][0].toFixed(2)},${pts[0][1].toFixed(2)}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    line += ` C${(p1[0] + (p2[0] - p0[0]) / 6).toFixed(2)},${(p1[1] + (p2[1] - p0[1]) / 6).toFixed(2)} ${(p2[0] - (p3[0] - p1[0]) / 6).toFixed(2)},${(p2[1] - (p3[1] - p1[1]) / 6).toFixed(2)} ${p2[0].toFixed(2)},${p2[1].toFixed(2)}`;
+  }
+  const lastX = pts[pts.length - 1][0].toFixed(2), firstX = pts[0][0].toFixed(2);
+  return `<svg class="u-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><path d="${line} L${lastX},${h} L${firstX},${h} Z" fill="var(--accent)" opacity=".1"/><path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity=".9"/><circle cx="${lastX}" cy="${pts[pts.length - 1][1].toFixed(2)}" r="2" fill="var(--accent)"/></svg>`;
+}
+
+function uSum(a: UDay[], f: (d: UDay) => number): number { return a.reduce((s, d) => s + f(d), 0); }
+function uDelta(cur: number, prev: number): string {
+  if (prev <= 0) return `<span class="u-delta u-muted">new</span>`;
+  const pct = Math.round((cur - prev) / prev * 100);
+  return `<span class="u-delta"><span class="u-arw">${pct >= 0 ? "▲" : "▼"}</span><b>${Math.abs(pct)}%</b>&nbsp;vs&nbsp;prev</span>`;
+}
+
+function uTiles(): string {
+  const all = usageWindow(usageRange * 2);
+  const cur = all.slice(usageRange), prev = all.slice(0, usageRange);
+  const mean = (a: UDay[], f: (d: UDay) => number) => a.length ? uSum(a, f) / a.length : 0;
+  const sess = (a: UDay[]) => uSum(a, (d) => d.u ? d.u.sessions : 0);
+  const spend = uSum(cur, (d) => d.cost), tok = uSum(cur, (d) => d.tok);
+  const nSess = sess(cur), nPrev = sess(prev);
+  const perSess = nSess ? tok / nSess : 0, perPrev = nPrev ? uSum(prev, (d) => d.tok) / nPrev : 0;
+  const haveTok = tokenDays.length > 0; // the transcript scan populates tokens/sessions
+  const tile = (label: string, val: string, foot: string, series: number[]) =>
+    `<div class="u-tile"><div class="label">${label}</div><div class="u-fig mono">${val}</div><div class="u-tfoot">${foot}${uSpark(series)}</div></div>`;
+  // Token/session tiles come from the (async) transcript scan: skeleton while it runs.
+  const skel = `<span class="u-skel"></span>`;
+  const scanFoot = `<span class="u-delta u-muted"><span class="u-spin"></span>scanning…</span>`;
+  const noData = `<span class="u-delta u-muted">no data</span>`;
+  const wait = (v: string, foot: string) => haveTok ? [v, foot] : [tokenScanning ? skel : "—", tokenScanning ? scanFoot : noData];
+  const [tokV, tokF] = wait(uTok(tok), uDelta(mean(cur, (d) => d.tok), mean(prev, (d) => d.tok)));
+  const [sesV, sesF] = wait(nSess.toLocaleString("en-US"), uDelta(nSess, nPrev));
+  const [avgV, avgF] = wait(nSess ? uTok(perSess) : "—", nSess ? uDelta(perSess, perPrev) : noData);
+  return `<div class="u-tiles">
+    ${tile("Total spend", uUsd(spend), uDelta(mean(cur, (d) => d.cost), mean(prev, (d) => d.cost)), cur.map((d) => d.cost))}
+    ${tile("Tokens processed", tokV, tokF, cur.map((d) => d.tok))}
+    ${tile("Sessions", sesV, sesF, cur.map((d) => d.u ? d.u.sessions : 0))}
+    ${tile("Avg / session", avgV, avgF, cur.map((d) => d.tok))}
+  </div>`;
+}
+
+// The GitHub-style spend heatmap — full recorded history, range-independent.
+function uHeatmap(): string {
+  const DAY = 86400000;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const nz = Object.values(usage).filter((v) => v > 0).sort((a, b) => a - b);
+  const q = (p: number) => nz.length ? nz[Math.floor(p * (nz.length - 1))] : 0;
+  const th = [q(0.20), q(0.40), q(0.62), q(0.84)];
+  const level = (v: number) => v <= 0 ? 0 : v <= th[0] ? 1 : v <= th[1] ? 2 : v <= th[2] ? 3 : 4;
+  const end = today.getTime() + (6 - today.getDay()) * DAY;
+  const WEEKS = 53, start = end - (WEEKS * 7 - 1) * DAY;
+  let months = "", cells = "", colMonth = -1, maxKey = "", maxCost = 0;
+  for (let w = 0; w < WEEKS; w++) { const m = new Date(start + w * 7 * DAY).getMonth(); months += `<span>${m !== colMonth ? U_MONTHS[m] : ""}</span>`; if (m !== colMonth) colMonth = m; }
+  for (let w = 0; w < WEEKS; w++) for (let r = 0; r < 7; r++) {
+    const t = start + (w * 7 + r) * DAY;
+    if (t > today.getTime()) { cells += `<i class="u-cell" style="visibility:hidden"></i>`; continue; }
+    const d = new Date(t), key = uDkey(d), v = usage[key] || 0;
+    if (v > maxCost) { maxCost = v; maxKey = key; }
+    const head = `${U_WD[d.getDay()]}, ${U_MONTHS[d.getMonth()]} ${d.getDate()}`;
+    cells += `<i class="u-cell l${level(v)}" data-tip="${esc(head + "||" + (v > 0 ? uUsd2(v) : "no sessions"))}"></i>`;
+  }
+  const active = nz.length;
+  let busiest = "—";
+  if (maxKey) { const d = new Date(maxKey + "T00:00:00"); busiest = `${U_MONTHS[d.getMonth()]} ${d.getDate()} · ${uUsd2(maxCost)}`; }
+  return `<section class="u-card">
+    <div class="u-cardh"><div><div class="label">Daily spend</div><h3 class="u-h">Last 12 months</h3>
+      <p class="u-hint">Each square is a day — darker means a heavier bill.</p></div>
+      <div class="u-scale">less<i style="background:var(--u-g0)"></i><i style="background:var(--u-g1)"></i><i style="background:var(--u-g2)"></i><i style="background:var(--u-g3)"></i><i style="background:var(--u-g4)"></i>more</div></div>
+    <div class="u-calwrap"><div class="u-wd"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div>
+      <div><div class="u-months">${months}</div><div class="u-grid">${cells}</div></div></div>
+    <div class="u-calfoot"><span>Busiest day <b>${busiest}</b></span><span><b>${active}</b> active days recorded</span></div>
+  </section>`;
+}
+
+type UBucket = { label: string; tip: string; total: number; models: Record<string, number> };
+function uBuckets(): UBucket[] {
+  const cur = usageWindow(usageRange);
+  const mk = (label: string, tip: string, days: UDay[]): UBucket => {
+    const models = uModels(days);
+    return { label, tip, total: models.Opus + models.Sonnet + models.Haiku + models.Other, models };
+  };
+  if (usageRange <= 31) return cur.map((d) => { const dt = new Date(d.key + "T00:00:00"); return mk(String(dt.getDate()), `${U_MONTHS[dt.getMonth()]} ${dt.getDate()}`, [d]); });
+  if (usageRange === 90) {
+    const out: UBucket[] = [];
+    for (let i = 0; i < cur.length; i += 7) { const wk = cur.slice(i, i + 7); if (!wk.length) continue; const s = new Date(wk[0].key + "T00:00:00"); out.push(mk(`${s.getMonth() + 1}/${s.getDate()}`, `Week of ${U_MONTHS[s.getMonth()]} ${s.getDate()}`, wk)); }
+    return out;
+  }
+  const by = new Map<string, UDay[]>();
+  for (const d of cur) { const dt = new Date(d.key + "T00:00:00"); const k = dt.getFullYear() + "-" + dt.getMonth(); let arr = by.get(k); if (!arr) { arr = []; by.set(k, arr); } arr.push(d); }
+  return [...by.values()].map((days) => { const dt = new Date(days[0].key + "T00:00:00"); return mk(U_MONTHS[dt.getMonth()], `${U_MONTHS[dt.getMonth()]} ${dt.getFullYear()}`, days); });
+}
+
+function uBars(): string {
+  const data = uBuckets();
+  const max = Math.max(...data.map((d) => d.total), 1), H = 168;
+  const parts: [string, string][] = [["Haiku", "--m-haiku"], ["Sonnet", "--m-sonnet"], ["Opus", "--m-opus"], ["Other", "--m-other"]];
+  const gap = data.length > 40 ? "2px" : data.length > 16 ? "4px" : "7px";
+  const cols = data.map((d) => {
+    let segs = "";
+    for (const [m, cssvar] of parts) { const v = d.models[m] || 0; if (v > 0) segs += `<i class="u-seg" style="height:${(v / max * H).toFixed(1)}px;background:var(${cssvar})"></i>`; }
+    const lines = parts.filter(([m]) => (d.models[m] || 0) > 0).map(([m]) => `${m} ${uTok(d.models[m])}`);
+    const tip = [d.tip, ...lines, `Total ${uTok(d.total)}`].join("||");
+    return `<div class="u-col" data-tip="${esc(tip)}"><div class="u-stack">${segs}</div></div>`;
+  }).join("");
+  const step = Math.ceil(data.length / 12);
+  const labels = data.map((d, i) => `<span>${(i % step === 0 || i === data.length - 1) ? esc(d.label) : ""}</span>`).join("");
+  const title = usageRange <= 31 ? `Last ${usageRange} days` : usageRange === 90 ? "Last 90 days · weekly" : "Last 12 months · monthly";
+  const anyOther = data.some((d) => (d.models.Other || 0) > 0);
+  const legModels: [string, string][] = anyOther
+    ? [["Opus", "--m-opus"], ["Sonnet", "--m-sonnet"], ["Haiku", "--m-haiku"], ["Other", "--m-other"]]
+    : [["Opus", "--m-opus"], ["Sonnet", "--m-sonnet"], ["Haiku", "--m-haiku"]];
+  const legend = legModels.map(([m, c]) => `<span class="u-lg"><i style="background:var(${c})"></i>${m}</span>`).join("");
+  const empty = !data.some((d) => d.total > 0);
+  const plot = empty && tokenScanning
+    ? `<div class="u-skelbar" style="height:${H}px"></div>`
+    : `<div class="u-plot"><div class="u-glabel mono">${uTok(max)}</div><div class="u-bars" style="--barsgap:${gap}">${cols}</div></div>
+       <div class="u-xlabels" style="--barsgap:${gap}">${labels}</div>`;
+  return `<section class="u-card">
+    <div class="u-cardh"><div><div class="label">Daily tokens by model</div><h3 class="u-h">${title}</h3></div><div class="u-legend">${legend}</div></div>
+    ${plot}
+  </section>`;
+}
+
+function uModelMix(): string {
+  const models = uModels(usageWindow(usageRange));
+  const total = models.Opus + models.Sonnet + models.Haiku + models.Other;
+  const rows = MODEL_ORDER.filter((m) => models[m] > 0).map((m) => {
+    const v = models[m], pct = total ? v / total * 100 : 0;
+    return `<div class="u-srow"><div class="u-stop"><span class="u-sw" style="background:var(${MODEL_VAR[m]})"></span><span class="u-snm">${m}</span><span class="u-susd mono">${uTok(v)}</span></div><div class="u-strack"><i style="width:${pct.toFixed(1)}%;background:var(${MODEL_VAR[m]})"></i></div></div>`;
+  }).join("");
+  const body = total > 0
+    ? `<div class="u-share">${rows}</div>`
+    : `<p class="u-hint">${tokenScanning ? "Scanning transcripts…" : "No token data in range yet."}</p>`;
+  return `<div class="label">Model mix <span class="u-byline">· by tokens</span></div>${body}`;
+}
+
+function uTokenMix(): string {
+  const cur = usageWindow(usageRange);
+  let inp = 0, out = 0, cr = 0, cw = 0;
+  const tk = new Map(tokenDays.map((t) => [t.day, t]));
+  for (const d of cur) { const t = tk.get(d.key); if (t) { inp += t.input; out += t.output; cr += t.cache_read; cw += t.cache_write; } }
+  const total = inp + out + cr + cw;
+  if (!total) {
+    const body = tokenScanning
+      ? `<div class="u-skelbar"></div><p class="u-hint"><span class="u-spin"></span> Scanning transcripts for token history…</p>`
+      : `<p class="u-hint">No token data in range yet.</p>`;
+    return `<div class="label" style="margin-top:15px">Token composition</div>${body}`;
+  }
+  const bar = ([["Cache read", cr, "--u-t4"], ["Cache write", cw, "--u-t3"], ["Input", inp, "--u-t2"], ["Output", out, "--u-t1"]] as [string, number, string][])
+    .map(([, v, c]) => v > 0 ? `<i style="width:${(v / total * 100).toFixed(2)}%;background:var(${c})"></i>` : "").join("");
+  const leg = ([["Cache read", cr, "--u-t4"], ["Input", inp, "--u-t2"], ["Output", out, "--u-t1"], ["Cache write", cw, "--u-t3"]] as [string, number, string][])
+    .map(([nm, v, c]) => `<div><i style="background:var(${c})"></i>${nm}<b>${Math.round(v / total * 100)}%</b></div>`).join("");
+  return `<div class="label" style="margin-top:15px">Token composition</div><div class="u-mix">${bar}</div><div class="u-mixleg">${leg}</div>
+    <div class="u-insight"><b>~${Math.round(cr / total * 100)}% of tokens are cache reads</b> — most context is reused, not re-billed. Big token counts, cheap dollars.</div>`;
+}
+
+function uProjects(): string {
+  const cur = usageWindow(usageRange);
+  const proj: Record<string, number> = {};
+  for (const d of cur) if (d.u) for (const [p, v] of Object.entries(d.u.projects)) proj[p] = (proj[p] || 0) + v;
+  const entries = Object.entries(proj).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  if (!entries.length) return `<section class="u-card"><div class="label">Top projects</div><p class="u-hint">${tokenScanning ? "Scanning transcripts…" : "No token data in range yet."}</p></section>`;
+  const maxw = entries[0][1] || 1;
+  const rows = entries.map(([p, v]) => `<tr><td><span class="u-pj"><span class="u-dot" style="background:${accentFor(p)}"></span>${esc(p)}</span></td><td class="u-num"><span class="u-pjbar"><i style="width:${(v / maxw * 100).toFixed(0)}%"></i></span></td><td class="u-num"><span class="u-usd mono">${uTok(v)}</span></td></tr>`).join("");
+  return `<section class="u-card"><div class="u-cardh"><div><div class="label">Attribution</div><h3 class="u-h">Top projects</h3></div><p class="u-hint" style="margin-top:5px">by tokens · working directory</p></div>
+    <table class="u-tbl"><thead><tr><th>Project</th><th class="u-num">Share</th><th class="u-num">Tokens</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+}
+
+function usagePanelHtml(): string {
+  const ranges = USAGE_RANGES.map(([n, l]) => `<button class="u-rbtn${n === usageRange ? " on" : ""}" data-urange="${n}">${l}</button>`).join("");
+  return `<div class="u-pane">
+    <header class="u-paneh"><div><div class="label">Analytics</div><h2 class="u-title">Usage &amp; spend</h2>
+      <p class="u-hint">Every session Muster launches, account-wide. History stays on this machine.</p></div>
+      <div class="u-range">${ranges}</div></header>
+    ${uTiles()}
+    ${uHeatmap()}
+    <div class="u-cols">${uBars()}<section class="u-card">${uModelMix()}${uTokenMix()}</section></div>
+    ${uProjects()}
+  </div>`;
+}
 // Only one floating footer/overlay menu may be open at a time: every open* closes
 // the rest first. (The footer triggers stopPropagation, so the document-level
 // outside-click close never fires for them — this is what keeps them exclusive.)
@@ -2334,7 +2628,9 @@ type SetControl =
   | { kind: "seg"; set: string; label: string; hint?: string; active: () => string; segs: () => SetSeg[] }
   | { kind: "font"; label: string; hint?: string }
   | { kind: "wtpreview"; label: string; hint?: string; active: () => string };
-interface SetTab { id: string; label: string; glyph: string; controls: () => SetControl[] }
+// Most tabs are a list of declarative controls; a tab may instead supply `render`
+// for a bespoke pane (the Usage analytics tab), which also widens the dialog.
+interface SetTab { id: string; label: string; glyph: string; controls: () => SetControl[]; render?: () => string }
 
 const SORT_SHORT: Record<SortMode, string> = { manual: "Manual", active: "Active", attention: "Attention" };
 // One-line descriptions of each worktree-grouping mode (mirrors the WtGroup comment block).
@@ -2377,6 +2673,11 @@ const SET_TABS: SetTab[] = [
         active: () => wtGroup },
     ],
   },
+  {
+    id: "usage", label: "Usage", glyph: "▦",
+    controls: () => [],
+    render: () => usagePanelHtml(),
+  },
 ];
 
 let setTab = "appearance";
@@ -2392,12 +2693,15 @@ function renderSettings() {
     `<button class="set-tab ${t.id === setTab ? "on" : ""}" data-settab="${t.id}"><span class="set-tglyph">${t.glyph}</span>${esc(t.label)}</button>`
   ).join("");
   const tab = SET_TABS.find((t) => t.id === setTab) || SET_TABS[0];
+  // The Usage tab is a wide, bespoke pane; every other tab is the narrow control list.
+  $("setDlg").classList.toggle("wide", !!tab.render);
   // Preserve scroll across the full-body rebuild so picking a card lower in the
   // (scrollable) Worktrees grid doesn't jump the view back to the top.
   const body = $("setBody");
   const sc = body.scrollTop;
-  body.innerHTML = tab.controls().map(renderSetControl).join("");
+  body.innerHTML = tab.render ? tab.render() : tab.controls().map(renderSetControl).join("");
   body.scrollTop = sc;
+  if (tab.id === "usage") refreshTokens(); // kick the (throttled, cached) token scan
 }
 // Demo roster for the worktree-grouping previews: one repo, a main checkout plus two
 // worktrees, so each grouping mode visibly differs. Static on purpose — the preview
@@ -2981,9 +3285,25 @@ $("setTabs").addEventListener("click", (e) => {
 $("setBody").addEventListener("click", (e) => {
   const f = (e.target as HTMLElement).closest<HTMLElement>("[data-setfont]");
   if (f) { setFontFromSettings(f.dataset.setfont!); return; }
+  const r = (e.target as HTMLElement).closest<HTMLElement>("[data-urange]");
+  if (r) { usageRange = +r.dataset.urange!; renderSettings(); return; }
   const o = (e.target as HTMLElement).closest<HTMLElement>("[data-set]");
   if (o) applySetting(o.dataset.set!, o.dataset.val!);
 });
+// Shared hover tooltip for the Usage panel's heatmap cells and cost bars. One
+// element on <body> (not #setBody), so a renderSettings() rebuild never drops it.
+const uTip = Object.assign(document.createElement("div"), { className: "u-tip", hidden: true });
+document.body.appendChild(uTip);
+$("setBody").addEventListener("mousemove", (e) => {
+  const t = (e.target as HTMLElement).closest<HTMLElement>("[data-tip]");
+  if (!t) { uTip.hidden = true; return; }
+  // dataset.tip is HTML-decoded on read; re-escape each line before re-inserting.
+  uTip.innerHTML = t.dataset.tip!.split("||").map(esc).join("<br>");
+  uTip.hidden = false;
+  uTip.style.left = e.clientX + "px";
+  uTip.style.top = (e.clientY - 14) + "px";
+});
+$("setBody").addEventListener("mouseleave", () => { uTip.hidden = true; });
 $("railCollapse").addEventListener("click", toggleRail);
 $("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);

@@ -2439,6 +2439,192 @@ fn transcript_meta(path: &std::path::Path) -> Option<(String, String)> {
     Some((title, last_prompt))
 }
 
+/// The three model tiers collapsed to a family (matches the frontend's `modelFamily`).
+fn model_family(model: &str) -> &'static str {
+    let s = model.to_ascii_lowercase();
+    if s.contains("opus") {
+        "opus"
+    } else if s.contains("sonnet") {
+        "sonnet"
+    } else if s.contains("haiku") {
+        "haiku"
+    } else {
+        "other"
+    }
+}
+
+/// One assistant message's usage, pulled from a transcript line.
+struct LineUsage {
+    day: String,           // YYYY-MM-DD from the line's own ISO timestamp (UTC)
+    tokens: [u64; 4],      // [input, output, cache_read, cache_write]
+    family: &'static str,  // opus | sonnet | haiku | other
+    project: String,       // basename of the line's cwd ("by working directory")
+}
+
+/// Parse one transcript line into a `LineUsage`, or `None` for the many lines with no
+/// assistant `usage` record (user turns, tool results, meta). Split out of the scan so
+/// the load-bearing, format-dependent parsing can be tested without a `$HOME` the
+/// parallel tests share.
+fn parse_usage_line(line: &str) -> Option<LineUsage> {
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let usage = v
+        .get("message")
+        .and_then(|m| m.get("usage"))
+        .or_else(|| v.get("usage"))?;
+    let day = match v.get("timestamp").and_then(|t| t.as_str()) {
+        Some(ts) if ts.len() >= 10 => ts[..10].to_string(),
+        _ => return None,
+    };
+    let g = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let model = v
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let project = v
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .and_then(|c| c.rsplit(|ch: char| ch == '/' || ch == '\\').find(|s| !s.is_empty()))
+        .unwrap_or("unknown")
+        .to_string();
+    Some(LineUsage {
+        day,
+        tokens: [
+            g("input_tokens"),
+            g("output_tokens"),
+            g("cache_read_input_tokens"),
+            g("cache_creation_input_tokens"),
+        ],
+        family: model_family(model),
+        project,
+    })
+}
+
+/// One calendar day, aggregated across every transcript: token totals by type, token
+/// totals by model family, the number of distinct sessions active, and per-project
+/// token totals ("by working directory"). Everything except the daily $ total (which
+/// lives in the telemetry rollup and can't be recovered from transcripts) is here.
+#[derive(serde::Serialize, Default)]
+struct DayUsage {
+    day: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    opus: u64,
+    sonnet: u64,
+    haiku: u64,
+    other: u64,
+    sessions: u64,
+    projects: std::collections::BTreeMap<String, u64>,
+}
+
+/// Aggregate transcript usage per calendar day across every Claude Code transcript
+/// touched within the last `days` days — tokens (by type and by model family), the
+/// count of distinct sessions active, and per-project token totals.
+///
+/// Tokens et al. are the figures the statusLine never reports (it carries only
+/// context-window *occupancy* and a $ total), so they're recovered from each assistant
+/// message's own `usage` record. That record shape is internal to Claude Code and
+/// documented as unstable (the risk `list_past_sessions` already lives with), hence
+/// the defensive parsing and the cheap `contains("\"usage\"")` pre-filter that skips
+/// the many lines carrying no tokens.
+///
+/// This is the heavy path: it reads whole transcripts, so the frontend calls it off
+/// the render path and caches the result. The mtime filter skips transcripts not
+/// written within the window — an old, untouched file cannot hold an in-range day —
+/// which keeps a full year's scan bounded to recent work. All of the model / project /
+/// session breakdown rides on this one pass; it adds no extra file reads.
+#[tauri::command]
+async fn token_usage_by_day(days: u64) -> Result<Vec<DayUsage>, String> {
+    // The scan reads whole transcripts (the recent corpus can run to ~1GB), so hand
+    // it to a blocking thread. A *synchronous* command runs on the main thread and
+    // would freeze the entire UI for the length of the first, uncached scan.
+    tauri::async_runtime::spawn_blocking(move || scan_usage(days))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn scan_usage(days: u64) -> Result<Vec<DayUsage>, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{BufRead, BufReader};
+    let home = home_dir();
+    if home.is_empty() {
+        return Err("no home directory".to_string());
+    }
+    let root = std::path::Path::new(&home).join(".claude").join("projects");
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(days.saturating_mul(86_400)));
+
+    let mut acc: HashMap<String, DayUsage> = HashMap::new();
+    let projects = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Ok(vec![]), // no transcripts yet — not an error
+    };
+    for proj in projects.flatten() {
+        let pdir = proj.path();
+        if !pdir.is_dir() {
+            continue;
+        }
+        let files = match std::fs::read_dir(&pdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // Skip transcripts untouched within the window: they can't hold in-range days.
+            if let (Some(cut), Ok(meta)) = (cutoff, entry.metadata()) {
+                if meta.modified().map(|m| m < cut).unwrap_or(false) {
+                    continue;
+                }
+            }
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            // One file == one session; remember the days it touched to count it once each.
+            let mut file_days: HashSet<String> = HashSet::new();
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let Some(lu) = parse_usage_line(&line) else { continue };
+                let LineUsage { day, tokens, family, project } = lu;
+                let tot: u64 = tokens.iter().sum();
+                let e = acc.entry(day.clone()).or_default();
+                if e.day.is_empty() {
+                    e.day = day.clone();
+                }
+                e.input += tokens[0];
+                e.output += tokens[1];
+                e.cache_read += tokens[2];
+                e.cache_write += tokens[3];
+                match family {
+                    "opus" => e.opus += tot,
+                    "sonnet" => e.sonnet += tot,
+                    "haiku" => e.haiku += tot,
+                    _ => e.other += tot,
+                }
+                *e.projects.entry(project).or_insert(0) += tot;
+                file_days.insert(day);
+            }
+            for d in file_days {
+                let e = acc.entry(d.clone()).or_default();
+                if e.day.is_empty() {
+                    e.day = d;
+                }
+                e.sessions += 1;
+            }
+        }
+    }
+    let mut out: Vec<DayUsage> = acc.into_values().collect();
+    out.sort_by(|a, b| a.day.cmp(&b.day));
+    Ok(out)
+}
+
 /// Read a read-only slice of an external session's transcript. The transcript
 /// lives at `~/.claude/projects/<enc>/<session_id>.jsonl`, where `<enc>` is the
 /// cwd with every non-alphanumeric char replaced by `-`. Only the tail (≤512KB)
@@ -2827,6 +3013,7 @@ pub fn run() {
             focus_external_session,
             read_transcript,
             list_past_sessions,
+            token_usage_by_day,
             find_project_icon,
             read_custom_icon,
             open_folder,
@@ -2859,6 +3046,39 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn parse_usage_line_extracts_day_tokens_family_and_project() {
+        let line = r#"{"type":"assistant","timestamp":"2026-07-21T10:00:00.000Z","cwd":"/Users/tim/dev/muster","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":4}}}"#;
+        let lu = parse_usage_line(line).expect("assistant usage line should parse");
+        assert_eq!(lu.day, "2026-07-21");
+        assert_eq!(lu.tokens, [10, 20, 300, 4]);
+        assert_eq!(lu.family, "opus");
+        assert_eq!(lu.project, "muster"); // basename of cwd
+        // Missing token fields default to 0; unknown model → "other"; no cwd → "unknown".
+        let partial = r#"{"timestamp":"2026-07-21T10:00:00Z","message":{"usage":{"output_tokens":7}}}"#;
+        let lu = parse_usage_line(partial).expect("should parse");
+        assert_eq!(lu.tokens, [0, 7, 0, 0]);
+        assert_eq!(lu.family, "other");
+        assert_eq!(lu.project, "unknown");
+    }
+
+    #[test]
+    fn parse_usage_line_skips_lines_without_usage() {
+        // The cheap pre-filter and the shape checks both reject non-usage lines.
+        assert!(parse_usage_line(r#"{"type":"user","timestamp":"2026-07-21T10:00:00Z"}"#).is_none());
+        assert!(parse_usage_line("not json at all").is_none());
+        // A usage record with no timestamp can't be bucketed, so it's dropped.
+        assert!(parse_usage_line(r#"{"message":{"usage":{"input_tokens":5}}}"#).is_none());
+    }
+
+    #[test]
+    fn model_family_buckets_by_tier() {
+        assert_eq!(model_family("claude-opus-4-8"), "opus");
+        assert_eq!(model_family("claude-sonnet-4-5"), "sonnet");
+        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(model_family("some-future-model"), "other");
+    }
 
     /// The one piece of the Windows keep-awake path that isn't a Win32 call: the
     /// translation of the UI's `caffeinate` flags into execution-state bits.
