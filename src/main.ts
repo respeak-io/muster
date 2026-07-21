@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, ask } from "@tauri-apps/plugin-dialog";
@@ -130,6 +131,9 @@ function setWtGroup(m: WtGroup) {
 // killing the drop. Telemetry ticks call renderAll() constantly, so this guard
 // is what makes reordering actually work during live sessions.
 let draggingProjects = false;
+// Set just after a pointer-driven reorder (see initProjectDnD): swallows the click a
+// pointerup may synthesise, so a drag that ends on a project doesn't also select it.
+let reorderGuardUntil = 0;
 // Leads with the bundled Nerd Font (see @font-face in styles.css) so the terminal
 // draws powerline / devicon glyphs on every OS; the rest stay as graceful fallbacks.
 const MONO = '"JetBrainsMono Nerd Font", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
@@ -1173,55 +1177,71 @@ function renderSidebar() {
         : `<span class="pcount ext">${p.dormants.length} past</span>`;
       head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}${tail}<span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch a Muster session here">＋</span></div>`;
     }
-    return `<div class="pgroup" draggable="true" data-path="${esc(p.path)}">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
+    return `<div class="pgroup" data-path="${esc(p.path)}">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
   }).join("");
 }
-// Drag-drop reordering of project groups. Delegated on the persistent #projects
-// container so it survives re-renders; the new order is persisted by path.
-// A separator line (.dropmark) shows where the group will land; the dragged group
-// is only physically moved on drop, then the DOM order is read back and saved.
-// NB: this only works because the window sets dragDropEnabled:false in
-// tauri.conf.json — otherwise the webview's native handler eats dragover/drop.
+// Reordering of project groups, on pointer events (not HTML5 drag). The window now
+// sets dragDropEnabled:true so external file drops paste a path instead of navigating
+// the webview (see initFileDrop) — but that native handler blocks HTML5 drag/drop, so
+// the reorder can no longer ride dragstart/dragover/drop. Pointer events are also fully
+// cross-platform (the old HTML5 path only worked with dragDropEnabled:false).
+//
+// Delegated on the persistent #projects container so it survives re-renders; a
+// separator line (.dropmark) shows where the group will land; the dragged group is only
+// physically moved on release, then the DOM order is read back and saved. A drag only
+// begins once the pointer crosses DRAG_SLOP, so a plain click still selects the project.
 function initProjectDnD() {
   const container = $("projects");
-  let dragEl: HTMLElement | null = null;
+  const DRAG_SLOP = 5; // px before a press becomes a drag rather than a click
   const marker = document.createElement("div");
   marker.className = "dropmark";
+  let dragEl: HTMLElement | null = null;      // the group actually being dragged
+  let candidate: HTMLElement | null = null;   // pressed group, promoted to dragEl past the slop
+  let startX = 0, startY = 0;
 
   const cleanup = () => {
     marker.remove();
     container.classList.remove("reordering");
     dragEl?.classList.remove("dragging");
-    dragEl = null;
+    dragEl = candidate = null;
     draggingProjects = false;
   };
 
-  container.addEventListener("dragstart", (e) => {
-    const g = (e.target as HTMLElement).closest<HTMLElement>(".pgroup");
+  container.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || !e.isPrimary) return;
+    const t = e.target as HTMLElement;
+    // Leave the interactive bits (launch +, remove ✕, colour dot) to their own clicks.
+    if (t.closest(".padd, .plaunch, .premove, .pdot, .pdirty")) return;
+    const g = t.closest<HTMLElement>(".pgroup");
     if (!g) return;
-    dragEl = g;
-    draggingProjects = true;
-    container.classList.add("reordering");
-    g.classList.add("dragging");
-    e.dataTransfer!.effectAllowed = "move";
-    try { e.dataTransfer!.setData("text/plain", g.dataset.path || ""); } catch { /* */ }
+    candidate = g;
+    startX = e.clientX; startY = e.clientY;
   });
 
-  container.addEventListener("dragover", (e) => {
-    if (!dragEl) return;
+  container.addEventListener("pointermove", (e) => {
+    if (!candidate) return;
+    if (!dragEl) {
+      if (Math.hypot(e.clientX - startX, e.clientY - startY) < DRAG_SLOP) return;
+      // Cross the slop → promote to a real drag.
+      dragEl = candidate;
+      draggingProjects = true;
+      container.classList.add("reordering");
+      dragEl.classList.add("dragging");
+      try { container.setPointerCapture(e.pointerId); } catch { /* */ }
+    }
     e.preventDefault();
-    e.dataTransfer!.dropEffect = "move";
-    const over = (e.target as HTMLElement).closest<HTMLElement>(".pgroup");
-    if (!over || over === dragEl) return;
-    const r = over.getBoundingClientRect();
+    // Place the marker relative to whichever group the pointer is over.
+    const over = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const grp = over?.closest<HTMLElement>(".pgroup");
+    if (!grp || grp === dragEl) return;
+    const r = grp.getBoundingClientRect();
     const after = e.clientY > r.top + r.height / 2;
-    container.insertBefore(marker, after ? over.nextSibling : over);
+    container.insertBefore(marker, after ? grp.nextSibling : grp);
   });
 
-  // Drop: slot the dragged group in at the marker, read the new order, persist.
-  container.addEventListener("drop", (e) => {
-    if (!dragEl) return;
-    e.preventDefault();
+  const finish = (e: PointerEvent) => {
+    try { container.releasePointerCapture(e.pointerId); } catch { /* */ }
+    if (!dragEl) { candidate = null; return; } // never crossed the slop: it was a click
     if (marker.parentNode) container.insertBefore(dragEl, marker);
     cleanup();
     projOrder = [...container.querySelectorAll<HTMLElement>(".pgroup")].map((el) => el.dataset.path!).filter(Boolean);
@@ -1229,11 +1249,44 @@ function initProjectDnD() {
     // A manual drag captures the current visual order and reasserts manual mode
     // (in a sorted mode the drag would otherwise be immediately overridden).
     if (sortMode !== "manual") setSort("manual", false);
+    // A pointerup *may* synthesise a click (if the browser still pairs it with the
+    // pointerdown after the DOM moved); guard the click handler for a brief window so
+    // the reorder doesn't also select. A plain timestamp self-heals if no click fires —
+    // a lingering one-shot listener would otherwise eat the user's next real click.
+    reorderGuardUntil = performance.now() + 250;
     renderAll();
-  });
+  };
+  container.addEventListener("pointerup", finish);
+  container.addEventListener("pointercancel", (e) => { try { container.releasePointerCapture(e.pointerId); } catch { /* */ } cleanup(); });
+}
 
-  // dragend fires after drop (no-op then) and on cancel (just clean up, no reorder).
-  container.addEventListener("dragend", () => { if (draggingProjects) { cleanup(); renderAll(); } });
+// External file drops. With dragDropEnabled:true the webview no longer navigates to a
+// dropped file's file:// URL (the old trap: a dropped PDF replaced the whole app with no
+// way back). Tauri's native drag-drop event carries the real absolute paths, which HTML5
+// drops never expose under WKWebView — so we paste them, shell-escaped, into the active
+// embedded session's PTY, matching what dragging a file into a normal terminal does.
+function initFileDrop() {
+  const zone = $("terminals");
+  getCurrentWebview().onDragDropEvent((e) => {
+    const p = e.payload;
+    if (p.type === "enter" || p.type === "over") zone.classList.add("dropping");
+    else zone.classList.remove("dropping");
+    if (p.type !== "drop") return;
+    const paths = p.paths || [];
+    if (!paths.length) return;
+    const s = activeId ? sessions.get(activeId) : null;
+    if (!s || s.external || !s.term) { toast("Drop files onto an embedded session's console to paste their paths"); return; }
+    const text = paths.map(shellEscapePath).join(" ") + " ";
+    invoke("write_pty", { sessionId: s.id, data: text });
+    s.term.focus();
+    dlog("info", `dropped ${paths.length} path${paths.length === 1 ? "" : "s"} into ${s.id.slice(0, 8)}`);
+  }).catch((err) => dlog("error", `onDragDropEvent wiring failed: ${err}`));
+}
+
+// Escape a path for a shell/REPL the way a terminal does on file drop: backslash before
+// anything outside the always-safe set, so spaces and metacharacters survive as one arg.
+function shellEscapePath(p: string): string {
+  return p.replace(/[^A-Za-z0-9_@%+=:,./-]/g, "\\$&");
 }
 function renderMini() {
   const activeProj = activeId ? sessions.get(activeId)?.project : null;
@@ -2244,6 +2297,8 @@ listen<{ id: string; data: any }>("permission", (e) => {
 
 // delegated clicks (sidebar / mini / inspector buttons)
 document.addEventListener("click", (e) => {
+  // A reorder just ended: eat the click a pointerup may have synthesised (see initProjectDnD).
+  if (performance.now() < reorderGuardUntil) { reorderGuardUntil = 0; return; }
   const t = e.target as HTMLElement;
   if (!t.closest("#colorPop, .pdot, .rm-dot")) closeColorPop();
   if (!t.closest("#enginePop, #fEngineSeg")) closeEnginePop();
@@ -2909,6 +2964,7 @@ setInterval(refreshBranches, 4000);
 
 setSort(sortMode, false); // paint the sort button's glyph/title for the persisted mode
 initProjectDnD();
+initFileDrop();
 // No `caffeinate` on Windows — drop the control rather than leave a button whose
 // every click reports an error. Its listeners stay wired but unreachable.
 if (IS_WINDOWS) $("caf").style.display = "none";
