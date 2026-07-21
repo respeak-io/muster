@@ -814,6 +814,13 @@ fn open_folder(dir: String) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
+        // Explorer's shell parser only understands backslashes. Hand it a
+        // forward-slash path and it silently opens the user's Documents folder
+        // instead — no error, no clue. That's not hypothetical: an external
+        // session's project row carries the repo root from `git rev-parse`, and
+        // git emits `E:/Programming/…` on Windows. `Path::is_dir` accepts either
+        // form, so the guard above cannot catch it; normalize here.
+        let dir = dir.replace('/', "\\");
         // explorer.exe is fire-and-forget: it hands off to the running shell and
         // exits non-zero even when the window opened, so never wait on its status.
         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
