@@ -40,24 +40,38 @@ Two hard constraints shape this code:
 ## Runnables — tasks & scripts (`src-tauri/src/tasks.rs`, `▶ Run`)
 
 Muster runs the task definitions a project already ships. A **`Runnable`** is one
-such definition (an npm script, an entry in `.muster/tasks.toml`; VS Code tasks,
-justfiles and Makefiles are the next providers). Discovery is in `tasks.rs`;
-execution reuses the existing PTY path, because **a task run is just another
-`Sess`** — see the `kind` discriminant below. That's what buys tasks the phase
-state machine, sidebar glyphs, attention badge, tray and ⌘1–9 for free: a run's
-**exit code is its phase** (0 → `done`, non-zero → `error`), delivered over the
-same `pty-exit` event as everything else.
+such definition. Providers: `.muster/tasks.toml` (Muster's own committable
+format), `.vscode/tasks.json`, `package.json` scripts, `justfile`, `Makefile`.
+Discovery is in `tasks.rs`; execution reuses the existing PTY path, because **a
+task run is just another `Sess`** — see the `kind` discriminant below. That's what
+buys tasks the phase state machine, sidebar glyphs, attention badge, tray and
+⌘1–9 for free: a run's **exit code is its phase** (0 → `done`, non-zero →
+`error`), delivered over the same `pty-exit` event as everything else.
 
-Two rules constrain `tasks.rs`:
+Three rules constrain `tasks.rs`:
 
-- **Discovery never executes the project.** Every provider parses a file. The
-  introspecting ones (`just --dump`, `task --list`, `make -qp`) *evaluate* what
-  they read — backtick variables and imports run shell at parse time — so they
-  stay out until there's a trust gate to put them behind. Adding a folder to
-  Muster must not run code from it.
-- **Ids are stable and namespaced** (`npm:test`, `muster:dev`). Pins
-  (`cc-task-pins`) and palette frecency key off them, so they must survive a
+- **Discovery never executes the project.** Most providers only parse. The
+  introspecting ones *evaluate* what they read — `just --dump` runs backtick
+  variables and imports at parse time — so they sit behind a **trust gate**:
+  `discover(root, trusted)`, where the frontend grants `trusted` only if the
+  global introspect toggle is on, the `just` provider is enabled, *and* the
+  folder is one the user chose (a `cc-favorites` project, or a one-time confirm
+  stored in `cc-trusted`). An untrusted justfile yields a single blocked row, so
+  the recipes read as withheld rather than missing. Makefiles are parsed
+  statically for exactly this reason — `make -qp` would expand `$(shell …)`.
+- **Ids are stable and namespaced** (`npm:test`, `vscode:build`, `just:deploy`).
+  Pins (`cc-task-pins`) and palette frecency key off them, so they must survive a
   rescan; `dedupe_ids` guarantees uniqueness.
+- **What can't run says so.** `blocked: Some(reason)` renders greyed in the
+  picker instead of being dropped — a missing row reads as "Muster didn't find my
+  task". VS Code tasks are blocked when they need an editor (`${file}`,
+  `${lineNumber}`), use `dependsOn` (running half of it silently is worse than
+  declining), or have an unsupported `type`. Supported variables:
+  `workspaceFolder`, `workspaceFolderBasename`, `cwd`, `userHome`,
+  `pathSeparator`, `env:X`. `${input:X}` is deliberately **left intact** by
+  discovery — only the frontend knows the answer, so it prompts (`openInputPrompt`)
+  and substitutes via `applyInputs` just before launch. just recipe parameters
+  without defaults become the same kind of prompt.
 
 `spawn_task` is the third PTY entry point after `spawn_claude` / `spawn_shell`.
 It takes a `TaskSpec { exec, cwd, env }` — a resolved subset of a `Runnable` — and
@@ -73,6 +87,22 @@ Surfaces: the `▶ Run` header button (picker grouped by source), a **Tasks** gr
 in ⌘K, and a task inspector offering re-run / pin / stop / *send output to a
 session*. Successful non-background runs auto-dismiss after 20s unless focused;
 failures persist and raise attention.
+
+## Settings window (⌘, · `renderSettings`)
+
+A modal with a **General** and a **Tasks** page. It exists partly because tasks
+needed somewhere to put the judgement calls (working directory when several
+worktrees are open, dismiss timing, whether a failed run raises attention,
+which providers to scan, trust) rather than hardcoding them — and it finally
+gives `wtGroup` a control, which until now was reachable only as
+`musterWtGroup()` in the console.
+
+Task preferences live in `cc-task-prefs`; trust in `cc-trusted`. The split is
+deliberate and worth preserving: **personal preference → `localStorage`;
+project fact → `.muster/tasks.toml`**, which is committable and works for a
+colleague who never opens Muster. Muster never rewrites a file it didn't create,
+so editing a discovered VS Code task should become an *override* in
+`tasks.toml`, not a mutation of `.vscode/tasks.json`.
 
 ## Backend (`src-tauri/src/lib.rs`)
 

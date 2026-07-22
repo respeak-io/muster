@@ -157,11 +157,17 @@ const isAgent = (s: Sess) => s.kind === "claude";
 // The resolved half of a Runnable — what the backend needs to actually start it.
 interface Exec { mode: "argv"; program: string; args: string[] }
 interface ExecShell { mode: "shell"; line: string }
+// One value a task needs before it can run — a VS Code `${input:…}` declaration,
+// or a just recipe parameter with no default.
+interface InputSpec {
+  id: string; kind: "promptString" | "pickString"; description: string;
+  default: string | null; options: string[]; password: boolean;
+}
 interface Runnable {
   id: string; label: string; detail: string | null;
   source: string; sourceFile: string; group: string | null;
   exec: Exec | ExecShell; cwd: string; env: Record<string, string>;
-  background: boolean; blocked: string | null;
+  background: boolean; inputs: InputSpec[]; blocked: string | null;
 }
 
 interface Sess {
@@ -1082,6 +1088,51 @@ function renderShellInspector(s: Sess) {
       <div class="ext-note">A regular login shell running inside Muster — no Claude, no telemetry. Handy for commands you don't want to run inside a session.</div>
     </div>`;
 }
+// ---------- task settings & trust ----------
+// Everything here is *personal* preference and lives in localStorage beside
+// cc-favorites. Project-shaped facts (what a task runs, its cwd, its env) belong
+// in .muster/tasks.toml, which is committable — the split is what keeps a shared
+// repo working for a colleague who never opens Muster.
+
+const ALL_PROVIDERS = ["muster", "vscode", "npm", "just", "make"] as const;
+type Provider = (typeof ALL_PROVIDERS)[number];
+const PROVIDER_LABEL: Record<Provider, string> = {
+  muster: ".muster", vscode: ".vscode", npm: "package.json", just: "justfile", make: "Makefile",
+};
+
+interface TaskPrefs {
+  providers: Provider[];
+  introspect: boolean;        // may a trusted project be *run* to enumerate itself?
+  cwd: "session" | "root";    // which directory a run inherits
+  dismissMs: number;          // 0 = never auto-dismiss a green run
+  attention: boolean;         // does a failed run raise the badge?
+}
+const DEFAULT_TASK_PREFS: TaskPrefs = {
+  providers: [...ALL_PROVIDERS], introspect: true, cwd: "session", dismissMs: 20000, attention: true,
+};
+const taskPrefs: TaskPrefs = { ...DEFAULT_TASK_PREFS, ...JSON.parse(localStorage.getItem("cc-task-prefs") || "{}") };
+function saveTaskPrefs() { localStorage.setItem("cc-task-prefs", JSON.stringify(taskPrefs)); renderAll(); }
+
+// Folders the user has explicitly allowed Muster to introspect. Adding a folder as
+// a project counts as saying yes — you chose it deliberately; a directory that
+// merely happens to hold a session does not.
+const trustedPaths: string[] = JSON.parse(localStorage.getItem("cc-trusted") || "[]");
+function saveTrusted() { localStorage.setItem("cc-trusted", JSON.stringify(trustedPaths)); }
+function isTrusted(path: string): boolean {
+  return FAVORITES.some((f) => f.path === path) || trustedPaths.includes(path);
+}
+function trustProject(path: string) {
+  if (!trustedPaths.includes(path)) { trustedPaths.push(path); saveTrusted(); }
+}
+function untrustProject(path: string) {
+  const i = trustedPaths.indexOf(path);
+  if (i >= 0) { trustedPaths.splice(i, 1); saveTrusted(); }
+  renderAll();
+}
+// Only projects the user opted in by hand can be revoked here — a favourite is
+// trusted *because* it's a favourite, and removing it is how you undo that.
+function explicitlyTrusted(): string[] { return [...trustedPaths]; }
+
 // ---------- runnables (tasks & scripts) ----------
 // Discovery lives in Rust (src-tauri/src/tasks.rs) and only ever *parses* files —
 // it never executes the project to find out what it can do. This half is choosing
@@ -1183,12 +1234,23 @@ function sendOutputToSession(task: Sess, targetId: string) {
     .catch((e) => toast("send failed: " + e));
 }
 
+// `discoveredIn` is the directory discovery ran in, which is how we tell a task
+// that declared its own cwd from one that merely inherited the default.
+interface TaskLaunchOpts { colorKey?: string; worktree?: string | null; branch?: string; discoveredIn?: string }
+
 // Start one run of a Runnable in its own pane. Mirrors launchShell — same PTY,
 // same xterm setup — because a task genuinely is just another pane.
-async function launchTask(r: Runnable, project: string, opts: { colorKey?: string; worktree?: string | null; branch?: string } = {}): Promise<string | null> {
+async function launchTask(r: Runnable, project: string, opts: TaskLaunchOpts = {}): Promise<string | null> {
   if (r.blocked) { toast(`${r.label}: ${r.blocked}`); return null; }
   const id = crypto.randomUUID();
   const colorKey = opts.colorKey ?? r.cwd;
+  // Which directory the run inherits (Settings › Tasks). "session" keeps the
+  // folder it was discovered in — the active session's, so with several worktrees
+  // open "run tests" means *this* worktree. "root" redirects to the repo root.
+  // Either way a task that declared its own cwd (tasks.toml `cwd`, VS Code
+  // `options.cwd`) keeps it: an explicit directory is never second-guessed.
+  const declaredOwnCwd = !!opts.discoveredIn && r.cwd !== opts.discoveredIn;
+  const cwd = taskPrefs.cwd === "root" && !declaredOwnCwd ? colorKey : r.cwd;
   const pane = document.createElement("div");
   pane.className = "term-pane";
   $("terminals").appendChild(pane);
@@ -1205,7 +1267,7 @@ async function launchTask(r: Runnable, project: string, opts: { colorKey?: strin
 
   const cmd = execCmd(r);
   const s: Sess = {
-    id, project, accent: accentFor(colorKey), workdir: r.cwd, colorKey,
+    id, project, accent: accentFor(colorKey), workdir: cwd, colorKey,
     branch: opts.branch ?? "", worktree: opts.worktree ?? null, title: r.label,
     phase: "working", phaseSince: Date.now(), lastActivity: Date.now(), attention: null,
     pendingCmd: "", pendingPermId: null, pendRisk: null, subagents: 0,
@@ -1222,7 +1284,7 @@ async function launchTask(r: Runnable, project: string, opts: { colorKey?: strin
   try {
     await invoke("spawn_task", {
       sessionId: id,
-      spec: { exec: r.exec, cwd: r.cwd, env: r.env },
+      spec: { exec: r.exec, cwd, env: r.env },
       rows: term.rows || 24, cols: term.cols || 80,
     });
   } catch (e) {
@@ -1243,6 +1305,7 @@ async function rerunTask(s: Sess) {
   const r = s.run; if (!r) return;
   const spec = lastRunnableById.get(r.id);
   if (!spec) { toast("Task definition is gone — rescan"); return; }
+  if (spec.inputs.length) { openInputPrompt(spec, s.project, { colorKey: s.colorKey, worktree: s.worktree, branch: s.branch, discoveredIn: spec.cwd }); return; }
   const project = s.project, colorKey = s.colorKey, worktree = s.worktree, branch = s.branch;
   closeSession(s.id);
   await launchTask(spec, project, { colorKey, worktree, branch });
@@ -1251,15 +1314,69 @@ async function rerunTask(s: Sess) {
 // The most recent discovery result, so a re-run doesn't need the picker open.
 const lastRunnableById = new Map<string, Runnable>();
 
-async function discoverTasks(workdir: string): Promise<Runnable[]> {
+// `trusted` is what lets the backend shell out to `just --dump` — which evaluates
+// the justfile. It takes all three of: the global toggle, the provider being on,
+// and this specific folder being one the user chose.
+async function discoverTasks(workdir: string, colorKey = workdir): Promise<Runnable[]> {
+  const trusted = taskPrefs.introspect && taskPrefs.providers.includes("just") && (isTrusted(workdir) || isTrusted(colorKey));
   try {
-    const list = await invoke<Runnable[]>("discover_runnables", { workdir });
+    const list = (await invoke<Runnable[]>("discover_runnables", { workdir, trusted }))
+      .filter((r) => taskPrefs.providers.includes(r.source as Provider));
     for (const r of list) lastRunnableById.set(r.id, r);
     return list;
   } catch (e) {
     dlog("warn", `discover failed (${workdir}): ${e}`);
     return [];
   }
+}
+
+// ---------- the inputs prompt ----------
+// A task declaring ${input:…} collects its values before anything runs. Discovery
+// deliberately leaves the placeholders intact, because only this side knows the
+// answers — so this is where they get filled in.
+let inputCtx: { r: Runnable; project: string; opts: TaskLaunchOpts } | null = null;
+
+function openInputPrompt(r: Runnable, project: string, opts: TaskLaunchOpts) {
+  inputCtx = { r, project, opts };
+  $("inSub").textContent = `${r.label} · ${r.inputs.length} input${r.inputs.length === 1 ? "" : "s"}`;
+  $("inBody").innerHTML = r.inputs.map((i, n) => {
+    const field = i.kind === "pickString"
+      ? `<select class="in-ctl" data-n="${n}">${i.options.map((o) => `<option value="${esc(o)}"${o === i.default ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+      : `<input class="in-ctl" data-n="${n}" type="${i.password ? "password" : "text"}" value="${esc(i.default ?? "")}" placeholder="${esc(i.default ?? "")}" spellcheck="false" autocomplete="off" />`;
+    return `<div class="in-field">
+      <label class="in-lbl">${esc(i.description)}<span class="in-id">${esc(i.id)}</span></label>
+      ${field}
+    </div>`;
+  }).join("");
+  $("inDlg").classList.add("show");
+  $("scrim").classList.add("show");
+  setTimeout(() => ($("inBody").querySelector(".in-ctl") as HTMLElement | null)?.focus(), 30);
+}
+function closeInputPrompt() {
+  $("inDlg").classList.remove("show");
+  if (!$("palette").classList.contains("show") && !$("runPop").classList.contains("show")) $("scrim").classList.remove("show");
+  inputCtx = null;
+}
+function submitInputPrompt() {
+  if (!inputCtx) return;
+  const { r, project, opts } = inputCtx;
+  const vals: Record<string, string> = {};
+  $("inBody").querySelectorAll<HTMLInputElement | HTMLSelectElement>(".in-ctl").forEach((el) => {
+    vals[r.inputs[+el.dataset.n!].id] = el.value;
+  });
+  closeInputPrompt();
+  void launchTask(applyInputs(r, vals), project, opts);
+}
+
+/// Substitute collected values into every string that reaches the command line.
+function applyInputs(r: Runnable, vals: Record<string, string>): Runnable {
+  const fill = (s: string) => s.replace(/\$\{input:([^}]+)\}/g, (m, id) => (id in vals ? vals[id] : m));
+  const exec = r.exec.mode === "shell"
+    ? { mode: "shell" as const, line: fill(r.exec.line) }
+    : { mode: "argv" as const, program: fill(r.exec.program), args: r.exec.args.map(fill) };
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(r.env)) env[k] = fill(v);
+  return { ...r, exec, cwd: fill(r.cwd), env, inputs: [] };
 }
 
 // ---- inspector: shared helpers for the redesigned modules ----
@@ -1571,7 +1688,7 @@ function renderFoot() {
 // not — it settles quietly and auto-dismisses.
 function needsYou(s: Sess): boolean {
   if (s.kind === "shell") return false;
-  if (s.kind === "task") return s.phase === "error";
+  if (s.kind === "task") return taskPrefs.attention && s.phase === "error";
   return !!s.attention || s.phase === "done" || s.phase === "error";
 }
 function needsYouSessions(): Sess[] {
@@ -1811,6 +1928,7 @@ const PAL_CMDS: { key: string; label: string; glyph: string; run: () => void; sc
   { key: "cmd:add", label: "Add a project folder…", glyph: "＋", run: addProject },
   { key: "cmd:term", label: "Open a terminal in the current project", glyph: "❯", run: openPlainTerminal },
   { key: "cmd:run", label: "Run a task in the current project…", glyph: "▶", run: () => { void openRunPicker(); } },
+  { key: "cmd:settings", label: "Open settings…", glyph: "⚙", run: () => openSettings(), sc: ["⌘", ","] },
   { key: "cmd:sort", label: "Change the sidebar sort order", glyph: "≡", run: cycleSort },
   { key: "cmd:insp", label: "Toggle the inspector", glyph: "◨", run: toggleInsp, sc: ["⌘", "I"] },
   { key: "cmd:rail", label: "Toggle the sidebar", glyph: "◧", run: toggleRail, sc: ["⌘", "B"] },
@@ -1845,7 +1963,13 @@ function buildPalGroups(raw: string): PalGroup[] {
   const taskCands: PalItem[] = palTasks.map((r) => ({
     kind: "task", key: "task:" + r.id, label: `Run ${r.label}`, labelHtml: esc(`Run ${r.label}`),
     sub: `${r.source} · ${execCmd(r)}`, glyph: r.blocked ? "⃠" : "▶",
-    run: () => { const c = runTargetCtx(); if (c) void launchTask(r, c.project, { colorKey: c.colorKey, worktree: c.worktree, branch: c.branch }); },
+    run: () => {
+      const c = runTargetCtx(); if (!c) return;
+      const o = { colorKey: c.colorKey, worktree: c.worktree, branch: c.branch, discoveredIn: c.workdir };
+      if (r.id === "just:__untrusted") { void askTrust(c.colorKey, c.project); return; }
+      if (r.inputs.length) { openInputPrompt(r, c.project, o); return; }
+      void launchTask(r, c.project, o);
+    },
   }));
   const launchCands: PalItem[] = FAVORITES.map((f) => ({ kind: "launch", key: "launch:" + f.path, label: `Launch ${f.name}`, labelHtml: esc(`Launch ${f.name}`), sub: tilde(f.path), sw: accentFor(f.path), icon: iconFor(f.path) || undefined, run: () => requestLaunch(f.name, f.path) }));
   const cmdCands: PalItem[] = PAL_CMDS.map((c) => ({ kind: "command", key: c.key, label: c.label, labelHtml: esc(c.label), sub: "command", glyph: c.glyph, shortcut: c.sc, run: c.run }));
@@ -1904,7 +2028,7 @@ function openPalette() {
   palPage = "root"; palActionSess = null; palSel = 0;
   const c = runTargetCtx();
   palTasks = [];
-  if (c) void discoverTasks(c.workdir).then((l) => { palTasks = l; if ($("palette").classList.contains("show")) refreshPal(); });
+  if (c) void discoverTasks(c.workdir, c.colorKey).then((l) => { palTasks = l; if ($("palette").classList.contains("show")) refreshPal(); });
   $("scrim").classList.add("show");
   $("palette").classList.add("show");
   ($("palInput") as HTMLInputElement).value = "";
@@ -1912,6 +2036,117 @@ function openPalette() {
   setTimeout(() => ($("palInput") as HTMLInputElement).focus(), 30);
 }
 function closePalette() { $("scrim").classList.remove("show"); $("palette").classList.remove("show"); palPage = "root"; palActionSess = null; }
+
+// ---------- settings ----------
+// The window main.ts has wanted for a while: it finally gives the worktree-grouping
+// mode a control (it was reachable only as musterWtGroup() in the console), and it
+// owns the task settings that would otherwise be hardcoded bets.
+
+let setPage: "general" | "tasks" = "tasks";
+const SET_PAGES: { id: "general" | "tasks"; label: string }[] = [
+  { id: "general", label: "General" },
+  { id: "tasks", label: "Tasks" },
+];
+
+/// A segmented control. `opts` are [value, label] pairs; `cur` is the selected one.
+function seg(name: string, cur: string, opts: [string, string][]): string {
+  return `<span class="s-ctl">${opts.map(([v, l]) =>
+    `<button class="opt${v === cur ? " on" : ""}" data-set="${name}" data-val="${esc(v)}">${esc(l)}</button>`).join("")}</span>`;
+}
+function sw(name: string, on: boolean): string {
+  return `<button class="sw${on ? " on" : ""}" data-set="${name}" data-val="${on ? "0" : "1"}" role="switch" aria-checked="${on}"></button>`;
+}
+function sRow(title: string, desc: string, ctl: string): string {
+  return `<div class="s-row"><div class="s-txt"><b>${title}</b><span>${desc}</span></div>${ctl}</div>`;
+}
+
+function renderSettings() {
+  $("setNav").innerHTML = SET_PAGES.map((p) =>
+    `<button class="set-tab${p.id === setPage ? " on" : ""}" data-page="${p.id}">${esc(p.label)}</button>`).join("");
+
+  const body = setPage === "general" ? settingsGeneral() : settingsTasks();
+  $("setBody").innerHTML = body;
+
+  $("setNav").querySelectorAll<HTMLElement>("[data-page]").forEach((el) =>
+    el.addEventListener("click", () => { setPage = el.dataset.page as typeof setPage; renderSettings(); }));
+  $("setBody").querySelectorAll<HTMLElement>("[data-set]").forEach((el) =>
+    el.addEventListener("click", () => applySetting(el.dataset.set!, el.dataset.val!)));
+}
+
+function settingsGeneral(): string {
+  return `
+    <div class="s-grp">Sidebar</div>
+    ${sRow("Worktree grouping", "How several checkouts of one repo are arranged in the sidebar.",
+      seg("wtGroup", wtGroup, [["subheader", "nested"], ["chip", "chips"], ["toplevel", "separate"], ["off", "flat"]]))}
+    ${sRow("Sort order", "What decides the order of projects in the sidebar.",
+      seg("sort", sortMode, SORT_MODES.map((m) => [m, SORT_META[m].label] as [string, string])))}
+    <div class="s-grp">Sessions</div>
+    ${sRow("New sessions open in", "Where the terminal for a new Claude session lives.",
+      seg("engine", termEngine, availEngines.map((e) => [e, engineDef(e).label] as [string, string])))}`;
+}
+
+function settingsTasks(): string {
+  const trusted = explicitlyTrusted();
+  const favTrusted = FAVORITES.length;
+  return `
+    <div class="s-grp">Providers</div>
+    ${sRow("Scan for task files", "Which formats Muster looks for when you open the Run picker.",
+      `<span class="s-ctl">${ALL_PROVIDERS.map((p) =>
+        `<button class="opt${taskPrefs.providers.includes(p) ? " on" : ""}" data-set="prov" data-val="${p}">${esc(PROVIDER_LABEL[p])}</button>`).join("")}</span>`)}
+
+    <div class="s-grp">Trust</div>
+    ${sRow("Let trusted projects introspect themselves",
+      "Listing justfile recipes means running <code>just --dump</code>, which evaluates the file and can execute code from the folder. Off means those recipes stay undiscovered.",
+      sw("introspect", taskPrefs.introspect))}
+    ${sRow("Trusted projects",
+      trusted.length
+        ? `${trusted.map((p) => `<code>${esc(basename(p))}</code>`).join(" ")} — plus your ${favTrusted} project folder${favTrusted === 1 ? "" : "s"}, trusted because you added them.`
+        : `Your ${favTrusted} project folder${favTrusted === 1 ? "" : "s"}, trusted because you added them. Anything else asks once.`,
+      trusted.length ? `<span class="s-ctl">${trusted.map((p) =>
+        `<button class="opt" data-set="untrust" data-val="${esc(p)}" title="${esc(tilde(p))}">revoke ${esc(basename(p))}</button>`).join("")}</span>` : `<span class="s-ctl"><span class="opt quiet">nothing to revoke</span></span>`)}
+
+    <div class="s-grp">Running</div>
+    ${sRow("Working directory", "With several worktrees open, “run tests” is otherwise ambiguous.",
+      seg("cwd", taskPrefs.cwd, [["session", "active session"], ["root", "repo root"]]))}
+    ${sRow("Dismiss successful runs", "Failures always stay until you close them.",
+      seg("dismiss", String(taskPrefs.dismissMs), [["0", "never"], ["20000", "after 20s"], ["1", "at once"]]))}
+    ${sRow("Raise attention when a run fails", "Uses the same badge and tray notification as a blocked session.",
+      sw("attention", taskPrefs.attention))}`;
+}
+
+function applySetting(name: string, val: string) {
+  switch (name) {
+    case "wtGroup": setWtGroup(val as WtGroup); break;
+    case "sort": setSort(val as SortMode, false); break;
+    case "engine": setEngine(val as Engine); break;
+    case "prov": {
+      const p = val as Provider;
+      const on = taskPrefs.providers.includes(p);
+      // Never let every provider be switched off — an empty picker looks broken.
+      if (on && taskPrefs.providers.length === 1) { toast("At least one provider has to stay on"); return; }
+      taskPrefs.providers = on ? taskPrefs.providers.filter((x) => x !== p) : [...taskPrefs.providers, p];
+      saveTaskPrefs();
+      break;
+    }
+    case "introspect": taskPrefs.introspect = val === "1"; saveTaskPrefs(); break;
+    case "cwd": taskPrefs.cwd = val as TaskPrefs["cwd"]; saveTaskPrefs(); break;
+    case "dismiss": taskPrefs.dismissMs = +val; saveTaskPrefs(); break;
+    case "attention": taskPrefs.attention = val === "1"; saveTaskPrefs(); break;
+    case "untrust": untrustProject(val); break;
+  }
+  renderSettings();
+}
+
+function openSettings(page: "general" | "tasks" = "tasks") {
+  setPage = page;
+  $("setDlg").classList.add("show");
+  $("scrim").classList.add("show");
+  renderSettings();
+}
+function closeSettings() {
+  $("setDlg").classList.remove("show");
+  if (!$("palette").classList.contains("show") && !$("runPop").classList.contains("show")) $("scrim").classList.remove("show");
+}
 
 // ---------- panels / theme ----------
 function setSort(m: SortMode, announce = true) {
@@ -2035,15 +2270,14 @@ listen<{ sessionId: string; code: number }>("pty-exit", (e) => {
 // A green run shouldn't linger — tasks are far more numerous and shorter-lived
 // than sessions, and without this the rail silently fills with ticks. A pane you
 // are actually looking at is never yanked away, and a failure never auto-closes.
-const DISMISS_MS = 20000;
 function scheduleDismiss(s: Sess) {
-  if (s.run?.background) return;
+  if (s.run?.background || !taskPrefs.dismissMs) return;
   window.setTimeout(() => {
     const cur = sessions.get(s.id);
     if (!cur || cur.run?.exitCode !== 0) return;   // re-run or still failing → leave it
     if (activeId === cur.id) return;               // you're reading it
     closeSession(cur.id);
-  }, DISMISS_MS);
+  }, taskPrefs.dismissMs);
 }
 listen<{ kind: string; data: any }>("telemetry", (e) => {
   const { kind, data } = e.payload; if (!data) return;
@@ -2342,6 +2576,7 @@ $("attnBadge").addEventListener("click", () => {
 
 $("kbar").addEventListener("click", openPalette);
 $("themeBtn").addEventListener("click", toggleTheme);
+$("setBtn").addEventListener("click", () => openSettings());
 $("railCollapse").addEventListener("click", toggleRail);
 $("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);
@@ -2381,7 +2616,7 @@ function openPlainTerminal() {
 // A popover over the stage, grouped by source so it's obvious where each task came
 // from. Blocked runnables stay visible but greyed: hiding them reads as "Muster
 // didn't find my task", which is the more expensive confusion.
-let runCtx: { project: string; colorKey: string; worktree: string | null; branch: string } | null = null;
+let runCtx: { project: string; colorKey: string; worktree: string | null; branch: string; workdir: string } | null = null;
 let runList: Runnable[] = [];
 let runSel = 0;
 
@@ -2402,8 +2637,8 @@ function runTargetCtx() {
 async function openRunPicker() {
   const c = runTargetCtx();
   if (!c) { toast("No active project"); return; }
-  runCtx = { project: c.project, colorKey: c.colorKey, worktree: c.worktree, branch: c.branch };
-  runList = await discoverTasks(c.workdir);
+  runCtx = { project: c.project, colorKey: c.colorKey, worktree: c.worktree, branch: c.branch, workdir: c.workdir };
+  runList = await discoverTasks(c.workdir, c.colorKey);
   runSel = 0;
   $("runSub").textContent = `${c.project}${c.worktree ? " · ⑃ " + c.branch : ""} · ${tilde(c.workdir)}`;
   const pop = $("runPop");
@@ -2476,10 +2711,29 @@ function pickRun(pin: boolean) {
   const r = flat[runSel];
   if (!r || !runCtx) return;
   if (pin) { togglePin(runCtx.colorKey, r.id); renderRunPicker(($("runInput") as HTMLInputElement).value); return; }
+  // The trust gate is the one blocked row you can act on: choosing it asks for
+  // permission rather than shrugging.
+  if (r.id === "just:__untrusted") { void askTrust(runCtx.colorKey, runCtx.project); return; }
+  if (r.blocked) { toast(`${r.label}: ${r.blocked}`); return; }
   const ctx = runCtx;
   closeRunPicker();
   bumpFrec("task:" + r.id);
-  void launchTask(r, ctx.project, { colorKey: ctx.colorKey, worktree: ctx.worktree, branch: ctx.branch });
+  const o = { colorKey: ctx.colorKey, worktree: ctx.worktree, branch: ctx.branch, discoveredIn: ctx.workdir };
+  if (r.inputs.length) { openInputPrompt(r, ctx.project, o); return; }
+  void launchTask(r, ctx.project, o);
+}
+
+// Trusting a folder means Muster may execute code from it to enumerate tasks, so
+// it is asked for plainly and once, never inferred from mere use.
+async function askTrust(path: string, project: string) {
+  const ok = await ask(
+    `Muster will run \`just --dump\` inside ${project} to list its recipes.\n\n`
+    + `That evaluates the justfile, which can execute code from this folder. Only do this for projects you trust.`,
+    { title: `Trust ${project}?`, kind: "warning", okLabel: "Trust and rescan", cancelLabel: "Cancel" });
+  if (!ok) return;
+  trustProject(path);
+  dlog("info", `trusted ${path}`);
+  await openRunPicker();
 }
 
 // Hand a command over to a terminal at `workdir` instead of running it ourselves.
@@ -2589,6 +2843,13 @@ $("btnNew").addEventListener("click", () => {
 $("btnWorktree").addEventListener("click", () => { const c = activeProjectCtx(); if (!c) { toast("No active session"); return; } openWt(c.project, c.path, false); });
 $("btnTerm").addEventListener("click", openPlainTerminal);
 $("btnRun").addEventListener("click", () => { void openRunPicker(); });
+$("inCancel").addEventListener("click", closeInputPrompt);
+$("inGo").addEventListener("click", submitInputPrompt);
+$("inBody").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); submitInputPrompt(); }
+  else if (e.key === "Escape") { e.preventDefault(); closeInputPrompt(); }
+});
+$("setClose").addEventListener("click", closeSettings);
 $("runInput").addEventListener("input", () => { runSel = 0; renderRunPicker(($("runInput") as HTMLInputElement).value); });
 $("runInput").addEventListener("keydown", (e) => {
   const meta = e.metaKey || e.ctrlKey;
@@ -2606,7 +2867,7 @@ $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);
 $("wtMain").addEventListener("click", () => { if (!wtCtx) return; const { project, repoDir } = wtCtx; closeWt(); launch(project, repoDir, { colorKey: repoDir }); });
 $("wtBranch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtCreate(); } else if (e.key === "Escape") closeWt(); });
-$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); closeRunPicker(); });
+$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); closeRunPicker(); closeInputPrompt(); closeSettings(); });
 $("diffClose").addEventListener("click", closeDiff);
 // Collapse / expand a file section by clicking its header.
 $("diffBody").addEventListener("click", (e) => {
@@ -2639,7 +2900,10 @@ window.addEventListener("keydown", (e) => {
   else if (meta && (e.key === "=" || e.key === "+")) { e.preventDefault(); bumpFont(0.5); }
   else if (meta && e.key === "-") { e.preventDefault(); bumpFont(-0.5); }
   else if (meta && e.key === "0") { e.preventDefault(); termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
+  else if (meta && e.key === ",") { e.preventDefault(); $("setDlg").classList.contains("show") ? closeSettings() : openSettings(); }
+  else if (meta && e.key.toLowerCase() === "r" && !$("runPop").classList.contains("show")) { e.preventDefault(); void openRunPicker(); }
   else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
+  else if (e.key === "Escape" && $("setDlg").classList.contains("show")) { e.preventDefault(); closeSettings(); }
 });
 new ResizeObserver(() => refit()).observe($("terminals"));
 

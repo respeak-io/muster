@@ -30,6 +30,7 @@
             </button>
             <button class="caf-caret" id="cafCaret" aria-label="Choose caffeinate mode">▾</button>
           </div>
+          <button class="ibtn" id="setBtn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
           <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
         </div>
       </header>
@@ -107,6 +108,24 @@
       <div class="run-foot">
         <span><kbd>⏎</kbd> run</span><span><kbd>⌘</kbd><kbd>⏎</kbd> pin</span><span><kbd>⌘</kbd><kbd>R</kbd> rescan</span><span><kbd>esc</kbd> close</span>
       </div>
+    </div>
+
+    <div class="indlg" id="inDlg" role="dialog" aria-modal="true">
+      <div class="wt-h">Run<span class="in-sub" id="inSub"></span></div>
+      <div class="in-body" id="inBody"></div>
+      <div class="wt-btns">
+        <button class="wt-cancel" id="inCancel">Cancel</button>
+        <button class="wt-go" id="inGo">Run ▸</button>
+      </div>
+    </div>
+
+    <div class="setdlg" id="setDlg" role="dialog" aria-modal="true">
+      <div class="set-head">
+        <b>Settings</b>
+        <div class="set-nav" id="setNav"></div>
+        <button class="diff-x" id="setClose" title="Close (Esc)">✕</button>
+      </div>
+      <div class="set-body" id="setBody"></div>
     </div>
 
     <div class="wtdlg" id="wtDlg" role="dialog" aria-modal="true">
