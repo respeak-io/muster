@@ -1,15 +1,18 @@
 name: ci
 
-# Compile gate for every PR and every push to main. There is no runtime test suite
-# (verification is running the app — see CLAUDE.md), so this proves the far cheaper
-# thing: the frontend typechecks and both supported OSes still build. It's what
-# catches "someone broke the Windows build" (or the macOS one) before it merges,
+# Compile gate for every PR and every push to dev or main. There is no runtime test
+# suite (verification is running the app — see CLAUDE.md), so this proves the far
+# cheaper thing: the frontend typechecks and both supported OSes still build. It's
+# what catches "someone broke the Windows build" (or the macOS one) before it merges,
 # since the cfg-gated platform code only compiles on its own OS.
+#
+# Work flows dev -> main, so dev is where the churn is and where a break must surface
+# first. main is kept too: it re-gates the dev -> main PR and covers a direct push.
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
 
 jobs:
@@ -21,13 +24,13 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: pnpm

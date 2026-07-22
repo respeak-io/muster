@@ -15,7 +15,7 @@
         <div class="top-right">
           <button class="attn-badge" id="attnBadge"><span class="bdot"></span><span id="attnBadgeTxt"></span></button>
           <div class="caf" id="caf">
-            <button class="caf-main" id="cafMain" aria-label="Keep this Mac awake">
+            <button class="caf-main" id="cafMain" aria-label="Keep this computer awake">
               <svg class="caf-ic" viewBox="0 0 24 24" aria-hidden="true">
                 <g class="caf-steam" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
                   <path class="s1" d="M9 2.6c-.8 1-.8 2 0 3s.8 2 0 3" />
@@ -30,8 +30,8 @@
             </button>
             <button class="caf-caret" id="cafCaret" aria-label="Choose caffeinate mode">▾</button>
           </div>
-          <button class="ibtn" id="setBtn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
           <button class="ibtn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+          <button class="ibtn" id="setBtn" title="Settings (⌘,)" aria-label="Settings">⚙</button>
         </div>
       </header>
 
@@ -53,8 +53,7 @@
           <div class="st-actions">
             <button class="act" id="btnTerm" title="Open a plain (non-Claude) terminal at the project root">❯ Terminal</button>
             <button class="act" id="btnRun" title="Run a task or script from this project">▶ Run</button>
-            <button class="act" id="btnWorktree" title="Create git worktree + session">⑃ Worktree</button>
-            <button class="act primary" id="btnNew">＋ Session</button>
+            <button class="act primary" id="btnNew" title="Start a session — pick the repo, a worktree, or a branch">＋ Session</button>
             <button class="act icon" id="btnClose" title="Close session" hidden>✕</button>
             <button class="act icon" id="inspBtn" title="Toggle inspector (⌘I)">◨</button>
           </div>
@@ -84,12 +83,20 @@
         <span class="fver" id="fVer" title="Installed Muster version · click to check for updates"></span>
         <button class="fupdate" id="fUpdate" title="Download the new version and restart Muster" hidden></button>
         <span class="fseg"><span id="fSessions">0</span> sessions</span>
+        <span class="fdiv"></span>
         <span class="fseg">today <b id="fCost">$0.00</b></span>
-        <span class="fseg">5h <b id="fRl">–</b><span class="fsub" id="fRlReset"></span></span>
-        <span class="fseg">7d <b id="fRl7">–</b></span>
+        <span class="fdiv"></span>
+        <span class="fseg fclick" id="fUsageSeg" title="Claude usage limits & forecast — click for detail">
+          <span class="flabel">limits</span>
+          <b id="fRl">–</b><span class="fsub">5h</span><span class="freset" id="fRlReset"></span>
+          <span class="fmid">·</span>
+          <b id="fRl7">–</b><span class="fsub">7d</span><span class="freset" id="fRl7Reset"></span>
+          <span class="fcaret">▴</span>
+        </span>
+        <span class="fdiv"></span>
         <span class="fseg fclick" id="fEngineSeg" title="Choose where new sessions open">new in <b id="fEngine">embedded</b> <span class="fcaret">▴</span></span>
         <span class="spacer"></span>
-        <span class="fseg fk">⌘K · ⌘1–9 switch · ⌘B sidebar · ⌘I inspector · ⌘± font</span>
+        <span class="fseg fclick" id="fShortSeg" title="Keyboard shortcuts"><kbd class="fkbd">⌘</kbd><span class="flabel">Shortcuts</span><span class="fcaret">▴</span></span>
         <button class="dbg-btn" id="dbgBtn" title="Debug console — live events & app state"><span class="dbg-ic">🐞</span><span class="dbg-badge" id="dbgBadge" hidden>0</span></button>
       </footer>
     </div>
@@ -119,12 +126,12 @@
       </div>
     </div>
 
-    <div class="setdlg mgrdlg" id="mgrDlg" role="dialog" aria-modal="true">
-      <div class="set-head">
+    <div class="mgrdlg" id="mgrDlg" role="dialog" aria-modal="true" aria-label="Project tasks">
+      <div class="mgr-head">
         <b>Tasks</b><span class="run-sub" id="mgrSub"></span>
         <button class="diff-x" id="mgrClose" title="Close (Esc)">✕</button>
       </div>
-      <div class="set-body mgr-body" id="mgrBody"></div>
+      <div class="mgr-body" id="mgrBody"></div>
       <div class="mgr-foot">
         <button class="tact" id="mgrBack">‹ Back</button>
         <button class="tact" id="mgrOpen">↗ Open tasks.toml</button>
@@ -134,25 +141,38 @@
       </div>
     </div>
 
-    <div class="setdlg" id="setDlg" role="dialog" aria-modal="true">
-      <div class="set-head">
-        <b>Settings</b>
-        <div class="set-nav" id="setNav"></div>
-        <button class="diff-x" id="setClose" title="Close (Esc)">✕</button>
+    <!--
+      New session. Every answer to "where should this session run" is a directory, so
+      every answer is a row: the repo itself, its worktrees, its branches, and whatever
+      you type. One scroll region on the left, the consequences of the highlighted row
+      on the right. Head and foot are pinned — the list is the only thing that scrolls.
+    -->
+    <div class="wtdlg" id="wtDlg" role="dialog" aria-modal="true" aria-label="New session">
+      <div class="wt-head">
+        <div class="wt-title"><b>New session</b><span class="wt-proj" id="wtProj"></span></div>
+        <div class="wt-headrow">
+          <span class="wt-path" id="wtPath"></span>
+          <span class="wt-eng" id="wtEng"></span>
+          <button class="wt-chip" id="wtRefresh" type="button" title="Re-read worktrees and branches">
+            <span class="ic">⟳</span><span id="wtAge">now</span>
+          </button>
+        </div>
       </div>
-      <div class="set-body" id="setBody"></div>
-    </div>
-
-    <div class="wtdlg" id="wtDlg" role="dialog" aria-modal="true">
-      <div class="wt-h">Worktrees</div>
-      <div class="wt-sub" id="wtSub"></div>
-      <div class="wt-list" id="wtList" hidden></div>
-      <label class="wt-lbl" for="wtBranch">New branch</label>
-      <input class="wt-in" id="wtBranch" spellcheck="false" placeholder="feature-x" autocomplete="off" />
-      <div class="wt-btns">
-        <button class="wt-cancel" id="wtCancel">Cancel</button>
-        <button class="wt-alt" id="wtMain" hidden>without worktree</button>
-        <button class="wt-go" id="wtGo">Create worktree ▸</button>
+      <div class="wt-q">
+        <span class="wt-caret">❯</span>
+        <input id="wtQ" spellcheck="false" autocomplete="off" aria-label="Filter destinations, or type a new branch name"
+               placeholder="Filter, or type a new branch name…" />
+        <span class="wt-count" id="wtCount"></span>
+      </div>
+      <div class="wt-body">
+        <div class="wt-list" id="wtList" role="listbox" aria-label="Session destinations"></div>
+        <div class="wt-detail" id="wtDetail" aria-live="polite"></div>
+      </div>
+      <div class="wt-foot">
+        <span><span class="k">↑</span><span class="k">↓</span> move</span>
+        <span><span class="k">⏎</span> <span class="wt-verb" id="wtVerb">start session</span></span>
+        <span class="sp"></span>
+        <span><span class="k">esc</span> close</span>
       </div>
     </div>
 
@@ -162,6 +182,17 @@
         <button class="diff-x" id="diffClose" title="Close (Esc)">✕</button>
       </div>
       <div class="diff-body" id="diffBody"></div>
+    </div>
+
+    <div class="setdlg" id="setDlg" role="dialog" aria-modal="true" aria-label="Settings">
+      <nav class="set-rail">
+        <div class="set-title">Settings</div>
+        <div class="set-tabs" id="setTabs"></div>
+      </nav>
+      <section class="set-pane">
+        <button class="set-x" id="setClose" title="Close (Esc)" aria-label="Close settings">✕</button>
+        <div class="set-body" id="setBody"></div>
+      </section>
     </div>
 
     <div class="dbg-panel" id="dbgPanel" hidden>
@@ -177,9 +208,16 @@
     </div>
 
     <div class="toast" id="toast"></div>
+    <div class="menupop ctxmenu" id="ctxMenu"></div>
     <div class="colorpop" id="colorPop"></div>
     <div class="menupop" id="enginePop"></div>
     <div class="menupop cafpop" id="cafPop"></div>
     <div class="menupop attnpop" id="attnPop"></div>
+    <div class="menupop usagepop" id="usagePop"></div>
+    <div class="menupop shortpop" id="shortPop"></div>
+    <!-- branch chooser for the new-session dialog (worktree base / root switch target).
+         Lives out here with its siblings, not inside #wtDlg: that dialog is
+         overflow:hidden, so an in-dialog popover would be clipped. -->
+    <div class="menupop bpop" id="bPop"></div>
   </body>
 </html>

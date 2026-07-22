@@ -16,7 +16,9 @@ use std::sync::Mutex;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::MenuBuilder;
+#[cfg(target_os = "macos")]
+use tauri::menu::{MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -27,6 +29,9 @@ struct Session {
     /// OS pid of the spawned `claude` (embedded PTY only). Used to exclude our
     /// own sessions from `list_external_sessions` by pid rather than session id.
     pid: Option<u32>,
+    /// Working directory this session runs in. Lets `remove_worktree` refuse to
+    /// delete a worktree that still has a live embedded session inside it.
+    workdir: String,
 }
 
 struct AppState {
@@ -46,6 +51,10 @@ struct AppState {
     /// without a clean stop — no orphaned process keeps the Mac awake forever.
     #[cfg(not(windows))]
     caffeinate: Mutex<Option<std::process::Child>>,
+    /// The single live `SetThreadExecutionState` assertion, if the user has
+    /// toggled keep-awake on. Windows' equivalent of the `caffeinate` child.
+    #[cfg(windows)]
+    caffeinate: Mutex<Option<KeepAwake>>,
 }
 
 /// Find a request header by (case-insensitive) name.
@@ -77,11 +86,37 @@ fn run_telemetry_server(server: tiny_http::Server, app: AppHandle) {
         let stable_sid = header_value(&request, "X-CC-Session").or_else(|| query_param(&url, "sid"));
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
-        let mut data: serde_json::Value =
-            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        // A parse failure here silently degrades the whole pane (session shows but
+        // no model/cost/phase) — e.g. the PowerShell-BOM class of bug — so it must
+        // be loud. Log length + error only, never the body (it can carry prompts).
+        let mut data: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                if !body.is_empty() {
+                    log::warn!(
+                        "telemetry: dropping unparseable {} payload ({} bytes, sid {}): {e}",
+                        url,
+                        body.len(),
+                        stable_sid.as_deref().unwrap_or("?")
+                    );
+                }
+                serde_json::Value::Null
+            }
+        };
         if let Some(sid) = &stable_sid {
             if !data.is_object() {
                 data = serde_json::json!({});
+            }
+            // Keep Claude's *runtime* id before forcing ours onto the payload. It
+            // rotates on /clear, /compact and /resume — and each rotation starts a
+            // NEW transcript file. So the runtime id, not our stable launch id, is
+            // what `--resume` must target; the frontend records it for restore.
+            // Routing still uses `session_id` (ours) and is unaffected.
+            if let Some(rt) = data.get("session_id").and_then(|v| v.as_str()) {
+                if rt != sid {
+                    let rt = rt.to_string();
+                    data["claude_session_id"] = serde_json::Value::String(rt);
+                }
             }
             data["session_id"] = serde_json::Value::String(sid.clone());
         }
@@ -328,8 +363,16 @@ fn spawn_claude(
     workdir: String,
     rows: u16,
     cols: u16,
+    resume: Option<String>,
 ) -> Result<(), String> {
     let port = state.port;
+    // A resume must land in the session's ORIGINAL cwd: Claude looks the id up in
+    // `~/.claude/projects/<enc(cwd)>/`, so resuming from elsewhere fails with "no
+    // conversation found". Creating the dir would silently produce that failure
+    // against an empty project, so refuse up front with something actionable.
+    if resume.is_some() && !std::path::Path::new(&workdir).is_dir() {
+        return Err(format!("can't resume: {workdir} no longer exists"));
+    }
     std::fs::create_dir_all(&workdir).map_err(|e| format!("create workdir: {e}"))?;
     let settings_path =
         write_instrument_settings(port, &session_id).map_err(|e| format!("write settings: {e}"))?;
@@ -341,8 +384,20 @@ fn spawn_claude(
 
     let claude = resolve_claude();
     let mut cmd = CommandBuilder::new(&claude);
-    cmd.arg("--session-id");
-    cmd.arg(&session_id);
+    // `--resume` and `--session-id` are mutually exclusive — resume adopts the
+    // stored id and ignores ours — so this is either/or, never both. `--settings`
+    // stays keyed to OUR launch uuid either way, so every hook still POSTs the
+    // `X-CC-Session` header the frontend routes by, whatever id Claude runs under.
+    match &resume {
+        Some(prev) => {
+            cmd.arg("--resume");
+            cmd.arg(prev);
+        }
+        None => {
+            cmd.arg("--session-id");
+            cmd.arg(&session_id);
+        }
+    }
     cmd.arg("--settings");
     cmd.arg(&settings_path);
     cmd.cwd(&workdir);
@@ -355,6 +410,10 @@ fn spawn_claude(
     cmd.env("CC_LAUNCHER_SESSION", &session_id);
     apply_utf8_locale(&mut cmd);
 
+    log::info!(
+        "spawn claude · {session_id} · {workdir}{}",
+        resume.as_deref().map(|r| format!(" · resume {r}")).unwrap_or_default()
+    );
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
@@ -371,7 +430,7 @@ fn spawn_claude(
 
     state.sessions.lock().unwrap().insert(
         session_id.clone(),
-        Session { master: pair.master, writer, killer, pid: child_pid },
+        Session { master: pair.master, writer, killer, pid: child_pid, workdir },
     );
 
     stream_pty_session(app, session_id, reader, child, child_pid);
@@ -412,6 +471,7 @@ fn stream_pty_session(
 
     std::thread::spawn(move || {
         let code = child.wait().map(|s| s.exit_code()).unwrap_or(0);
+        log::info!("pty exit · {session_id} · code {code}");
         if let Some(st) = app.try_state::<AppState>() {
             st.sessions.lock().unwrap().remove(&session_id);
             if let Some(p) = child_pid {
@@ -487,7 +547,7 @@ fn spawn_shell(
     // and never registers in ~/.claude/sessions, so it can't leak as "external".
     state.sessions.lock().unwrap().insert(
         session_id.clone(),
-        Session { master: pair.master, writer, killer, pid: child_pid },
+        Session { master: pair.master, writer, killer, pid: child_pid, workdir },
     );
     stream_pty_session(app, session_id, reader, child, child_pid);
     Ok(())
@@ -585,7 +645,7 @@ fn spawn_task(
     let child_pid = child.process_id();
     state.sessions.lock().unwrap().insert(
         session_id.clone(),
-        Session { master: pair.master, writer, killer, pid: child_pid },
+        Session { master: pair.master, writer, killer, pid: child_pid, workdir },
     );
     stream_pty_session(app, session_id, reader, child, child_pid);
     Ok(())
@@ -629,8 +689,12 @@ fn spawn_ghostty(
     workdir: String,
     accent: String,
     title: String,
+    resume: Option<String>,
 ) -> Result<(), String> {
     let port = state.port;
+    if resume.is_some() && !std::path::Path::new(&workdir).is_dir() {
+        return Err(format!("can't resume: {workdir} no longer exists"));
+    }
     std::fs::create_dir_all(&workdir).map_err(|e| format!("create workdir: {e}"))?;
     let settings_path =
         write_instrument_settings(port, &session_id).map_err(|e| format!("write settings: {e}"))?;
@@ -644,8 +708,17 @@ fn spawn_ghostty(
     cmd.arg(format!("--working-directory={workdir}"));
     cmd.arg("-e");
     cmd.arg(resolve_claude());
-    cmd.arg("--session-id");
-    cmd.arg(&session_id);
+    // Either/or, never both — see the note in `spawn_claude`.
+    match &resume {
+        Some(prev) => {
+            cmd.arg("--resume");
+            cmd.arg(prev);
+        }
+        None => {
+            cmd.arg("--session-id");
+            cmd.arg(&session_id);
+        }
+    }
     cmd.arg("--settings");
     cmd.arg(&settings_path);
     for (k, v) in std::env::vars() {
@@ -700,6 +773,7 @@ fn spawn_external_terminal(
     _workdir: String,
     _engine: String,
     _title: String,
+    _resume: Option<String>,
 ) -> Result<(), String> {
     Err("external terminals aren't supported on Windows yet — use the embedded terminal".to_string())
 }
@@ -717,8 +791,12 @@ fn spawn_external_terminal(
     workdir: String,
     engine: String,
     title: String,
+    resume: Option<String>,
 ) -> Result<(), String> {
     let port = state.port;
+    if resume.is_some() && !std::path::Path::new(&workdir).is_dir() {
+        return Err(format!("can't resume: {workdir} no longer exists"));
+    }
     std::fs::create_dir_all(&workdir).map_err(|e| format!("create workdir: {e}"))?;
     let settings_path =
         write_instrument_settings(port, &session_id).map_err(|e| format!("write settings: {e}"))?;
@@ -729,13 +807,17 @@ fn spawn_external_terminal(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let script = dir.join(format!("run-{session_id}.command"));
 
+    // Either/or, never both — see the note in `spawn_claude`.
+    let id_args = match &resume {
+        Some(prev) => format!("--resume {}", sh_quote(prev)),
+        None => format!("--session-id {}", sh_quote(&session_id)),
+    };
     let body = format!(
-        "#!/bin/zsh\n# Muster session: {title}\nexport PATH={path}\ncd {wd} || exit 1\nexec {claude} --session-id {sid} --settings {settings}\n",
+        "#!/bin/zsh\n# Muster session: {title}\nexport PATH={path}\ncd {wd} || exit 1\nexec {claude} {id_args} --settings {settings}\n",
         title = title.replace(['\n', '\r'], " "),
         path = sh_quote(&augmented_path()),
         wd = sh_quote(&workdir),
         claude = sh_quote(&claude),
-        sid = sh_quote(&session_id),
         settings = sh_quote(&settings_path),
     );
     std::fs::write(&script, body).map_err(|e| format!("write launcher: {e}"))?;
@@ -822,6 +904,48 @@ fn open_terminal_here(workdir: String, engine: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Open a project's folder in the OS file manager (Explorer / Finder / the
+/// desktop's default handler). Refuses a vanished directory rather than silently
+/// doing nothing — deleted worktrees are real.
+#[tauri::command]
+fn open_folder(dir: String) -> Result<(), String> {
+    if !std::path::Path::new(&dir).is_dir() {
+        return Err(format!("not a directory: {dir}"));
+    }
+    #[cfg(windows)]
+    {
+        // Explorer's shell parser only understands backslashes. Hand it a
+        // forward-slash path and it silently opens the user's Documents folder
+        // instead — no error, no clue. That's not hypothetical: an external
+        // session's project row carries the repo root from `git rev-parse`, and
+        // git emits `E:/Programming/…` on Windows. `Path::is_dir` accepts either
+        // form, so the guard above cannot catch it; normalize here.
+        let dir = dir.replace('/', "\\");
+        // explorer.exe is fire-and-forget: it hands off to the running shell and
+        // exits non-zero even when the window opened, so never wait on its status.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        std::process::Command::new(format!(r"{sysroot}\explorer.exe"))
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("open Explorer: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("open Finder: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Persist a debug snapshot (JSON built by the frontend) to a fixed, discoverable
 /// path so an external tool — or an LLM agent debugging the running app — can read
 /// live state and the recent event log. Returns the path written.
@@ -833,6 +957,21 @@ fn write_debug_file(contents: String) -> Result<String, String> {
     let path = dir.join("muster-debug.json");
     std::fs::write(&path, contents).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Tee a frontend `dlog()` line into the backend rolling log (muster.log), tagged
+/// `[ui]`. The UI's event stream is otherwise only an in-memory ring mirrored to
+/// the *overwritten* muster-debug.json snapshot — so it doesn't survive a crash.
+/// Forwarding it here puts the whole timeline (UI + backend) in one durable,
+/// time-ordered file: after #12 the backend was crash-visible but the UI half
+/// wasn't. Fire-and-forget from the frontend; a dropped line is not worth an error.
+#[tauri::command]
+fn log_frontend(level: String, msg: String) {
+    match level.as_str() {
+        "error" => log::error!("[ui] {msg}"),
+        "warn" => log::warn!("[ui] {msg}"),
+        _ => log::info!("[ui] {msg}"),
+    }
 }
 
 #[tauri::command]
@@ -880,6 +1019,7 @@ fn resolve_permission(state: State<AppState>, id: String, behavior: String) {
 fn kill_session(state: State<AppState>, session_id: String) -> Result<(), String> {
     let killed = state.sessions.lock().unwrap().remove(&session_id);
     if let Some(mut s) = killed {
+        log::info!("kill session · {session_id}");
         let _ = s.killer.kill();
         if let Some(p) = s.pid {
             state.owned_pids.lock().unwrap().remove(&p);
@@ -934,21 +1074,114 @@ fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> R
     Ok(())
 }
 
-/// Windows has no `caffeinate` binary and no power-assertion equivalent wired up
-/// yet (that would be `SetThreadExecutionState`). The UI hides the control there,
-/// so this only exists to keep the command registered for the shared
-/// `invoke_handler!` list — reaching it means the frontend guard was bypassed.
+/// A live Windows power assertion. `SetThreadExecutionState` is scoped to the
+/// *calling thread* — the assertion dies with that thread — so we park a thread
+/// for exactly as long as the user wants the machine awake. That thread-scoping
+/// is also the safety net the macOS side gets from `caffeinate -w <our pid>`: a
+/// panic or a hard exit can't leave a Windows box pinned awake, because the
+/// thread goes with the process.
+#[cfg(windows)]
+struct KeepAwake {
+    /// Dropping this releases the assertion: the parked thread's `recv()` fails,
+    /// it clears the execution state and exits.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        // Join so the state is provably cleared before a replacement assertion
+        // is set up — otherwise a preset switch could race the old thread's
+        // clearing call and land on ES_CONTINUOUS (i.e. silently off).
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Translate the macOS `caffeinate` flags the UI speaks into Windows execution
+/// state bits, so the frontend keeps one vocabulary for both platforms.
+///
+///   `-d` (display) → `ES_DISPLAY_REQUIRED`   `-i` / `-s` (idle/system) → `ES_SYSTEM_REQUIRED`
+///   `-m` (disk) and `-u` (user active) have no Windows equivalent and are dropped.
+///   `-t <sec>` is dropped too — the frontend's own timer disarms the preset.
+///
+/// Anything that asks for the display also implies the system, matching what a
+/// user means by "keep the screen on". Returns 0 when nothing was requested.
+///
+/// Deliberately *not* mapped: `ES_AWAYMODE_REQUIRED`. It's only honoured where
+/// the power policy enables away mode, and where it isn't the whole call fails
+/// (returns 0) — so asking for it would silently assert nothing at all.
+#[cfg(windows)]
+fn execution_state_for(flags: &[String]) -> u32 {
+    use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+    let mut es = 0u32;
+    for f in flags {
+        let Some(rest) = f.strip_prefix('-') else { continue }; // bare `-t` argument
+        for c in rest.chars() {
+            match c {
+                'd' => es |= ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED,
+                'i' | 's' => es |= ES_SYSTEM_REQUIRED,
+                _ => {} // m / u / t — nothing to assert
+            }
+        }
+    }
+    es
+}
+
+/// Toggle a Windows power assertion on or off — the `caffeinate` counterpart.
+/// Only ever one assertion is live: an existing one is dropped (which joins its
+/// thread and clears the state) first, so switching presets is a stop+restart.
 #[cfg(windows)]
 #[tauri::command]
-fn set_caffeinate(_state: State<AppState>, _active: bool, _flags: Vec<String>) -> Result<(), String> {
-    Err("keep-awake is not supported on Windows yet".into())
+fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> Result<(), String> {
+    use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
+    let mut guard = state.caffeinate.lock().unwrap();
+    guard.take(); // drop → releases whatever was asserted
+    if !active || flags.is_empty() {
+        return Ok(());
+    }
+    let es = execution_state_for(&flags);
+    if es == 0 {
+        return Err(format!("no Windows keep-awake equivalent for: {}", flags.join(" ")));
+    }
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    // The assertion must be set *and* released on the same thread, so the whole
+    // lifetime lives inside this closure: assert, park, clear.
+    let (ready, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: a plain flags-in/flags-out Win32 call with no pointers.
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS | es) };
+        if prev == 0 {
+            let _ = ready.send(Err("SetThreadExecutionState refused the request".into()));
+            return;
+        }
+        let _ = ready.send(Ok(()));
+        let _ = rx.recv(); // park until the sender is dropped
+        // SAFETY: same call; ES_CONTINUOUS alone clears our assertion.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    });
+    // Surface a refusal as a command error instead of a thread that quietly did
+    // nothing — the UI would otherwise paint the cup lit over a sleeping PC.
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = thread.join();
+            return Err(e);
+        }
+        Err(_) => return Err("keep-awake thread died before asserting".into()),
+    }
+    *guard = Some(KeepAwake { stop: Some(stop), thread: Some(thread) });
+    Ok(())
 }
 
 /// Create a git worktree with a new (or existing) branch off `repo_dir`.
 /// Returns the absolute worktree path. Worktrees live in a sibling
 /// `.cc-worktrees/<repo>/<branch>` folder so the repo stays clean.
-#[tauri::command]
-fn create_worktree(repo_dir: String, branch: String) -> Result<String, String> {
+#[tauri::command(async)]
+fn create_worktree(repo_dir: String, branch: String, base: Option<String>) -> Result<String, String> {
     // Every git call forces LC_ALL=C: we must never depend on localized output.
     // A German git says "existiert bereits", not "already exists" — parsing error
     // text for control flow (as this used to) silently broke worktree creation on
@@ -988,8 +1221,26 @@ fn create_worktree(repo_dir: String, branch: String) -> Result<String, String> {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
+    // `base` only means anything when we're CREATING the branch — attaching an existing
+    // one takes its own tip. Without it `worktree add -b` cuts from the repo's HEAD,
+    // which quietly makes whatever the root folder is parked on the parent of every new
+    // branch; passing a start-point is how the caller escapes that.
+    let base = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    if let Some(b) = base.as_deref() {
+        if !branch_exists {
+            let ok = git(&["-C", &root, "rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")])
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !ok {
+                return Err(format!("can't branch from {b} — no such commit"));
+            }
+        }
+    }
+
     let add = if branch_exists {
         git(&["-C", &root, "worktree", "add", &wt_str, &safe])
+    } else if let Some(b) = base.as_deref() {
+        git(&["-C", &root, "worktree", "add", "-b", &safe, &wt_str, b])
     } else {
         git(&["-C", &root, "worktree", "add", "-b", &safe, &wt_str])
     }.map_err(|e| e.to_string())?;
@@ -1009,16 +1260,33 @@ fn create_worktree(repo_dir: String, branch: String) -> Result<String, String> {
     Err(String::from_utf8_lossy(&add.stderr).trim().to_string())
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Debug)]
 struct Worktree {
     path: String,
     branch: String,
     is_main: bool,
+    /// Working tree has uncommitted or untracked changes (`git status --porcelain`).
+    /// A dirty worktree can't be removed without `--force`, so the UI won't offer a
+    /// one-click removal for it. Always false for the main worktree (never removable).
+    dirty: bool,
+    /// This worktree's branch is fully merged into the MAIN worktree's branch (its
+    /// commits are an ancestor). Removing such a worktree — and safe-deleting its
+    /// branch — loses nothing, so the UI can surface it as the obvious cleanup.
+    merged: bool,
+    /// `git worktree lock` was used on this checkout. Git refuses to remove a locked
+    /// worktree even with `--force`, so without this flag the UI would hand the user
+    /// a `--force` command that also fails. Always false for the main worktree.
+    locked: bool,
+    /// The checkout directory is still on disk. A hand-deleted folder stays in
+    /// `.git/worktrees` until pruned, so it keeps appearing in this list — the UI must
+    /// not launch a PTY into it, and removal has to fall back to `prune`.
+    exists: bool,
 }
 
 /// List the git worktrees for a repo (parsed from `git worktree list --porcelain`).
-/// The first entry is the main working tree.
-#[tauri::command]
+/// The first entry is the main working tree. Each linked worktree is enriched with
+/// `dirty` / `merged` cues so the picker can tell which are safe to clean up.
+#[tauri::command(async)]
 fn list_worktrees(repo_dir: String) -> Vec<Worktree> {
     let out = sys_command("git")
         .arg("-C").arg(&repo_dir).args(["worktree", "list", "--porcelain"])
@@ -1031,28 +1299,457 @@ fn list_worktrees(repo_dir: String) -> Vec<Worktree> {
     let mut res: Vec<Worktree> = Vec::new();
     let mut cur_path: Option<String> = None;
     let mut cur_branch = String::new();
-    let flush = |res: &mut Vec<Worktree>, path: Option<String>, branch: String| {
+    let mut cur_locked = false;
+    let flush = |res: &mut Vec<Worktree>, path: Option<String>, branch: String, locked: bool| {
         if let Some(path) = path {
             let is_main = res.is_empty();
-            res.push(Worktree { path, branch, is_main });
+            let exists = std::path::Path::new(&path).is_dir();
+            res.push(Worktree {
+                path, branch, is_main, dirty: false, merged: false,
+                locked: locked && !is_main,
+                exists,
+            });
         }
     };
     for line in text.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            flush(&mut res, cur_path.take(), std::mem::take(&mut cur_branch));
+            flush(&mut res, cur_path.take(), std::mem::take(&mut cur_branch), std::mem::take(&mut cur_locked));
             cur_path = Some(p.to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
             cur_branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
         } else if line.starts_with("detached") {
             cur_branch = "(detached)".to_string();
+        } else if line == "locked" || line.starts_with("locked ") {
+            // `locked` appears bare, or as `locked <reason>`.
+            cur_locked = true;
         }
     }
-    flush(&mut res, cur_path.take(), cur_branch);
+    flush(&mut res, cur_path.take(), cur_branch, cur_locked);
+
+    // Second pass: cleanliness cues for the linked worktrees. `merged` is measured
+    // against the main worktree's branch. Every git call here is best-effort — any
+    // hiccup just leaves the flag false, which only ever makes the UI more cautious.
+    let main_branch = res.iter().find(|w| w.is_main)
+        .map(|w| w.branch.clone())
+        .filter(|b| !b.is_empty() && b != "(detached)");
+    for w in res.iter_mut() {
+        if w.is_main {
+            continue;
+        }
+        w.dirty = sys_command("git")
+            .env("LC_ALL", "C")
+            .arg("-C").arg(&w.path)
+            .args(["--no-optional-locks", "status", "--porcelain"])
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false);
+        if let Some(mb) = &main_branch {
+            if !w.branch.is_empty() && w.branch != "(detached)" && &w.branch != mb {
+                // `merge-base --is-ancestor A B` exits 0 when A is an ancestor of B,
+                // i.e. this worktree's branch is fully contained in the main branch.
+                w.merged = sys_command("git")
+                    .env("LC_ALL", "C")
+                    .arg("-C").arg(&repo_dir)
+                    .args(["merge-base", "--is-ancestor",
+                        &format!("refs/heads/{}", w.branch),
+                        &format!("refs/heads/{mb}")])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+            }
+        }
+    }
+    res
+}
+
+/// True when two paths point at the same location, tolerant of symlinks and
+/// trailing slashes. Falls back to a string compare when either can't be
+/// canonicalized (e.g. one has already been deleted).
+fn same_path(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Remove a linked git worktree, optionally safe-deleting its branch. Mirrors
+/// `git_action`'s rule that no button may leave state the UI can't explain: the
+/// destructive `--force` (worktree) and `-D` (branch) variants are NEVER run from
+/// here — on refusal we hand back the exact shell command to run in a terminal.
+///
+/// Two guards up front: refuse while a live embedded session runs in the worktree
+/// (close it first), and refuse the repo's main worktree. Beyond that, plain
+/// `git worktree remove` is the safety net — it declines a dirty/untracked tree on
+/// its own, so committed work is never at risk from a click.
+#[tauri::command(async)]
+fn remove_worktree(
+    state: State<AppState>,
+    repo_dir: String,
+    path: String,
+    branch: String,
+    delete_branch: bool,
+) -> Result<GitActionResult, String> {
+    // The one guard that needs live app state: never yank a worktree out from under
+    // a running embedded session. The rest is pure git and lives in the helper.
+    let label = if branch.is_empty() { "worktree" } else { &branch };
+    if state.sessions.lock().unwrap().values().any(|s| same_path(&s.workdir, &path)) {
+        return Err(format!("a session is still running in {label} — close it first"));
+    }
+    remove_worktree_impl(&repo_dir, &path, &branch, delete_branch)
+}
+
+/// The git side of `remove_worktree`, free of app state so it's testable against a
+/// real temp repo. Refuses the main worktree; removes without `--force`; optionally
+/// safe-deletes the branch — handing back the force command on any refusal.
+fn remove_worktree_impl(
+    repo_dir: &str,
+    path: &str,
+    branch: &str,
+    delete_branch: bool,
+) -> Result<GitActionResult, String> {
+    let label = if branch.is_empty() { "worktree".to_string() } else { branch.to_string() };
+
+    let listed = list_worktrees(repo_dir.to_string());
+    if listed.iter().any(|w| w.is_main && same_path(&w.path, path)) {
+        return Err("that's the repo's main worktree — it can't be removed".into());
+    }
+    // A locked worktree is refused by git even WITH --force, so suggesting the force
+    // command (as the generic failure path below does) would just fail again. Name
+    // the actual next step instead.
+    if listed.iter().any(|w| w.locked && same_path(&w.path, path)) {
+        return Ok(GitActionResult {
+            ok: false,
+            summary: format!("{label} is locked — unlock it first"),
+            output: String::new(),
+            suggest: Some(format!("git worktree unlock \"{path}\" && git worktree remove \"{path}\"")),
+        });
+    }
+
+    let out = git_run(git_cmd(repo_dir, &["worktree", "remove", path]), 30)?;
+    if !out.status.success() {
+        // The folder was deleted by hand: nothing to remove, only an administrative
+        // record in .git/worktrees. `prune` is the operation git actually wants here,
+        // and it can't lose work — the tree is already gone.
+        if !std::path::Path::new(path).is_dir() {
+            let pruned = git_run(git_cmd(repo_dir, &["worktree", "prune"]), 15)?;
+            if pruned.status.success() {
+                return Ok(GitActionResult {
+                    ok: true,
+                    summary: format!("Pruned {label} — its folder was already gone"),
+                    output: String::new(),
+                    suggest: None,
+                });
+            }
+        }
+        let combined = [
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("\n");
+        let first = combined.lines().find(|l| !l.trim().is_empty()).unwrap_or("git refused").to_string();
+        return Ok(GitActionResult {
+            ok: false,
+            summary: first,
+            output: combined,
+            suggest: Some(format!("git worktree remove --force \"{path}\"")),
+        });
+    }
+
+    // Best-effort: drop the now-empty `.cc-worktrees/<repo>/` parent so the sibling
+    // tree doesn't accumulate empty dirs. `remove_dir` only succeeds when empty.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+
+    if delete_branch && !branch.is_empty() && branch != "(detached)" {
+        // Safe-delete only: `git branch -d` refuses an unmerged branch. If it does,
+        // the worktree is already gone — report success and offer the force command.
+        let del = git_run(git_cmd(repo_dir, &["branch", "-d", branch]), 15)?;
+        if del.status.success() {
+            return Ok(GitActionResult {
+                ok: true,
+                summary: format!("Removed worktree and branch {branch}"),
+                output: String::new(),
+                suggest: None,
+            });
+        }
+        return Ok(GitActionResult {
+            ok: true,
+            summary: format!("Removed worktree — kept branch {branch} (not fully merged)"),
+            output: String::from_utf8_lossy(&del.stderr).trim().to_string(),
+            suggest: Some(format!("git branch -D \"{branch}\"")),
+        });
+    }
+
+    Ok(GitActionResult { ok: true, summary: format!("Removed worktree {label}"), output: String::new(), suggest: None })
+}
+
+/// The tip commit of a checkout or a ref — what the new-session dialog's detail
+/// pane shows for whichever destination is highlighted.
+#[derive(serde::Serialize)]
+struct CommitInfo {
+    /// Abbreviated sha (`%h`).
+    short: String,
+    /// Subject line (`%s`).
+    subject: String,
+    /// Author name (`%an`).
+    author: String,
+    /// Committer date, relative (`%cr`) — "2 hours ago".
+    rel: String,
+}
+
+/// Tip commit of `rev` (a branch name, or HEAD when empty) as seen from `dir`.
+///
+/// Fetched for the *highlighted* row only, never for the whole list — a repo can
+/// have `BRANCH_LIST_CAP` branches plus every worktree, and one `git log` per row
+/// would cost far more than the pane is worth. NUL-separated so a subject
+/// containing any printable character still parses.
+#[tauri::command(async)]
+fn git_commit_info(dir: String, rev: String) -> Option<CommitInfo> {
+    let rev = if rev.trim().is_empty() { "HEAD".to_string() } else { rev };
+    let out = sys_command("git")
+        .env("LC_ALL", "C")
+        .arg("-C").arg(&dir)
+        .args(["--no-optional-locks", "log", "-1", "--format=%h%x00%s%x00%an%x00%cr", &rev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.trim_end_matches('\n').split('\0');
+    let short = parts.next()?.to_string();
+    if short.is_empty() {
+        return None; // an unborn branch has no tip
+    }
+    Some(CommitInfo {
+        short,
+        subject: parts.next().unwrap_or("").to_string(),
+        author: parts.next().unwrap_or("").to_string(),
+        rel: parts.next().unwrap_or("").to_string(),
+    })
+}
+
+/// Move the repo's main working tree to another branch.
+///
+/// Muster's whole model is "don't switch, branch out" — worktrees exist so two pieces
+/// of work never fight over one checkout. But the root folder's branch is also the
+/// default parent of every new worktree, so a root parked somewhere stale is a real
+/// problem, and a terminal was the only way out. This is that lever, with the guards
+/// that make it safe to expose:
+///
+/// - Refused while Muster sessions run in the root: switching moves the ground under a
+///   live agent's cwd mid-edit.
+/// - Refused when the target is checked out in another worktree (git refuses too, but
+///   this says which one).
+/// - Refused on a dirty tree. `git switch` would silently CARRY uncommitted changes to
+///   the new branch — not destructive, but a state change the UI never explained, which
+///   is the same rule `git_action` and `remove_worktree` follow. Handed to a terminal.
+#[tauri::command(async)]
+fn switch_branch(state: State<AppState>, repo_dir: String, branch: String) -> Result<GitActionResult, String> {
+    if branch.trim().is_empty() {
+        return Err("no branch given".into());
+    }
+    if state.sessions.lock().unwrap().values().any(|s| same_path(&s.workdir, &repo_dir)) {
+        return Err("sessions are running in this folder — close them first".into());
+    }
+    if list_worktrees(repo_dir.clone()).iter()
+        .any(|w| !same_path(&w.path, &repo_dir) && w.branch == branch)
+    {
+        return Err(format!("{branch} is already checked out in another worktree"));
+    }
+
+    let status = git_run(git_cmd(&repo_dir, &["--no-optional-locks", "status", "--porcelain"]), 20)?;
+    if status.status.success() && !status.stdout.is_empty() {
+        return Ok(GitActionResult {
+            ok: false,
+            summary: "uncommitted changes — switching would carry them across".into(),
+            output: String::new(),
+            suggest: Some(format!("git switch \"{branch}\"")),
+        });
+    }
+
+    let out = git_run(git_cmd(&repo_dir, &["switch", &branch]), 30)?;
+    if out.status.success() {
+        return Ok(GitActionResult {
+            ok: true,
+            summary: format!("Switched to {branch}"),
+            output: String::new(),
+            suggest: None,
+        });
+    }
+    let combined = [
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("\n");
+    let first = combined.lines().find(|l| !l.trim().is_empty()).unwrap_or("git refused").to_string();
+    Ok(GitActionResult {
+        ok: false,
+        summary: first,
+        output: combined,
+        suggest: Some(format!("git switch \"{branch}\"")),
+    })
+}
+
+/// Delete a local branch, the counterpart to the picker's worktree removal.
+///
+/// Same rule as `remove_worktree`: the destructive variant is NEVER run from a click.
+/// `git branch -d` refuses anything not fully merged, and on refusal we hand back the
+/// exact `-D` command for a terminal instead of running it.
+///
+/// Worth knowing about the common case this exists for — a branch whose upstream is
+/// `gone` (the PR merged, the remote branch was deleted). If that PR was **squash**-
+/// merged, the branch's commits never became ancestors of HEAD, so `-d` refuses even
+/// though the work is safely in main. That refusal is correct and the `-D` handoff is
+/// the honest answer; the UI warns about it before the click rather than after.
+#[tauri::command(async)]
+fn delete_branch(repo_dir: String, branch: String) -> Result<GitActionResult, String> {
+    if branch.trim().is_empty() {
+        return Err("no branch given".into());
+    }
+    // git refuses to delete a branch that some worktree holds; say so in our own words
+    // instead of surfacing its message, and name the fix.
+    if list_worktrees(repo_dir.clone()).iter().any(|w| w.branch == branch) {
+        return Err(format!("{branch} is checked out — remove its worktree first"));
+    }
+
+    let out = git_run(git_cmd(&repo_dir, &["branch", "-d", &branch]), 15)?;
+    if out.status.success() {
+        return Ok(GitActionResult {
+            ok: true,
+            summary: format!("Deleted branch {branch}"),
+            output: String::new(),
+            suggest: None,
+        });
+    }
+    let combined = [
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("\n");
+    let first = combined.lines().find(|l| !l.trim().is_empty()).unwrap_or("git refused").to_string();
+    Ok(GitActionResult {
+        ok: false,
+        summary: first,
+        output: combined,
+        suggest: Some(format!("git branch -D \"{branch}\"")),
+    })
+}
+
+/// One local branch, with enough context for the worktree picker to tell whether
+/// it's worth starting on. `current` is the branch the repo's HEAD is on (the repo
+/// row, not the pick list). `checked_out` means some worktree already holds it — git
+/// refuses a second checkout, so it can't take a new worktree and appears in the
+/// existing-worktrees list instead. `rel`/`unix` describe the last commit (staleness).
+///
+/// `ahead`/`behind` are versus this branch's OWN upstream, not versus HEAD. Measuring
+/// every branch against whatever happens to be checked out answers a question nobody
+/// asked ("how far behind my current work is this old branch" — always "very"), while
+/// the useful one is "is my work pushed, and has the remote moved on".
+#[derive(serde::Serialize, Debug)]
+struct BranchInfo {
+    name: String,
+    current: bool,
+    checked_out: bool,
+    /// The remote-tracking ref this branch follows ("origin/foo"), empty when the
+    /// branch is purely local.
+    upstream: String,
+    /// Commits this branch has that its upstream doesn't — unpushed work. 0 when
+    /// there is no upstream.
+    ahead: u32,
+    /// Commits the upstream has that this branch doesn't — unpulled work. 0 when
+    /// there is no upstream.
+    behind: u32,
+    /// An upstream is configured but no longer exists on the remote (branch deleted
+    /// after a merge, typically). `upstream` still names it.
+    gone: bool,
+    rel: String,
+    unix: i64,
+}
+
+/// Local branches for the worktree picker, most-recently-committed first, each with
+/// staleness + upstream context (see `BranchInfo`). Nothing is filtered here — the
+/// frontend hides `current` and `checked_out` from the pickable list; returning them
+/// with flags keeps the command honest and testable. Capped at BRANCH_LIST_CAP so a
+/// repo with hundreds of refs can't blow the list up.
+///
+/// Everything comes out of ONE `for-each-ref`: `%(upstream:track)` makes git do the
+/// ahead/behind arithmetic itself, so this no longer spawns a `rev-list` per branch.
+#[tauri::command(async)]
+fn git_branch_list(repo_dir: String) -> Vec<BranchInfo> {
+    const BRANCH_LIST_CAP: usize = 80;
+    // LC_ALL=C for the same reason as create_worktree: never depend on localized
+    // output — and here it also pins `%(upstream:track)` to English "ahead"/"behind".
+    let git = |args: &[&str]| sys_command("git").env("LC_ALL", "C").args(args).output();
+
+    let taken: std::collections::HashSet<String> =
+        match git(&["-C", &repo_dir, "worktree", "list", "--porcelain"]) {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix("branch "))
+                .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b).to_string())
+                .collect(),
+            _ => Default::default(),
+        };
+
+    // The branch HEAD points at (None when detached — then there is no "current").
+    let current = git(&["-C", &repo_dir, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Tab-separated so neither the branch name nor the relative date can collide with
+    // the delimiter (a relative date is "3 days ago" — spaces, never tabs).
+    let out = match git(&[
+        "-C", &repo_dir,
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname:short)\t%(committerdate:unix)\t%(committerdate:relative)\t%(upstream)\t%(upstream:short)\t%(upstream:track,nobracket)",
+        "refs/heads",
+    ]) {
+        Ok(o) if o.status.success() => o,
+        _ => return vec![],
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let mut res = Vec::new();
+    for line in text.lines().take(BRANCH_LIST_CAP) {
+        let mut parts = line.split('\t');
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let unix = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let rel = parts.next().unwrap_or("").to_string();
+        // An upstream is only interesting if it is a REMOTE. `git branch`/`checkout -b`
+        // off a local branch can set that local branch as the upstream (depending on
+        // branch.autoSetupMerge), and "2 commits not pushed to dev" is nonsense — dev is
+        // right here. Gate on the full refname; only refs/remotes/* counts.
+        let is_remote = parts.next().unwrap_or("").trim().starts_with("refs/remotes/");
+        let upstream = if is_remote { parts.next().unwrap_or("").trim().to_string() } else { parts.next(); String::new() };
+        // `%(upstream:track,nobracket)` is "" when in sync (or absent), "gone" when the
+        // upstream was deleted, else "ahead 2", "behind 3" or "ahead 2, behind 3".
+        let track = if is_remote { parts.next().unwrap_or("").trim() } else { parts.next(); "" };
+        let gone = track == "gone";
+        let field = |key: &str| -> u32 {
+            track.split(',')
+                .filter_map(|p| p.trim().strip_prefix(key))
+                .filter_map(|n| n.trim().parse().ok())
+                .next()
+                .unwrap_or(0)
+        };
+        let (ahead, behind) = if gone { (0, 0) } else { (field("ahead "), field("behind ")) };
+
+        res.push(BranchInfo {
+            checked_out: taken.contains(&name),
+            current: current.as_deref() == Some(name.as_str()),
+            name, upstream, ahead, behind, gone, rel, unix,
+        });
+    }
     res
 }
 
 /// Current git branch for a working directory (None if not a repo / detached).
-#[tauri::command]
+#[tauri::command(async)]
 fn git_branch(workdir: String) -> Option<String> {
     let out = sys_command("git")
         .arg("-C")
@@ -1079,7 +1776,7 @@ struct HeadInfo {
 /// *actually* checked out rather than the one a worktree was created with (a
 /// worktree shows whatever branch is checked out, and that can change). Returns
 /// None if the dir isn't a git repo. LC_ALL=C keeps output locale-independent.
-#[tauri::command]
+#[tauri::command(async)]
 fn git_head(workdir: String) -> Option<HeadInfo> {
     let git = |args: &[&str]| {
         sys_command("git")
@@ -1247,7 +1944,7 @@ struct DiffStat {
 /// has no commits yet. LC_ALL=C + numeric numstat keep it locale-independent (the
 /// german-git-locale gotcha) and `--no-optional-locks` avoids fighting a running
 /// `git` in the same worktree.
-#[tauri::command]
+#[tauri::command(async)]
 fn git_diffstat(workdir: String) -> Option<DiffStat> {
     let git = |args: &[&str]| {
         sys_command("git")
@@ -1347,7 +2044,7 @@ fn git_diff(workdir: String) -> Option<GitDiff> {
     Some(GitDiff { patch, truncated })
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Debug)]
 struct GitActionResult {
     ok: bool,
     /// One line for the toast.
@@ -1373,7 +2070,7 @@ struct GitActionResult {
 ///
 /// Every op is safe against a live Claude in the same worktree: fetch and push
 /// don't touch the working tree at all, and ff-only pull won't overwrite edits.
-#[tauri::command]
+#[tauri::command(async)]
 fn git_action(workdir: String, op: String) -> Result<GitActionResult, String> {
     if !std::path::Path::new(&workdir).is_dir() {
         return Err(format!("not a directory: {workdir}"));
@@ -1500,7 +2197,7 @@ struct Resources {
 /// session id's stored pid. Measures the `claude` process itself (not its whole
 /// subtree) — enough for the inspector's "what's this costing my machine" readout.
 /// None for external/shell sessions (no owned pid) or a process that has exited.
-#[tauri::command]
+#[tauri::command(async)]
 fn session_resources(state: State<AppState>, session_id: String) -> Option<Resources> {
     let pid = state.sessions.lock().unwrap().get(&session_id)?.pid?;
     let line = ps_one(pid, "%cpu=,rss=")?;
@@ -1645,6 +2342,16 @@ fn find_project_icon(dir: String) -> Option<ProjectIcon> {
     subs.iter().find_map(|p| probe_icon_dir(p))
 }
 
+/// Load a user-picked image as a project's logo. Deliberately runs the same
+/// sniff/size gate as discovery (`read_icon`), so a file that isn't really an
+/// image — or one too big to sit in localStorage as a data-URI — is rejected here
+/// instead of becoming a broken `<img>` in the sidebar.
+#[tauri::command]
+fn read_custom_icon(path: String) -> Result<ProjectIcon, String> {
+    read_icon(std::path::Path::new(&path))
+        .ok_or_else(|| "Not a usable image (PNG, SVG, ICO, JPEG, WEBP or GIF, max 512 KB)".to_string())
+}
+
 // ---------- external (non-Muster) Claude Code sessions ----------
 //
 // Claude Code writes a per-process registry file at
@@ -1657,6 +2364,13 @@ fn find_project_icon(dir: String) -> Option<ProjectIcon> {
 // own live session as "external". What remains is the sessions started outside
 // Muster (a plain terminal, an IDE, etc.) — we jump to their terminal window and
 // show a read-only mirror of their transcript.
+//
+// The registry format and directory are identical on Windows (verified on CC
+// 2.1.216: `%USERPROFILE%\.claude\sessions\<pid>.json`, VS Code-hosted sessions
+// included), so LISTING is fully cross-platform: liveness/ownership checks go
+// through `ProcTable`, an in-process `sysinfo` snapshot that works the same on
+// macOS, Windows and Linux. Only `focus_external_session` (jumping to the
+// owning terminal window) remains platform-specific — macOS-only today.
 
 #[derive(serde::Serialize)]
 struct ExternalSession {
@@ -1676,8 +2390,10 @@ struct ExternalSession {
 }
 
 /// One `ps -o <fields>=` line for a single pid (trimmed), or None if the process
-/// is gone / no output. Windows has no `ps`; process introspection (per-session
-/// resources, external-session ownership) is macOS-only for now, so this is None.
+/// is gone / no output. Windows has no `ps`; the remaining `ps` consumers
+/// (per-session CPU/RAM, terminal-window focus) are macOS-only for now, so this
+/// is None there. External-session listing does NOT go through here — it uses
+/// the cross-platform `ProcTable` below.
 #[cfg(windows)]
 fn ps_one(_pid: u32, _fields: &str) -> Option<String> {
     None
@@ -1693,43 +2409,104 @@ fn ps_one(pid: u32, fields: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
-/// Used to recognise `claude` processes Muster launched — directly (embedded
-/// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session id.
-#[cfg(not(windows))]
-fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
-    let mut cur = pid;
-    for _ in 0..24 {
-        if cur == ancestor {
-            return true;
-        }
-        match ps_one(cur, "ppid=").and_then(|s| s.trim().parse::<u32>().ok()) {
-            Some(ppid) if ppid > 1 => cur = ppid,
-            _ => return false,
-        }
-    }
-    false
+/// A point-in-time snapshot of the system process table (pid → parent + name),
+/// taken in-process via `sysinfo` so the exact same code serves macOS, Windows
+/// and Linux — no `ps`/`tasklist` child processes. The frontend polls external
+/// sessions every ~3s; refreshing only the bare process list (no CPU/memory/
+/// exe/cmd lookups) keeps a snapshot to a few milliseconds.
+struct ProcTable {
+    /// pid → (ppid, lowercased process name)
+    procs: std::collections::HashMap<u32, (Option<u32>, String)>,
 }
 
-/// Surfacing sessions started outside Muster relies on `ps` liveness/ownership
-/// checks that don't exist on Windows yet, so this is empty there.
-#[cfg(windows)]
-#[tauri::command]
-fn list_external_sessions(_state: State<AppState>, _exclude: Vec<String>) -> Vec<ExternalSession> {
-    Vec::new()
+impl ProcTable {
+    fn snapshot() -> Self {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let procs = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| {
+                (
+                    pid.as_u32(),
+                    (p.parent().map(|pp| pp.as_u32()), p.name().to_string_lossy().to_lowercase()),
+                )
+            })
+            .collect();
+        Self { procs }
+    }
+
+    /// True if `pid` is currently a live process whose name contains "claude" —
+    /// the identity check that guards against stale registry files and pid
+    /// reuse. Matched loosely because the name varies: `claude` on macOS/Linux,
+    /// `claude.exe` on Windows, and self-update renames like
+    /// `claude.exe.old.<ts>` for a binary updated while running.
+    fn is_live_claude(&self, pid: u32) -> bool {
+        self.procs.get(&pid).is_some_and(|(_, name)| name.contains("claude"))
+    }
+
+    /// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
+    /// Used to recognise `claude` processes Muster launched — directly (embedded
+    /// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session
+    /// id. The iteration cap also bounds ppid cycles, which Windows can produce
+    /// after pid reuse (a dead parent's pid handed to a new process).
+    fn is_descendant_of(&self, pid: u32, ancestor: u32) -> bool {
+        let mut cur = pid;
+        for _ in 0..24 {
+            if cur == ancestor {
+                return true;
+            }
+            match self.procs.get(&cur).and_then(|(ppid, _)| *ppid) {
+                Some(ppid) if ppid > 1 && ppid != cur => cur = ppid,
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
+/// Parse one `~/.claude/sessions/<pid>.json` registry file into an
+/// `ExternalSession` (repo_root/branch enriched later). None for malformed
+/// files and non-interactive entries (`claude -p`, SDK runs).
+fn parse_registry_entry(txt: &str) -> Option<ExternalSession> {
+    let v: serde_json::Value = serde_json::from_str(txt).ok()?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some("interactive") {
+        return None;
+    }
+    let pid = v.get("pid").and_then(|x| x.as_u64())? as u32;
+    let session_id = v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(ExternalSession {
+        pid,
+        session_id,
+        cwd: v.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        status: v.get("status").and_then(|x| x.as_str()).unwrap_or("idle").to_string(),
+        status_updated_at: v.get("statusUpdatedAt").and_then(|x| x.as_i64()),
+        started_at: v.get("startedAt").and_then(|x| x.as_i64()),
+        version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        repo_root: None,
+        branch: None,
+    })
 }
 
 /// List interactive Claude Code sessions running OUTSIDE Muster. `exclude` is the
 /// set of session ids Muster already owns (belt-and-suspenders — ours don't
 /// register anyway). Dead/stale registry files are filtered by verifying the pid
 /// is still a live `claude` process.
-#[cfg(not(windows))]
-#[tauri::command]
+#[tauri::command(async)]
 fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<ExternalSession> {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return vec![],
-    };
+    let home = home_dir();
+    if home.is_empty() {
+        return vec![];
+    }
     let dir = std::path::Path::new(&home).join(".claude").join("sessions");
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -1738,70 +2515,22 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     let exclude: std::collections::HashSet<String> =
         exclude.into_iter().map(|s| s.to_lowercase()).collect();
 
-    let mut parsed: Vec<ExternalSession> = Vec::new();
-    for ent in entries.flatten() {
-        let p = ent.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let txt = match std::fs::read_to_string(&p) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let v: serde_json::Value = match serde_json::from_str(&txt) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("kind").and_then(|k| k.as_str()) != Some("interactive") {
-            continue;
-        }
-        let pid = match v.get("pid").and_then(|x| x.as_u64()) {
-            Some(n) => n as u32,
-            None => continue,
-        };
-        let session_id = v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        if session_id.is_empty() || exclude.contains(&session_id.to_lowercase()) {
-            continue;
-        }
-        parsed.push(ExternalSession {
-            pid,
-            session_id,
-            cwd: v.get("cwd").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            status: v.get("status").and_then(|x| x.as_str()).unwrap_or("idle").to_string(),
-            status_updated_at: v.get("statusUpdatedAt").and_then(|x| x.as_i64()),
-            started_at: v.get("startedAt").and_then(|x| x.as_i64()),
-            version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            repo_root: None,
-            branch: None,
-        });
-    }
+    let mut parsed: Vec<ExternalSession> = entries
+        .flatten()
+        .map(|ent| ent.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|txt| parse_registry_entry(&txt))
+        .filter(|s| !exclude.contains(&s.session_id.to_lowercase()))
+        .collect();
     if parsed.is_empty() {
         return parsed;
     }
 
-    // Liveness + identity: one `ps` for all pids; keep those still running `claude`
-    // (guards against stale files and pid reuse).
-    let pids_csv = parsed.iter().map(|s| s.pid.to_string()).collect::<Vec<_>>().join(",");
-    let live: std::collections::HashSet<u32> = std::process::Command::new("ps")
-        .args(["-p", &pids_csv, "-o", "pid=,comm="])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| {
-                    let l = l.trim();
-                    let mut it = l.splitn(2, char::is_whitespace);
-                    let pid = it.next()?.trim().parse::<u32>().ok()?;
-                    let comm = it.next().unwrap_or("");
-                    if comm.to_lowercase().contains("claude") { Some(pid) } else { None }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    parsed.retain(|s| live.contains(&s.pid));
+    // Liveness + identity: one process-table snapshot for all pids; keep those
+    // still running `claude` (guards against stale files and pid reuse).
+    let table = ProcTable::snapshot();
+    parsed.retain(|s| table.is_live_claude(s.pid));
 
     // Drop Muster's OWN sessions, matched by pid — NOT by session id. Their id on
     // disk changes when the user runs /resume or /clear (the pid file is rewritten
@@ -1811,7 +2540,7 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     // catches sessions launched into a child terminal (e.g. Ghostty).
     let self_pid = std::process::id();
     let owned = state.owned_pids.lock().unwrap().clone();
-    parsed.retain(|s| !owned.contains(&s.pid) && !is_descendant_of(s.pid, self_pid));
+    parsed.retain(|s| !owned.contains(&s.pid) && !table.is_descendant_of(s.pid, self_pid));
 
     // Enrich survivors with their repo root + branch so worktrees of one repo group
     // together (and merge into that repo's project) rather than each cwd becoming its
@@ -1913,26 +2642,335 @@ struct TranscriptMsg {
     text: String,
 }
 
-/// Read a read-only slice of an external session's transcript. The transcript
-/// lives at `~/.claude/projects/<enc>/<session_id>.jsonl`, where `<enc>` is the
-/// cwd with every non-alphanumeric char replaced by `-`. Only the tail (≤512KB)
-/// is read; only human/assistant prose is extracted (tool calls, tool results and
-/// thinking are dropped), and the last `limit` messages are returned.
-#[tauri::command]
-fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<TranscriptMsg>, String> {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+/// Claude stores a project's transcripts under `~/.claude/projects/<enc>/`, where
+/// `<enc>` is the cwd with every non-ASCII-alphanumeric char replaced by `-`.
+fn project_transcript_dir(cwd: &str) -> Option<std::path::PathBuf> {
     let home = home_dir();
     if home.is_empty() {
-        return Err("no home directory".to_string());
+        return None;
     }
     let enc: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let path = std::path::Path::new(&home)
-        .join(".claude")
-        .join("projects")
-        .join(&enc)
+    Some(std::path::Path::new(&home).join(".claude").join("projects").join(enc))
+}
+
+/// A finished (or at least not-currently-owned) session found on disk, offered to
+/// the user as restorable via `claude --resume <id>`.
+#[derive(serde::Serialize)]
+struct PastSession {
+    session_id: String,
+    title: String,
+    last_prompt: String,
+    mtime: u64,
+}
+
+/// Enumerate the transcripts Claude has written for `workdir`, newest first, so
+/// the frontend can label restorable sessions with something human-readable.
+///
+/// Titles come from the `ai-title` record Claude maintains; it is rewritten as the
+/// session evolves, so the LAST occurrence wins. That record type is internal to
+/// Claude Code and documented as unstable across releases, hence the fallback
+/// chain: `ai-title` → `last-prompt` → first user message → "" (caller labels it).
+/// Only the tail is scanned — `ai-title` recurs throughout the file, so a bounded
+/// read reliably catches the latest one without paying for a 4MB transcript.
+#[tauri::command(async)]
+fn list_past_sessions(workdir: String) -> Result<Vec<PastSession>, String> {
+    let dir = match project_transcript_dir(&workdir) {
+        Some(d) => d,
+        None => return Err("no home directory".to_string()),
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(vec![]), // project never had a session — not an error
+    };
+
+    let mut out: Vec<PastSession> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let (title, last_prompt) = match transcript_meta(&path) {
+            Some(m) => m,
+            None => continue,
+        };
+        out.push(PastSession { session_id, title, last_prompt, mtime });
+    }
+
+    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    Ok(out)
+}
+
+/// Pull `(title, last_prompt)` out of one transcript. Split out of
+/// `list_past_sessions` so it can be tested against a fixture file without
+/// touching `$HOME` (which the parallel test threads share).
+fn transcript_meta(path: &std::path::Path) -> Option<(String, String)> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    const CAP: u64 = 512 * 1024;
+    let mut reader = BufReader::new(file);
+    if len > CAP {
+        reader.seek(SeekFrom::Start(len - CAP)).ok()?;
+        let mut discard = String::new(); // drop the partial first line
+        let _ = reader.read_line(&mut discard);
+    }
+
+    let (mut title, mut last_prompt, mut first_user) = (String::new(), String::new(), String::new());
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+            // Both records recur through the file and are rewritten as the session
+            // evolves — the LAST occurrence is the current one, so keep overwriting.
+            "ai-title" => {
+                if let Some(s) = v.get("aiTitle").and_then(|x| x.as_str()) {
+                    title = s.trim().to_string();
+                }
+            }
+            "last-prompt" => {
+                if let Some(s) = v.get("lastPrompt").and_then(|x| x.as_str()) {
+                    last_prompt = s.trim().to_string();
+                }
+            }
+            "user" if first_user.is_empty() => {
+                if let Some(serde_json::Value::String(s)) =
+                    v.get("message").and_then(|m| m.get("content"))
+                {
+                    first_user = s.trim().chars().take(200).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    if title.is_empty() {
+        title = if !last_prompt.is_empty() { last_prompt.clone() } else { first_user };
+    }
+    if title.chars().count() > 120 {
+        title = title.chars().take(120).collect::<String>() + "…";
+    }
+    Some((title, last_prompt))
+}
+
+/// The three model tiers collapsed to a family (matches the frontend's `modelFamily`).
+fn model_family(model: &str) -> &'static str {
+    let s = model.to_ascii_lowercase();
+    if s.contains("opus") {
+        "opus"
+    } else if s.contains("sonnet") {
+        "sonnet"
+    } else if s.contains("haiku") {
+        "haiku"
+    } else {
+        "other"
+    }
+}
+
+/// One assistant message's usage, pulled from a transcript line.
+struct LineUsage {
+    day: String,           // YYYY-MM-DD from the line's own ISO timestamp (UTC)
+    tokens: [u64; 4],      // [input, output, cache_read, cache_write]
+    family: &'static str,  // opus | sonnet | haiku | other
+    project: String,       // basename of the line's cwd ("by working directory")
+}
+
+/// Parse one transcript line into a `LineUsage`, or `None` for the many lines with no
+/// assistant `usage` record (user turns, tool results, meta). Split out of the scan so
+/// the load-bearing, format-dependent parsing can be tested without a `$HOME` the
+/// parallel tests share.
+fn parse_usage_line(line: &str) -> Option<LineUsage> {
+    if !line.contains("\"usage\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let usage = v
+        .get("message")
+        .and_then(|m| m.get("usage"))
+        .or_else(|| v.get("usage"))?;
+    let day = match v.get("timestamp").and_then(|t| t.as_str()) {
+        Some(ts) if ts.len() >= 10 => ts[..10].to_string(),
+        _ => return None,
+    };
+    let g = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let model = v
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let project = v
+        .get("cwd")
+        .and_then(|x| x.as_str())
+        .and_then(|c| c.rsplit(|ch: char| ch == '/' || ch == '\\').find(|s| !s.is_empty()))
+        .unwrap_or("unknown")
+        .to_string();
+    Some(LineUsage {
+        day,
+        tokens: [
+            g("input_tokens"),
+            g("output_tokens"),
+            g("cache_read_input_tokens"),
+            g("cache_creation_input_tokens"),
+        ],
+        family: model_family(model),
+        project,
+    })
+}
+
+/// One calendar day, aggregated across every transcript: token totals by type, token
+/// totals by model family, the number of distinct sessions active, and per-project
+/// token totals ("by working directory"). Everything except the daily $ total (which
+/// lives in the telemetry rollup and can't be recovered from transcripts) is here.
+#[derive(serde::Serialize, Default)]
+struct DayUsage {
+    day: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    opus: u64,
+    sonnet: u64,
+    haiku: u64,
+    other: u64,
+    sessions: u64,
+    projects: std::collections::BTreeMap<String, u64>,
+}
+
+/// Aggregate transcript usage per calendar day across every Claude Code transcript
+/// touched within the last `days` days — tokens (by type and by model family), the
+/// count of distinct sessions active, and per-project token totals.
+///
+/// Tokens et al. are the figures the statusLine never reports (it carries only
+/// context-window *occupancy* and a $ total), so they're recovered from each assistant
+/// message's own `usage` record. That record shape is internal to Claude Code and
+/// documented as unstable (the risk `list_past_sessions` already lives with), hence
+/// the defensive parsing and the cheap `contains("\"usage\"")` pre-filter that skips
+/// the many lines carrying no tokens.
+///
+/// This is the heavy path: it reads whole transcripts, so the frontend calls it off
+/// the render path and caches the result. The mtime filter skips transcripts not
+/// written within the window — an old, untouched file cannot hold an in-range day —
+/// which keeps a full year's scan bounded to recent work. All of the model / project /
+/// session breakdown rides on this one pass; it adds no extra file reads.
+#[tauri::command]
+async fn token_usage_by_day(days: u64) -> Result<Vec<DayUsage>, String> {
+    // The scan reads whole transcripts (the recent corpus can run to ~1GB), so hand
+    // it to a blocking thread. A *synchronous* command runs on the main thread and
+    // would freeze the entire UI for the length of the first, uncached scan.
+    tauri::async_runtime::spawn_blocking(move || scan_usage(days))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn scan_usage(days: u64) -> Result<Vec<DayUsage>, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{BufRead, BufReader};
+    let home = home_dir();
+    if home.is_empty() {
+        return Err("no home directory".to_string());
+    }
+    let root = std::path::Path::new(&home).join(".claude").join("projects");
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(days.saturating_mul(86_400)));
+
+    let mut acc: HashMap<String, DayUsage> = HashMap::new();
+    let projects = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Ok(vec![]), // no transcripts yet — not an error
+    };
+    for proj in projects.flatten() {
+        let pdir = proj.path();
+        if !pdir.is_dir() {
+            continue;
+        }
+        let files = match std::fs::read_dir(&pdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // Skip transcripts untouched within the window: they can't hold in-range days.
+            if let (Some(cut), Ok(meta)) = (cutoff, entry.metadata()) {
+                if meta.modified().map(|m| m < cut).unwrap_or(false) {
+                    continue;
+                }
+            }
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            // One file == one session; remember the days it touched to count it once each.
+            let mut file_days: HashSet<String> = HashSet::new();
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let Some(lu) = parse_usage_line(&line) else { continue };
+                let LineUsage { day, tokens, family, project } = lu;
+                let tot: u64 = tokens.iter().sum();
+                let e = acc.entry(day.clone()).or_default();
+                if e.day.is_empty() {
+                    e.day = day.clone();
+                }
+                e.input += tokens[0];
+                e.output += tokens[1];
+                e.cache_read += tokens[2];
+                e.cache_write += tokens[3];
+                match family {
+                    "opus" => e.opus += tot,
+                    "sonnet" => e.sonnet += tot,
+                    "haiku" => e.haiku += tot,
+                    _ => e.other += tot,
+                }
+                *e.projects.entry(project).or_insert(0) += tot;
+                file_days.insert(day);
+            }
+            for d in file_days {
+                let e = acc.entry(d.clone()).or_default();
+                if e.day.is_empty() {
+                    e.day = d;
+                }
+                e.sessions += 1;
+            }
+        }
+    }
+    let mut out: Vec<DayUsage> = acc.into_values().collect();
+    out.sort_by(|a, b| a.day.cmp(&b.day));
+    Ok(out)
+}
+
+/// Read a read-only slice of an external session's transcript. The transcript
+/// lives at `~/.claude/projects/<enc>/<session_id>.jsonl`, where `<enc>` is the
+/// cwd with every non-alphanumeric char replaced by `-`. Only the tail (≤512KB)
+/// is read; only human/assistant prose is extracted (tool calls, tool results and
+/// thinking are dropped), and the last `limit` messages are returned.
+#[tauri::command(async)]
+fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<TranscriptMsg>, String> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let path = project_transcript_dir(&cwd)
+        .ok_or_else(|| "no home directory".to_string())?
         .join(format!("{session_id}.jsonl"));
     let file = std::fs::File::open(&path).map_err(|e| format!("transcript not found: {e}"))?;
     let len = file.metadata().map_err(|e| e.to_string())?.len();
@@ -1967,22 +3005,18 @@ fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<
         match content {
             Some(serde_json::Value::String(s)) => text.push_str(s),
             Some(serde_json::Value::Array(arr)) => {
+                // Only "text" blocks: tool calls (Bash, Read, Edit, …), tool_result
+                // echoes and thinking blocks are noise in a read-only conversation
+                // mirror — keep the human/assistant prose. An assistant turn that is
+                // only tool calls collapses to empty and is dropped below.
                 for blk in arr {
-                    match blk.get("type").and_then(|x| x.as_str()) {
-                        Some("text") => {
-                            if let Some(s) = blk.get("text").and_then(|x| x.as_str()) {
-                                if !text.is_empty() {
-                                    text.push('\n');
-                                }
-                                text.push_str(s);
+                    if blk.get("type").and_then(|x| x.as_str()) == Some("text") {
+                        if let Some(s) = blk.get("text").and_then(|x| x.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
                             }
+                            text.push_str(s);
                         }
-                        // Tool calls (Bash, Read, Edit, …), tool_result echoes and
-                        // thinking blocks are noise in a read-only conversation
-                        // mirror — keep only the human/assistant prose. An assistant
-                        // turn that is only tool calls collapses to empty and is
-                        // dropped below.
-                        _ => {}
                     }
                 }
             }
@@ -2065,18 +3099,81 @@ fn update_tray(
     Ok(())
 }
 
+/// Log every panic — message, location, thread, backtrace — before the process
+/// dies. A panic that unwinds out of `main` terminates a GUI app *cleanly* as far
+/// as the OS is concerned: no crash dump, no WER/CrashReporter entry, the window
+/// just vanishes. This hook is the only on-disk trace of that failure class. It
+/// writes through the `log` facade (→ the rolling muster.log) AND appends raw to
+/// `panic.log` in the same directory, in case the logger itself is what broke.
+fn install_panic_hook(log_dir: std::path::PathBuf) {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let thread = std::thread::current();
+        let msg = format!(
+            "panic on thread '{}': {info}\n{backtrace}",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        log::error!("{msg}");
+        let _ = std::fs::create_dir_all(&log_dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("panic.log"))
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[unix {secs}] {msg}\n");
+        }
+        prev(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("muster".into()),
+                    }),
+                ])
+                .level(log::LevelFilter::Info)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Windows analog of the macOS Cmd+Q catcher in `setup` below: Windows gets
+        // no app menu (see there), so quitting means closing the window. Intercept
+        // the close and run the same frontend confirm flow — only `confirm_quit`
+        // actually exits, and the frontend calls it straight away when idle.
+        .on_window_event(|window, event| {
+            #[cfg(windows)]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.emit("quit-requested", ());
+            }
+            #[cfg(not(windows))]
+            let _ = (window, event);
+        })
         .setup(|app| {
+            // Before anything that can panic: from here on, panics leave a trace.
+            install_panic_hook(app.path().app_log_dir()?);
+            log::info!("muster v{} starting", app.package_info().version);
+
             let server = tiny_http::Server::http("127.0.0.1:0")
                 .expect("bind telemetry server on 127.0.0.1");
             let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
-            println!("[cc-launcher] telemetry server on 127.0.0.1:{port}");
+            log::info!("telemetry server on 127.0.0.1:{port}");
 
             app.manage(AppState {
                 port,
@@ -2084,7 +3181,6 @@ pub fn run() {
                 owned_pids: Mutex::new(HashSet::new()),
                 pending: Mutex::new(HashMap::new()),
                 next_perm: std::sync::atomic::AtomicU64::new(1),
-                #[cfg(not(windows))]
                 caffeinate: Mutex::new(None),
             });
 
@@ -2158,7 +3254,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // ---- App menu with a Cmd+Q catcher ----
+            // ---- App menu with a Cmd+Q catcher (macOS only) ----
             // Cmd+Q is a "special Apple event" that Tauri does not reliably surface
             // as an app/window event on macOS (tauri-apps/tauri#9198), so
             // RunEvent::ExitRequested/prevent_exit can't be trusted to intercept it.
@@ -2167,50 +3263,63 @@ pub fn run() {
             // `terminate:`. The handler asks the frontend to confirm; only `confirm_quit`
             // actually exits. Replacing the default menu means we must re-add the Edit
             // submenu ourselves, or Cmd+C/X/V/Z/A stop working in the app's inputs.
-            let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Muster")
-                .accelerator("CmdOrCtrl+Q")
-                .build(app)?;
-            let app_menu = SubmenuBuilder::new(app, "Muster")
-                .about(None)
-                .separator()
-                .services()
-                .separator()
-                .hide()
-                .hide_others()
-                .show_all()
-                .separator()
-                .item(&quit_item)
-                .build()?;
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .fullscreen()
-                .separator()
-                .close_window()
-                .build()?;
-            let menu = MenuBuilder::new(app)
-                .items(&[&app_menu, &edit_menu, &window_menu])
-                .build()?;
-            app.set_menu(menu)?;
-            app.on_menu_event(|app, event| {
-                if event.id().0.as_str() == "quit-confirm" {
-                    // Surface the window so the confirm dialog has context, then let the
-                    // frontend decide (it quits straight away when nothing is running).
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
+            //
+            // Never install this on Windows: `set_menu` would render it as an
+            // in-window menu bar full of mac-only items — and muda's predefined
+            // Hide item there does a raw Win32 ShowWindow(SW_HIDE) behind tao's
+            // visibility flags, after which tao's show() no-ops and the window is
+            // unrecoverable, tray "Show Muster" included (muda 0.19.3
+            // windows/mod.rs:1217 vs tao 0.35.3 window_state.rs apply_diff).
+            // Windows needs no menu at all: WebView2 handles the edit shortcuts
+            // natively, and quitting goes through the CloseRequested hook on the
+            // builder above.
+            #[cfg(target_os = "macos")]
+            {
+                let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Muster")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+                let app_menu = SubmenuBuilder::new(app, "Muster")
+                    .about(None)
+                    .separator()
+                    .services()
+                    .separator()
+                    .hide()
+                    .hide_others()
+                    .show_all()
+                    .separator()
+                    .item(&quit_item)
+                    .build()?;
+                let edit_menu = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
+                let window_menu = SubmenuBuilder::new(app, "Window")
+                    .minimize()
+                    .fullscreen()
+                    .separator()
+                    .close_window()
+                    .build()?;
+                let menu = MenuBuilder::new(app)
+                    .items(&[&app_menu, &edit_menu, &window_menu])
+                    .build()?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    if event.id().0.as_str() == "quit-confirm" {
+                        // Surface the window so the confirm dialog has context, then let the
+                        // frontend decide (it quits straight away when nothing is running).
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app.emit("quit-requested", ());
                     }
-                    let _ = app.emit("quit-requested", ());
-                }
-            });
+                });
+            }
 
             Ok(())
         })
@@ -2229,6 +3338,11 @@ pub fn run() {
             set_caffeinate,
             resolve_permission,
             list_worktrees,
+            remove_worktree,
+            git_branch_list,
+            delete_branch,
+            switch_branch,
+            git_commit_info,
             spawn_ghostty,
             spawn_shell,
             spawn_task,
@@ -2242,13 +3356,30 @@ pub fn run() {
             list_external_sessions,
             focus_external_session,
             read_transcript,
+            list_past_sessions,
+            token_usage_by_day,
             find_project_icon,
+            read_custom_icon,
+            open_folder,
             write_debug_file,
+            log_frontend,
             update_tray,
             confirm_quit
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        // Record clean shutdowns: a log that ends WITHOUT one of these lines is an
+        // abnormal termination — that alone answers "did it crash or was it quit?".
+        .run(|_app, event| match event {
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                log::info!(
+                    "exit requested{}",
+                    code.map(|c| format!(" (code {c})")).unwrap_or_default()
+                );
+            }
+            tauri::RunEvent::Exit => log::info!("exit · clean shutdown"),
+            _ => {}
+        });
 }
 
 #[cfg(test)]
@@ -2260,6 +3391,60 @@ mod tests {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    #[test]
+    fn parse_usage_line_extracts_day_tokens_family_and_project() {
+        let line = r#"{"type":"assistant","timestamp":"2026-07-21T10:00:00.000Z","cwd":"/Users/tim/dev/muster","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":4}}}"#;
+        let lu = parse_usage_line(line).expect("assistant usage line should parse");
+        assert_eq!(lu.day, "2026-07-21");
+        assert_eq!(lu.tokens, [10, 20, 300, 4]);
+        assert_eq!(lu.family, "opus");
+        assert_eq!(lu.project, "muster"); // basename of cwd
+        // Missing token fields default to 0; unknown model → "other"; no cwd → "unknown".
+        let partial = r#"{"timestamp":"2026-07-21T10:00:00Z","message":{"usage":{"output_tokens":7}}}"#;
+        let lu = parse_usage_line(partial).expect("should parse");
+        assert_eq!(lu.tokens, [0, 7, 0, 0]);
+        assert_eq!(lu.family, "other");
+        assert_eq!(lu.project, "unknown");
+    }
+
+    #[test]
+    fn parse_usage_line_skips_lines_without_usage() {
+        // The cheap pre-filter and the shape checks both reject non-usage lines.
+        assert!(parse_usage_line(r#"{"type":"user","timestamp":"2026-07-21T10:00:00Z"}"#).is_none());
+        assert!(parse_usage_line("not json at all").is_none());
+        // A usage record with no timestamp can't be bucketed, so it's dropped.
+        assert!(parse_usage_line(r#"{"message":{"usage":{"input_tokens":5}}}"#).is_none());
+    }
+
+    #[test]
+    fn model_family_buckets_by_tier() {
+        assert_eq!(model_family("claude-opus-4-8"), "opus");
+        assert_eq!(model_family("claude-sonnet-4-5"), "sonnet");
+        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(model_family("some-future-model"), "other");
+    }
+
+    /// The one piece of the Windows keep-awake path that isn't a Win32 call: the
+    /// translation of the UI's `caffeinate` flags into execution-state bits.
+    #[cfg(windows)]
+    #[test]
+    fn caffeinate_flags_map_to_execution_state() {
+        use windows_sys::Win32::System::Power::{ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+        let f = |args: &[&str]| execution_state_for(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // Asking for the display implies the system stays powered too.
+        assert_eq!(f(&["-d"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-i"]), ES_SYSTEM_REQUIRED);
+        assert_eq!(f(&["-dimsu"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // The timer preset: `-t` and its bare seconds argument assert nothing on
+        // their own, and must not be mistaken for a flag cluster.
+        assert_eq!(f(&["-di", "-t", "3600"]), ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        // Nothing translatable → 0, which the command reports as an error rather
+        // than lighting the cup over a machine that will happily sleep.
+        assert_eq!(f(&["-m"]), 0);
+        assert_eq!(f(&[]), 0);
+    }
+
     /// A fresh, empty scratch directory under the OS temp dir. No randomness (pid +
     /// an atomic counter keep it unique even under cargo's parallel test threads).
     fn scratch_dir() -> PathBuf {
@@ -2268,6 +3453,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Where `create_worktree` puts this repo's checkouts: `<parent>/.cc-worktrees/<repo>`.
+    ///
+    /// Tests MUST clean up via this and never via `<parent>/.cc-worktrees` — `scratch_dir`
+    /// hands every repo the same parent (the OS temp dir), so wiping the whole
+    /// `.cc-worktrees` tree deletes the checkouts of every test running in parallel,
+    /// which made these two flake against each other.
+    fn wt_root(repo: &Path) -> PathBuf {
+        repo.parent().unwrap()
+            .join(".cc-worktrees")
+            .join(repo.file_name().unwrap())
     }
 
     /// Run a git command in `dir`, asserting success. Identity/signing are passed via
@@ -2312,5 +3509,444 @@ mod tests {
         let dir = scratch_dir();
         assert!(git_diff(dir.to_str().unwrap().to_string()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The picker leans on these flags to decide what's pickable: it hides `current`
+    /// (the "start here" button) and `checked_out` (git refuses a second checkout, so
+    /// those sit in the existing-worktrees list instead). ahead/behind must be
+    /// The picker's branch context: which branches are claimed, and how each stands
+    /// against ITS OWN upstream — not against whatever HEAD happens to be.
+    #[test]
+    fn git_branch_list_flags_state_and_tracks_each_upstream() {
+        let dir = scratch_dir();
+        let remote = scratch_dir();
+        git(&remote, &["init", "-q", "--bare", "-b", "dev"]);
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        let commit = |dir: &Path, msg: &str| git(dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit(&dir, "base");
+        git(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "dev"]);
+
+        // pushed-then-moved: tracks origin/pushed, 2 commits unpushed.
+        git(&dir, &["checkout", "-q", "-b", "pushed"]);
+        git(&dir, &["push", "-q", "-u", "origin", "pushed"]);
+        commit(&dir, "p1");
+        commit(&dir, "p2");
+
+        // local-only: never pushed, so no upstream at all.
+        git(&dir, &["checkout", "-q", "-b", "local-only"]);
+        commit(&dir, "l1");
+
+        // orphaned: had an upstream, which was then deleted on the remote.
+        git(&dir, &["checkout", "-q", "-b", "orphaned"]);
+        git(&dir, &["push", "-q", "-u", "origin", "orphaned"]);
+        git(&dir, &["push", "-q", "origin", "--delete", "orphaned"]);
+        git(&dir, &["fetch", "-q", "--prune", "origin"]);
+
+        git(&dir, &["checkout", "-q", "dev"]);
+        git(&dir, &["branch", "claimed"]);
+        let wt = dir.join("wt-claimed");
+        git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "claimed"]);
+
+        let bs = git_branch_list(dir.to_str().unwrap().to_string());
+        let by = |n: &str| bs.iter().find(|b| b.name == n).unwrap_or_else(|| panic!("{n} missing from {bs:?}"));
+
+        // dev is `current`; it's also `checked_out` because the main working tree holds
+        // it — the frontend hides it via `current`, so that overlap is harmless.
+        assert!(by("dev").current, "dev should be current: {bs:?}");
+        assert!(by("claimed").checked_out && !by("claimed").current, "claimed should be checked_out: {bs:?}");
+        assert!(!by("pushed").current && !by("pushed").checked_out, "pushed should be free: {bs:?}");
+
+        // Ahead is measured against origin/pushed, NOT against dev — dev has moved on
+        // its own and that must not leak into this branch's numbers.
+        let p = by("pushed");
+        assert_eq!(p.upstream, "origin/pushed", "pushed should track its own remote: {bs:?}");
+        assert_eq!((p.ahead, p.behind), (2, 0), "pushed should be 2 unpushed / 0 unpulled: {bs:?}");
+        assert!(!p.gone);
+
+        let l = by("local-only");
+        assert!(l.upstream.is_empty() && !l.gone, "local-only has no upstream: {bs:?}");
+        assert_eq!((l.ahead, l.behind), (0, 0), "no upstream means no counts: {bs:?}");
+
+        let o = by("orphaned");
+        assert!(o.gone, "orphaned's upstream was deleted: {bs:?}");
+        assert_eq!(o.upstream, "origin/orphaned", "a gone upstream is still named: {bs:?}");
+
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+    /// Without a start-point, `worktree add -b` cuts from HEAD — which makes whatever
+    /// the root folder is parked on the silent parent of every new branch. Pin the
+    /// escape hatch down.
+    #[test]
+    fn create_worktree_branches_from_the_given_base() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        let commit = |msg: &str| git(&dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit("on main");
+        let repo = dir.to_str().unwrap().to_string();
+        let main_tip = String::from_utf8_lossy(
+            &Command::new("git").current_dir(&dir).args(["rev-parse", "HEAD"]).output().unwrap().stdout
+        ).trim().to_string();
+
+        // Park the root on a feature branch that has moved past main.
+        git(&dir, &["checkout", "-q", "-b", "parked"]);
+        commit("only on parked");
+
+        // No base → inherits HEAD, i.e. `parked`. This is the trap.
+        let inherit = create_worktree(repo.clone(), "from-head".into(), None).expect("default base");
+        let p = String::from_utf8_lossy(
+            &Command::new("git").current_dir(&inherit).args(["rev-parse", "HEAD"]).output().unwrap().stdout
+        ).trim().to_string();
+        assert_ne!(p, main_tip, "with no base the new branch cuts from the parked HEAD");
+
+        // Explicit base → main's tip, regardless of where the root is parked.
+        let based = create_worktree(repo.clone(), "from-main".into(), Some("main".into())).expect("explicit base");
+        let b = String::from_utf8_lossy(
+            &Command::new("git").current_dir(&based).args(["rev-parse", "HEAD"]).output().unwrap().stdout
+        ).trim().to_string();
+        assert_eq!(b, main_tip, "an explicit base wins over HEAD");
+
+        // A base that doesn't resolve is refused before git can emit anything cryptic.
+        let e = create_worktree(repo, "from-nowhere".into(), Some("no-such-ref".into())).expect_err("bad base refused");
+        assert!(e.contains("no such commit"), "the message should name the problem: {e}");
+
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Branch deletion mirrors worktree removal: safe-delete only, force handed off.
+    #[test]
+    fn delete_branch_safe_deletes_merged_and_refuses_the_rest() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        let commit = |dir: &Path, msg: &str| git(dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit(&dir, "base");
+        let repo = dir.to_str().unwrap().to_string();
+
+        // merged: branched and never advanced, so its commits are all in dev.
+        git(&dir, &["branch", "merged-b"]);
+        // unmerged: has a commit dev doesn't.
+        git(&dir, &["checkout", "-q", "-b", "unmerged-b"]);
+        commit(&dir, "only-here");
+        git(&dir, &["checkout", "-q", "dev"]);
+        // held: claimed by a worktree.
+        git(&dir, &["branch", "held-b"]);
+        let wt = dir.join("wt-held");
+        git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "held-b"]);
+
+        let r = delete_branch(repo.clone(), "merged-b".into()).expect("merged deletes");
+        assert!(r.ok && r.suggest.is_none(), "a merged branch should just go: {r:?}");
+        let b = Command::new("git").current_dir(&dir).args(["branch", "--list", "merged-b"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&b.stdout).trim().is_empty(), "merged-b should be gone");
+
+        // Unmerged: refused, branch survives, `-D` offered rather than run.
+        let r = delete_branch(repo.clone(), "unmerged-b".into()).expect("call returns");
+        assert!(!r.ok, "an unmerged branch must be refused: {r:?}");
+        assert!(r.suggest.as_deref().unwrap_or("").contains("branch -D"), "force should be handed off: {r:?}");
+        let b = Command::new("git").current_dir(&dir).args(["branch", "--list", "unmerged-b"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&b.stdout).trim().is_empty(), "unmerged-b must survive");
+
+        // Checked out somewhere: refused up front, in our words.
+        let e = delete_branch(repo, "held-b".into()).expect_err("a checked-out branch is refused");
+        assert!(e.contains("checked out"), "the message should name the reason: {e}");
+
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The label says "New branch" but the field has always taken existing ones —
+    /// that's the whole point of the picker, so pin the attach path down.
+    #[test]
+    fn create_worktree_attaches_an_existing_branch() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        git(&dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&dir, &["branch", "test"]);
+
+        let path = create_worktree(dir.to_str().unwrap().to_string(), "test".into(), None).expect("attach failed");
+        let head = Command::new("git").current_dir(&path).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "test");
+
+        // The repo it was created from must be undisturbed — this is a second
+        // checkout, not a branch switch.
+        let orig = Command::new("git").current_dir(&dir).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&orig.stdout).trim(), "dev");
+
+        // Worktrees land in a *sibling* .cc-worktrees tree, never inside the repo.
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cleanup path: `list_worktrees` must flag which linked worktrees are safe
+    /// to remove (merged, clean), and `remove_worktree_impl` must never force —
+    /// safe-deleting a merged branch, keeping an unmerged one, and refusing a dirty
+    /// tree with a `--force` handoff instead of clobbering it.
+    #[test]
+    fn worktree_cleanup_flags_and_safe_removal() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        let commit = |dir: &Path, msg: &str| git(dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit(&dir, "base");
+        let repo = dir.to_str().unwrap().to_string();
+
+        // Three linked worktrees: one at dev's tip (merged, clean), one advanced past
+        // dev (unmerged), and one with an untracked file (dirty).
+        let merged = create_worktree(repo.clone(), "merged-wt".into(), None).expect("merged worktree");
+        let ahead = create_worktree(repo.clone(), "ahead-wt".into(), None).expect("ahead worktree");
+        commit(Path::new(&ahead), "extra");
+        let dirty = create_worktree(repo.clone(), "dirty-wt".into(), None).expect("dirty worktree");
+        std::fs::write(Path::new(&dirty).join("scratch.txt"), "wip\n").unwrap();
+
+        let wts = list_worktrees(repo.clone());
+        let by = |b: &str| wts.iter().find(|w| w.branch == b).unwrap_or_else(|| panic!("{b} missing from {wts:?}"));
+        assert!(by("merged-wt").merged && !by("merged-wt").dirty, "merged-wt should be merged+clean: {wts:?}");
+        assert!(!by("ahead-wt").merged && !by("ahead-wt").dirty, "ahead-wt should be unmerged+clean: {wts:?}");
+        assert!(by("dirty-wt").dirty, "dirty-wt should be dirty: {wts:?}");
+        let main_path = wts.iter().find(|w| w.is_main).expect("a main worktree").path.clone();
+
+        // The main worktree can never be removed.
+        assert!(remove_worktree_impl(&repo, &main_path, "dev", false).is_err(), "main worktree must be refused");
+
+        // Merged + delete_branch: worktree gone, branch safe-deleted.
+        let r = remove_worktree_impl(&repo, &merged, "merged-wt", true).expect("remove merged");
+        assert!(r.ok, "merged removal should succeed: {r:?}");
+        assert!(!Path::new(&merged).exists(), "merged worktree dir should be gone");
+        let b = Command::new("git").current_dir(&dir).args(["branch", "--list", "merged-wt"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&b.stdout).trim().is_empty(), "merged branch should be deleted");
+
+        // Unmerged + delete_branch: worktree gone, branch KEPT with a force handoff.
+        let r = remove_worktree_impl(&repo, &ahead, "ahead-wt", true).expect("remove ahead");
+        assert!(r.ok && r.suggest.as_deref().unwrap_or("").contains("branch -D"), "unmerged branch delete should be handed off: {r:?}");
+        let b = Command::new("git").current_dir(&dir).args(["branch", "--list", "ahead-wt"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&b.stdout).trim().is_empty(), "unmerged branch should be kept");
+
+        // Dirty, no force: refused, tree untouched, force handoff offered.
+        let r = remove_worktree_impl(&repo, &dirty, "dirty-wt", false).expect("call returns");
+        assert!(!r.ok && r.suggest.as_deref().unwrap_or("").contains("--force"), "dirty removal should be refused with a force handoff: {r:?}");
+        assert!(Path::new(&dirty).exists(), "dirty worktree must not be clobbered");
+
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two states the new-session dialog needs but `git worktree remove` handles
+    /// badly on its own: a LOCKED worktree (git refuses it even with `--force`, so
+    /// suggesting force would just fail again) and a worktree whose folder was deleted
+    /// by hand (nothing to remove — `prune` is what git actually wants).
+    #[test]
+    fn worktree_locked_and_missing_are_reported_and_handled() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        git(&dir, &["-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false",
+                    "commit", "-q", "--allow-empty", "-m", "base"]);
+        let repo = dir.to_str().unwrap().to_string();
+
+        let locked = create_worktree(repo.clone(), "locked-wt".into(), None).expect("locked worktree");
+        let gone = create_worktree(repo.clone(), "gone-wt".into(), None).expect("gone worktree");
+        git(&dir, &["worktree", "lock", &locked]);
+        std::fs::remove_dir_all(&gone).expect("hand-delete the checkout");
+
+        let wts = list_worktrees(repo.clone());
+        let by = |b: &str| wts.iter().find(|w| w.branch == b).unwrap_or_else(|| panic!("{b} missing from {wts:?}"));
+        assert!(by("locked-wt").locked, "locked-wt should report locked: {wts:?}");
+        assert!(by("locked-wt").exists, "locked-wt is still on disk: {wts:?}");
+        assert!(!by("gone-wt").exists, "gone-wt's folder was deleted: {wts:?}");
+        assert!(!wts.iter().any(|w| w.is_main && w.locked), "the main worktree is never locked");
+
+        // Locked: refused with an unlock handoff, NOT a --force one that would also fail.
+        let r = remove_worktree_impl(&repo, &locked, "locked-wt", false).expect("call returns");
+        let suggest = r.suggest.as_deref().unwrap_or("");
+        assert!(!r.ok, "a locked worktree must be refused: {r:?}");
+        assert!(suggest.contains("worktree unlock") && !suggest.contains("--force"),
+            "locked handoff should unlock, not force: {r:?}");
+        assert!(Path::new(&locked).exists(), "locked worktree must survive the refusal");
+
+        // Hand-deleted folder: pruned, and it leaves the listing.
+        let r = remove_worktree_impl(&repo, &gone, "gone-wt", false).expect("call returns");
+        assert!(r.ok, "a vanished worktree should prune cleanly: {r:?}");
+        assert!(!list_worktrees(repo.clone()).iter().any(|w| w.branch == "gone-wt"),
+            "gone-wt should be pruned out of the listing");
+
+        git(&dir, &["worktree", "unlock", &locked]);
+        let _ = std::fs::remove_dir_all(wt_root(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The detail pane's HEAD line. Parsing is NUL-separated so a subject containing
+    /// spaces (or anything else printable) survives the round trip.
+    #[test]
+    fn git_commit_info_reads_the_tip_of_a_dir_or_a_ref() {
+        let dir = scratch_dir();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        let commit = |msg: &str| git(&dir, &["-c", "user.email=t@example.com", "-c", "user.name=Ada L",
+                                             "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", msg]);
+        commit("base subject with spaces");
+        let repo = dir.to_str().unwrap().to_string();
+
+        let head = git_commit_info(repo.clone(), String::new()).expect("HEAD resolves");
+        assert_eq!(head.subject, "base subject with spaces", "the whole subject survives");
+        assert_eq!(head.author, "Ada L");
+        assert!(!head.short.is_empty() && !head.rel.is_empty(), "sha and relative date are filled: {head:?}",
+            head = (&head.short, &head.rel));
+
+        // A named ref resolves independently of what HEAD points at.
+        git(&dir, &["branch", "side"]);
+        commit("moved dev on");
+        let side = git_commit_info(repo.clone(), "side".into()).expect("side resolves");
+        assert_eq!(side.subject, "base subject with spaces", "side still points at the first commit");
+        assert_ne!(git_commit_info(repo.clone(), String::new()).unwrap().short, side.short,
+            "HEAD has moved past side");
+
+        assert!(git_commit_info(repo, "no-such-ref".into()).is_none(), "an unknown ref yields None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ai-title` and `last-prompt` are rewritten repeatedly as a session evolves,
+    /// so the newest one at the end of the file has to win over the earlier ones.
+    #[test]
+    fn transcript_meta_takes_the_last_title_and_prompt() {
+        let dir = scratch_dir();
+        let path = dir.join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"the very first thing I asked"}}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"An early guess"}"#, "\n",
+                r#"{"type":"last-prompt","lastPrompt":"an early prompt"}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"What it settled on"}"#, "\n",
+                r#"{"type":"last-prompt","lastPrompt":"the latest prompt"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let (title, last) = transcript_meta(&path).unwrap();
+        assert_eq!(title, "What it settled on");
+        assert_eq!(last, "the latest prompt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record types are internal to Claude Code and documented as unstable, so a
+    /// transcript without `ai-title` must still yield something human-readable.
+    #[test]
+    fn transcript_meta_falls_back_when_no_ai_title() {
+        let dir = scratch_dir();
+
+        // No ai-title → the last prompt stands in.
+        let a = dir.join("a.jsonl");
+        std::fs::write(
+            &a,
+            concat!(
+                r#"{"type":"user","message":{"content":"opening message"}}"#, "\n",
+                r#"{"type":"last-prompt","lastPrompt":"what I asked most recently"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_meta(&a).unwrap().0, "what I asked most recently");
+
+        // Neither → the first user message stands in.
+        let b = dir.join("b.jsonl");
+        std::fs::write(&b, "{\"type\":\"user\",\"message\":{\"content\":\"opening message\"}}\n").unwrap();
+        assert_eq!(transcript_meta(&b).unwrap().0, "opening message");
+
+        // Garbage lines are skipped, not fatal — a torn write must not lose the title.
+        let c = dir.join("c.jsonl");
+        std::fs::write(
+            &c,
+            concat!("not json at all\n", r#"{"type":"ai-title","aiTitle":"Survived"}"#, "\n", "{\"truncated\":"),
+        )
+        .unwrap();
+        assert_eq!(transcript_meta(&c).unwrap().0, "Survived");
+
+        // An empty transcript yields an empty title (the frontend labels it).
+        let d = dir.join("d.jsonl");
+        std::fs::write(&d, "").unwrap();
+        assert_eq!(transcript_meta(&d).unwrap().0, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transcript bigger than the 512KB tail cap must still surface the newest
+    /// title — the whole point of scanning the tail rather than the head.
+    #[test]
+    fn transcript_meta_reads_the_tail_of_a_large_transcript() {
+        let dir = scratch_dir();
+        let path = dir.join("big.jsonl");
+        let filler = format!(
+            "{}\n",
+            serde_json::json!({ "type": "assistant", "message": { "content": "x".repeat(4000) } })
+        );
+        let mut body = String::new();
+        body.push_str(r#"{"type":"ai-title","aiTitle":"Stale head title"}"#);
+        body.push('\n');
+        while body.len() < 900 * 1024 {
+            body.push_str(&filler);
+        }
+        body.push_str(r#"{"type":"ai-title","aiTitle":"Fresh tail title"}"#);
+        body.push('\n');
+        std::fs::write(&path, &body).unwrap();
+
+        assert!(body.len() as u64 > 512 * 1024, "fixture must exceed the tail cap");
+        assert_eq!(transcript_meta(&path).unwrap().0, "Fresh tail title");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn table(entries: &[(u32, Option<u32>, &str)]) -> ProcTable {
+        ProcTable {
+            procs: entries.iter().map(|&(pid, ppid, name)| (pid, (ppid, name.to_string()))).collect(),
+        }
+    }
+
+    #[test]
+    fn proc_table_identity_and_ancestry() {
+        // muster(100) → ghostty(200) → claude(300); unrelated claude(400) under init.
+        let t = table(&[
+            (100, Some(1), "muster"),
+            (200, Some(100), "ghostty"),
+            (300, Some(200), "claude"),
+            (400, Some(1), "claude.exe"),
+        ]);
+        assert!(t.is_descendant_of(300, 100), "grandchild via child terminal");
+        assert!(t.is_descendant_of(100, 100), "a pid is its own ancestor");
+        assert!(!t.is_descendant_of(400, 100), "unrelated session must stay external");
+        assert!(t.is_live_claude(300));
+        assert!(t.is_live_claude(400), "windows .exe name still matches");
+        assert!(!t.is_live_claude(200), "live but not claude");
+        assert!(!t.is_live_claude(999), "dead pid");
+    }
+
+    #[test]
+    fn proc_table_ancestry_survives_ppid_cycles() {
+        // Windows pid reuse can produce ppid cycles; the walk must terminate.
+        let t = table(&[(10, Some(20), "a"), (20, Some(10), "b")]);
+        assert!(!t.is_descendant_of(10, 99));
+    }
+
+    #[test]
+    fn proc_table_snapshot_sees_this_process() {
+        // Real sysinfo snapshot on whatever OS runs the tests: our own pid must
+        // be present and count as its own descendant.
+        let t = ProcTable::snapshot();
+        let me = std::process::id();
+        assert!(t.procs.contains_key(&me), "own pid missing from process snapshot");
+        assert!(t.is_descendant_of(me, me));
+    }
+
+    #[test]
+    fn parse_registry_entry_accepts_interactive_rejects_rest() {
+        // Shape verified against a real CC 2.1.216 registry file on Windows;
+        // the keys are identical on macOS.
+        let win = r#"{"pid":41708,"sessionId":"20283E01-6874-4FBB-B696-C29A89F13CC6","cwd":"E:\\Programming\\Work\\Respeak\\muster","startedAt":1784613714619,"procStart":"639202177128968910","version":"2.1.216","peerProtocol":1,"kind":"interactive","entrypoint":"cli","name":"muster-15","nameSource":"derived","status":"busy","updatedAt":1784614124255,"statusUpdatedAt":1784614124255}"#;
+        let s = parse_registry_entry(win).expect("interactive entry should parse");
+        assert_eq!(s.pid, 41708);
+        assert_eq!(s.cwd, r"E:\Programming\Work\Respeak\muster");
+        assert_eq!(s.status, "busy");
+        assert_eq!(s.status_updated_at, Some(1784614124255));
+
+        // Non-interactive (`claude -p`, SDK) and malformed entries are skipped.
+        assert!(parse_registry_entry(r#"{"pid":1,"sessionId":"x","kind":"print"}"#).is_none());
+        assert!(parse_registry_entry(r#"{"sessionId":"x","kind":"interactive"}"#).is_none());
+        assert!(parse_registry_entry("not json").is_none());
     }
 }

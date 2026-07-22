@@ -28,7 +28,24 @@ base64 = "0.22.1"
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Runnable discovery: .muster/tasks.toml, and format-preserving writes back to it.
 toml = "0.9"
-jsonc-parser = { version = "0.33.0", features = ["serde"] }
 toml_edit = "0.25.13"
+# .vscode/tasks.json and launch.json are JSONC — VS Code's own template ships
+# comments and trailing commas, which serde_json rejects.
+jsonc-parser = { version = "0.33.0", features = ["serde"] }
+# Crash forensics: rolling file log + panic hook. The app previously wrote no
+# logs at all — a panic that unwound out of main left zero trace on disk.
+log = "0.4"
+tauri-plugin-log = "2"
+# Process-table introspection (external-session liveness + ancestry) without
+# spawning `ps`/`tasklist` — one in-process snapshot, same code on every OS.
+# 0.38 (not latest) because newer sysinfo raises MSRV past our rustc.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+# `SetThreadExecutionState` for the keep-awake control — Windows' answer to
+# macOS `caffeinate`. 0.61 is the version tauri already resolves, so this adds
+# a feature to an existing crate rather than a second copy of windows-sys.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
