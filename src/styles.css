@@ -594,6 +594,26 @@ select.in-ctl { cursor: pointer; }
 .sw.on { background: var(--accent); border-color: var(--accent); }
 .sw.on::after { transform: translateX(15px); background: #17121f; }
 
+/* project tasks panel — manage what the picker shows */
+.mgrdlg { width: min(560px, 94vw); }
+.mgrdlg .set-head .run-sub { font: 10px var(--font-mono); color: var(--muted-2); }
+.mgr-body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+.mgr-row { display: flex; align-items: center; gap: 10px; padding: 7px 9px; border: 1px solid var(--hair); border-radius: var(--radius-sm); background: var(--surface); }
+.mgr-row.off { opacity: .45; }
+.mgr-row .txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.mgr-row .txt b { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mgr-row .txt small { font: 9.5px var(--font-mono); color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mgr-acts { display: flex; gap: 3px; flex: none; }
+.mgr-b { font: 11px var(--font-ui); border: 1px solid var(--hair-strong); border-radius: 6px; padding: 2px 7px; background: var(--surface-2); color: var(--muted); cursor: pointer; }
+.mgr-b:hover { color: var(--text); border-color: var(--accent-line); }
+.mgr-b.on { color: var(--accent-ink); border-color: var(--accent-line); background: var(--accent-wash); }
+.mgr-b.danger:hover { color: var(--st-error); border-color: var(--st-error); }
+.mgr-b.quiet { font: 9px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; opacity: .5; cursor: default; }
+.mgr-b.quiet:hover { color: var(--muted); border-color: var(--hair-strong); }
+.mgr-body .in-field { gap: 5px; }
+.mgr-foot { display: flex; align-items: center; gap: 6px; padding: 9px 13px; border-top: 1px solid var(--hair); background: var(--surface); }
+.mgr-foot .mgr-sp { flex: 1; }
+
 /* worktree dialog */
 .wtdlg { position: fixed; top: 22vh; left: 50%; transform: translateX(-50%) translateY(-8px) scale(.98); width: min(420px, 92vw); z-index: 42; opacity: 0; pointer-events: none; transition: opacity .16s, transform .16s; border-radius: var(--radius-lg); padding: 18px; background: linear-gradient(180deg, rgba(255,255,255,.06), transparent 40%), color-mix(in srgb, var(--panel) 94%, transparent); backdrop-filter: blur(24px) saturate(1.4); border: 1px solid var(--hair-strong); box-shadow: 0 40px 100px -30px rgba(0,0,0,.8), inset 0 1px 0 rgba(255,255,255,.08); }
 .wtdlg.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0) scale(1); }

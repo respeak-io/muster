@@ -65,6 +65,12 @@ pub struct Runnable {
     /// them and substitutes before calling `spawn_task` — discovery deliberately
     /// leaves them intact, because their values aren't knowable here.
     pub inputs: Vec<InputSpec>,
+    /// Labels of tasks that must run first. The frontend resolves and runs them —
+    /// it owns the PTY panes, so it's the only side that can wait on an exit code.
+    pub depends_on: Vec<String>,
+    /// "parallel" | "sequence". Parallel is VS Code's default when `dependsOn` is
+    /// an array, which surprises people — but matching it beats inventing our own.
+    pub depends_order: String,
     /// `Some(reason)` → the picker shows it greyed and refuses to run it. Being
     /// honest about what we can't run beats silently omitting it, which reads as
     /// "Muster didn't find your task".
@@ -97,9 +103,13 @@ pub fn discover(root: &Path, trusted: bool) -> Vec<Runnable> {
     let mut out = Vec::new();
     out.extend(muster_tasks(root));
     out.extend(vscode_tasks(root));
+    out.extend(launch_configs(root));
     out.extend(npm_scripts(root));
     out.extend(just_recipes(root, trusted));
+    out.extend(run_introspector(root, trusted, &TASKFILE));
+    out.extend(run_introspector(root, trusted, &MISE));
     out.extend(make_targets(root));
+    out.extend(cargo_tasks(root));
     dedupe_ids(&mut out);
     out
 }
@@ -189,6 +199,8 @@ fn muster_tasks(root: &Path) -> Vec<Runnable> {
                 env: t.env,
                 background: t.background,
                 inputs: Vec::new(),
+                depends_on: Vec::new(),
+                depends_order: "parallel".into(),
                 blocked: None,
             }
         })
@@ -246,6 +258,8 @@ fn npm_scripts(root: &Path) -> Vec<Runnable> {
                 env: BTreeMap::new(),
                 background: is_background(name, body),
                 inputs: Vec::new(),
+                depends_on: Vec::new(),
+                depends_order: "parallel".into(),
                 blocked: None,
             })
         })
@@ -436,12 +450,6 @@ fn vscode_tasks(root: &Path) -> Vec<Runnable> {
                 Some(blocked_row(&format!("vscode:{label}"), &label, &rel, "vscode", root, why))
             };
 
-            // dependsOn changes what running the task *means*; doing half of it
-            // silently is worse than declining until P2 implements the ordering.
-            if t.get("dependsOn").is_some() {
-                return mk_blocked("depends on other tasks — not supported yet");
-            }
-
             let command = t.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let args: Vec<String> = t
                 .get("args")
@@ -506,6 +514,22 @@ fn vscode_tasks(root: &Path) -> Vec<Runnable> {
                 return mk_blocked(&format!("no input declared for ${{input:{missing}}}"));
             }
 
+            // dependsOn names other tasks by *label*; the frontend resolves them
+            // against the same discovery result and runs them before this one.
+            let depends_on: Vec<String> = match t.get("dependsOn") {
+                Some(serde_json::Value::String(one)) => vec![one.clone()],
+                Some(serde_json::Value::Array(many)) => {
+                    many.iter().filter_map(|d| Some(d.as_str()?.to_string())).collect()
+                }
+                _ => Vec::new(),
+            };
+            let depends_order = t
+                .get("dependsOrder")
+                .and_then(|v| v.as_str())
+                .filter(|v| *v == "sequence")
+                .unwrap_or("parallel")
+                .to_string();
+
             let group = t.get("group").and_then(|g| {
                 g.as_str().map(str::to_string).or_else(|| Some(g.get("kind")?.as_str()?.to_string()))
             });
@@ -526,11 +550,322 @@ fn vscode_tasks(root: &Path) -> Vec<Runnable> {
                 env,
                 background: t.get("isBackground").and_then(|v| v.as_bool()).unwrap_or(false),
                 inputs,
+                depends_on,
+                depends_order,
                 blocked: None,
             })
         })
         .collect()
 }
+
+// ── .vscode/launch.json ─────────────────────────────────────────────────────
+// "Run without debugging" — VS Code's ⌃F5, not F5. Muster has no debug adapter,
+// so it starts the same program with the same args, env and cwd, and says so.
+// A config that only makes sense *with* a debugger (an attach request) is blocked
+// rather than silently started as a plain process.
+
+fn launch_configs(root: &Path) -> Vec<Runnable> {
+    let rel = format!(".vscode{}launch.json", std::path::MAIN_SEPARATOR);
+    let Ok(text) = std::fs::read_to_string(root.join(".vscode").join("launch.json")) else {
+        return Vec::new();
+    };
+    let json: serde_json::Value = match jsonc_parser::parse_to_serde_value(&text, &Default::default()) {
+        Ok(Some(v)) => v,
+        _ => return Vec::new(),
+    };
+    let Some(list) = json.get("configurations").and_then(|c| c.as_array()) else { return Vec::new() };
+    let root_str = root.display().to_string();
+    let all_inputs = parse_input_specs(root, &root_str, json.get("inputs"));
+
+    list.iter()
+        .filter_map(|raw| {
+            let c = apply_platform(raw);
+            let name = c.get("name")?.as_str()?.to_string();
+            let id = format!("launch:{}", slugify(&name));
+            let mk_blocked = |why: &str| Some(blocked_row(&id, &name, &rel, "launch", root, why));
+
+            // A compound config chains other configs; that's dependsOn by another
+            // name, and it isn't wired up here yet.
+            if c.get("configurations").is_some() {
+                return mk_blocked("compound configuration — not supported yet");
+            }
+            if c.get("request").and_then(|r| r.as_str()) == Some("attach") {
+                return mk_blocked("attaches to a running process — needs a debugger");
+            }
+
+            let cwd = match c.get("cwd").and_then(|v| v.as_str()) {
+                Some(v) => match substitute(v, root, &root_str) {
+                    Ok(v) => v,
+                    Err(why) => return mk_blocked(&why),
+                },
+                None => root_str.clone(),
+            };
+            let sub = |v: Option<&serde_json::Value>| -> Result<Option<String>, String> {
+                match v.and_then(|x| x.as_str()) {
+                    Some(x) => substitute(x, root, &cwd).map(Some),
+                    None => Ok(None),
+                }
+            };
+            let str_list = |key: &str| -> Result<Vec<String>, String> {
+                c.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(|x| substitute(x, root, &cwd))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap_or_else(|| Ok(Vec::new()))
+            };
+
+            let program = match sub(c.get("program")) {
+                Ok(p) => p,
+                Err(why) => return mk_blocked(&why),
+            };
+            let runtime = match sub(c.get("runtimeExecutable")) {
+                Ok(p) => p,
+                Err(why) => return mk_blocked(&why),
+            };
+            let (args, runtime_args) = match (str_list("args"), str_list("runtimeArgs")) {
+                (Ok(a), Ok(r)) => (a, r),
+                (Err(why), _) | (_, Err(why)) => return mk_blocked(&why),
+            };
+
+            let ctype = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let exec = match ctype {
+                "node" | "pwa-node" | "node-terminal" => {
+                    let program = program.clone().unwrap_or_default();
+                    let mut a = runtime_args.clone();
+                    if !program.is_empty() {
+                        a.push(program);
+                    }
+                    a.extend(args.clone());
+                    Exec::Argv { program: runtime.clone().unwrap_or_else(|| "node".into()), args: a }
+                }
+                "python" | "debugpy" => {
+                    let mut a = vec![program.clone().unwrap_or_default()];
+                    a.extend(args.clone());
+                    Exec::Argv { program: runtime.clone().unwrap_or_else(|| "python3".into()), args: a }
+                }
+                "go" => Exec::Shell {
+                    line: format!("go run {}", program.clone().unwrap_or_else(|| ".".into())),
+                },
+                // Native launchers already point at a built executable.
+                "lldb" | "cppdbg" | "cppvsdbg" | "codelldb" => match &program {
+                    Some(p) => Exec::Argv { program: p.clone(), args: args.clone() },
+                    None => return mk_blocked("no program to run"),
+                },
+                other => return mk_blocked(&format!("launch type “{other}” isn't supported yet")),
+            };
+
+            let mut env = BTreeMap::new();
+            if let Some(e) = c.get("env").and_then(|e| e.as_object()) {
+                for (k, v) in e {
+                    let Some(v) = v.as_str() else { continue };
+                    match substitute(v, root, &cwd) {
+                        Ok(v) => { env.insert(k.clone(), v); }
+                        Err(why) => return mk_blocked(&why),
+                    }
+                }
+            }
+
+            let line = exec_line(&exec);
+            let ids = referenced_inputs(std::slice::from_ref(&line));
+            let inputs: Vec<InputSpec> =
+                all_inputs.iter().filter(|i| ids.contains(&i.id)).cloned().collect();
+            if let Some(missing) = ids.iter().find(|id| !inputs.iter().any(|i| &&i.id == id)) {
+                return mk_blocked(&format!("no input declared for ${{input:{missing}}}"));
+            }
+
+            Some(Runnable {
+                id,
+                label: name,
+                // Says plainly that this is the run half of a debug config.
+                detail: Some(format!("{line}  (no debugger)")),
+                source: "launch".into(),
+                source_file: rel.clone(),
+                group: Some("run".into()),
+                exec,
+                cwd,
+                env,
+                background: false,
+                inputs,
+                depends_on: Vec::new(),
+                depends_order: "parallel".into(),
+                blocked: None,
+            })
+        })
+        .collect()
+}
+
+// ── Cargo.toml ──────────────────────────────────────────────────────────────
+
+/// Rust projects don't declare tasks — the toolchain *is* the task list. These are
+/// the five commands you'd type anyway, offered without having to write them down.
+/// Purely conventional: the file is read only to confirm it's a crate and to see
+/// whether there's a binary to `run`.
+fn cargo_tasks(root: &Path) -> Vec<Runnable> {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else { return Vec::new() };
+    // A virtual workspace root has no package to build; its members do.
+    let is_workspace_only = text.contains("[workspace]") && !text.contains("[package]");
+    let has_bin = root.join("src").join("main.rs").exists() || text.contains("[[bin]]");
+
+    let mut out: Vec<(&str, &str, &str)> = vec![
+        ("check", "cargo check", "check"),
+        ("test", "cargo test", "test"),
+        ("clippy", "cargo clippy --all-targets", "check"),
+        ("build", "cargo build", "build"),
+    ];
+    if has_bin && !is_workspace_only {
+        out.push(("run", "cargo run", "run"));
+    }
+    out.into_iter()
+        .map(|(name, line, group)| Runnable {
+            id: format!("cargo:{name}"),
+            label: name.to_string(),
+            detail: Some(line.to_string()),
+            source: "cargo".into(),
+            source_file: "Cargo.toml".into(),
+            group: Some(group.to_string()),
+            exec: Exec::Shell { line: line.to_string() },
+            cwd: root.display().to_string(),
+            env: BTreeMap::new(),
+            background: false,
+            inputs: Vec::new(),
+            depends_on: Vec::new(),
+            depends_order: "parallel".into(),
+            blocked: None,
+        })
+        .collect()
+}
+
+// ── introspecting providers ─────────────────────────────────────────────────
+
+/// (name, doc) pairs pulled out of a tool's JSON listing.
+type TaskListing = Vec<(String, Option<String>)>;
+
+/// Shared shape for the providers that must *run* the project's own tool to list
+/// its tasks. Each one evaluates the file it reads, so all of them sit behind the
+/// same trust gate — and when untrusted, each reports one blocked row rather than
+/// disappearing, so the tasks read as withheld rather than absent.
+struct Introspector {
+    source: &'static str,
+    /// Marker files, any of which means "this project uses me".
+    markers: &'static [&'static str],
+    program: &'static str,
+    args: &'static [&'static str],
+    /// Pulls (name, doc) pairs out of the tool's JSON.
+    parse: fn(&serde_json::Value) -> TaskListing,
+    /// How to invoke one task, given its name.
+    line: fn(&str) -> String,
+}
+
+fn run_introspector(root: &Path, trusted: bool, i: &Introspector) -> Vec<Runnable> {
+    let Some(found) = i.markers.iter().find(|m| root.join(m).exists()) else { return Vec::new() };
+    if !trusted {
+        return vec![blocked_row(
+            &format!("{}:__untrusted", i.source),
+            &format!("{} tasks", i.source),
+            found,
+            i.source,
+            root,
+            &format!("trust this project to read its {found}"),
+        )];
+    }
+    let out = match std::process::Command::new(i.program).args(i.args).current_dir(root).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            return vec![blocked_row(
+                &format!("{}:__error", i.source),
+                &format!("{} tasks", i.source),
+                found,
+                i.source,
+                root,
+                &first_line(&String::from_utf8_lossy(&o.stderr)),
+            )]
+        }
+        // Tool not installed — the marker file simply isn't actionable here.
+        Err(_) => return Vec::new(),
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out) else { return Vec::new() };
+
+    (i.parse)(&json)
+        .into_iter()
+        .map(|(name, doc)| {
+            let line = (i.line)(&name);
+            Runnable {
+                id: format!("{}:{}", i.source, slugify(&name)),
+                group: infer_group(&name, ""),
+                detail: doc.or_else(|| Some(line.clone())),
+                label: name,
+                source: i.source.into(),
+                source_file: found.to_string(),
+                exec: Exec::Shell { line },
+                cwd: root.display().to_string(),
+                env: BTreeMap::new(),
+                background: false,
+                inputs: Vec::new(),
+                depends_on: Vec::new(),
+                depends_order: "parallel".into(),
+                blocked: None,
+            }
+        })
+        .collect()
+}
+
+/// go-task. `--list-all` includes tasks without a description, which `--list` hides.
+const TASKFILE: Introspector = Introspector {
+    source: "taskfile",
+    markers: &["Taskfile.yml", "Taskfile.yaml", "taskfile.yml"],
+    program: "task",
+    args: &["--list-all", "--json"],
+    parse: |json| {
+        json.get("tasks")
+            .and_then(|t| t.as_array())
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| {
+                        let name = t.get("name")?.as_str()?.to_string();
+                        let doc = t
+                            .get("desc")
+                            .or_else(|| t.get("summary"))
+                            .and_then(|d| d.as_str())
+                            .filter(|d| !d.is_empty())
+                            .map(str::to_string);
+                        Some((name, doc))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    },
+    line: |n| format!("task {n}"),
+};
+
+/// mise. Its `tasks ls --json` returns a bare array.
+const MISE: Introspector = Introspector {
+    source: "mise",
+    markers: &["mise.toml", ".mise.toml", "mise.local.toml", ".config/mise.toml"],
+    program: "mise",
+    args: &["tasks", "ls", "--json"],
+    parse: |json| {
+        json.as_array()
+            .map(|ts| {
+                ts.iter()
+                    .filter_map(|t| {
+                        let name = t.get("name")?.as_str()?.to_string();
+                        let doc = t
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .filter(|d| !d.is_empty())
+                            .map(str::to_string);
+                        Some((name, doc))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    },
+    line: |n| format!("mise run {n}"),
+};
 
 // ── justfile ────────────────────────────────────────────────────────────────
 
@@ -626,6 +961,8 @@ fn just_recipes(root: &Path, trusted: bool) -> Vec<Runnable> {
                 env: BTreeMap::new(),
                 background: false,
                 inputs,
+                depends_on: Vec::new(),
+                depends_order: "parallel".into(),
                 blocked: None,
             })
         })
@@ -695,6 +1032,8 @@ fn make_targets(root: &Path) -> Vec<Runnable> {
             env: BTreeMap::new(),
             background: false,
             inputs: Vec::new(),
+            depends_on: Vec::new(),
+            depends_order: "parallel".into(),
             blocked: None,
         });
         pending_doc = None;
@@ -717,6 +1056,8 @@ fn blocked_row(id: &str, label: &str, file: &str, source: &str, root: &Path, why
         env: BTreeMap::new(),
         background: false,
         inputs: Vec::new(),
+        depends_on: Vec::new(),
+        depends_order: "parallel".into(),
         blocked: Some(why.to_string()),
     }
 }
@@ -801,6 +1142,135 @@ fn slugify(s: &str) -> String {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or(s).trim().to_string()
+}
+
+// ── writing .muster/tasks.toml ──────────────────────────────────────────────
+// The one file Muster owns, and the only one it ever writes. Discovered VS Code
+// tasks, justfiles and Makefiles are read-only: editing them would mean rewriting
+// a file another tool owns, which Muster shouldn't do behind your back.
+//
+// Edits go through `toml_edit` rather than a serialize-the-whole-struct round trip
+// so a hand-written file keeps its comments, ordering and spacing. Someone wrote
+// that file by hand; a save shouldn't reformat it.
+
+/// One task as the editor panel sends it.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MusterTaskInput {
+    pub label: String,
+    pub run: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+fn tasks_toml_path(workdir: &str) -> std::path::PathBuf {
+    Path::new(workdir).join(".muster").join("tasks.toml")
+}
+
+fn load_doc(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => t.parse::<toml_edit::DocumentMut>().map_err(|e| first_line(&e.to_string())),
+        Err(_) => Ok(toml_edit::DocumentMut::new()),
+    }
+}
+
+fn write_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create .muster: {e}"))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|e| format!("write tasks.toml: {e}"))
+}
+
+fn fill_table(t: &mut toml_edit::Table, task: &MusterTaskInput, id: &str) {
+    t["id"] = toml_edit::value(id);
+    t["label"] = toml_edit::value(task.label.as_str());
+    t["run"] = toml_edit::value(task.run.as_str());
+    match &task.group {
+        Some(g) if !g.is_empty() => t["group"] = toml_edit::value(g.as_str()),
+        _ => { t.remove("group"); }
+    }
+    match &task.cwd {
+        Some(c) if !c.is_empty() => t["cwd"] = toml_edit::value(c.as_str()),
+        _ => { t.remove("cwd"); }
+    }
+    if task.background {
+        t["background"] = toml_edit::value(true);
+    } else {
+        t.remove("background");
+    }
+}
+
+/// Find the `[[task]]` entry Muster addresses as `id`. Tasks Muster wrote carry an
+/// explicit `id`; hand-written ones are matched on their label's slug, which is
+/// exactly how discovery derived their id in the first place.
+fn find_task_index(arr: &toml_edit::ArrayOfTables, id: &str) -> Option<usize> {
+    arr.iter().position(|t| {
+        let explicit = t.get("id").and_then(|v| v.as_str());
+        let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        explicit == Some(id) || (explicit.is_none() && slugify(label) == id)
+    })
+}
+
+/// Create or update a task. `id` is `None` for a new one. Returns its id.
+#[tauri::command]
+pub fn save_muster_task(
+    workdir: String,
+    id: Option<String>,
+    task: MusterTaskInput,
+) -> Result<String, String> {
+    if task.label.trim().is_empty() {
+        return Err("a task needs a label".into());
+    }
+    if task.run.trim().is_empty() {
+        return Err("a task needs a command".into());
+    }
+    let path = tasks_toml_path(&workdir);
+    let mut doc = load_doc(&path)?;
+    if !doc.contains_key("task") {
+        doc["task"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let arr = doc["task"]
+        .as_array_of_tables_mut()
+        .ok_or("`task` in tasks.toml isn't a [[task]] array")?;
+
+    let existing = id.as_deref().and_then(|i| find_task_index(arr, i));
+    let new_id = id.unwrap_or_else(|| slugify(&task.label));
+    match existing {
+        Some(i) => fill_table(arr.get_mut(i).unwrap(), &task, &new_id),
+        None => {
+            let mut t = toml_edit::Table::new();
+            fill_table(&mut t, &task, &new_id);
+            arr.push(t);
+        }
+    }
+    write_doc(&path, &doc)?;
+    Ok(format!("muster:{new_id}"))
+}
+
+#[tauri::command]
+pub fn delete_muster_task(workdir: String, id: String) -> Result<(), String> {
+    let path = tasks_toml_path(&workdir);
+    let mut doc = load_doc(&path)?;
+    let Some(arr) = doc.get_mut("task").and_then(|t| t.as_array_of_tables_mut()) else {
+        return Err("no tasks to delete".into());
+    };
+    let Some(i) = find_task_index(arr, &id) else {
+        return Err(format!("no task “{id}” in tasks.toml"));
+    };
+    arr.remove(i);
+    write_doc(&path, &doc)
+}
+
+/// Whether the project already has a tasks.toml — the panel asks before creating
+/// one, because a new committable file in someone's repo is a real side effect.
+#[tauri::command]
+pub fn muster_tasks_file(workdir: String) -> Result<(String, bool), String> {
+    let p = tasks_toml_path(&workdir);
+    Ok((p.display().to_string(), p.exists()))
 }
 
 /// Parse the project's runnables. Cheap enough (two small files) to run on every
@@ -1032,14 +1502,137 @@ env = { RUST_LOG = "debug" }
     }
 
     #[test]
-    fn a_vscode_task_with_dependson_declines_rather_than_running_half_of_it() {
+    fn vscode_dependson_is_carried_through_for_the_frontend_to_order() {
         let t = Tmp::new("vscdep");
         t.write(
             ".vscode/tasks.json",
-            r#"{"tasks":[{"label":"All","type":"shell","command":"echo hi","dependsOn":["Build"]}]}"#,
+            r#"{"tasks":[
+              {"label":"Build","type":"shell","command":"make"},
+              {"label":"All","type":"shell","command":"echo hi","dependsOn":["Build"],"dependsOrder":"sequence"},
+              {"label":"One","type":"shell","command":"echo one","dependsOn":"Build"}
+            ]}"#,
         );
         let found = discover(&t.0, true);
-        assert!(found[0].blocked.as_deref().unwrap().contains("depends on"));
+        let all = found.iter().find(|r| r.label == "All").unwrap();
+        assert!(all.blocked.is_none(), "dependsOn no longer blocks a task");
+        assert_eq!(all.depends_on, vec!["Build"]);
+        assert_eq!(all.depends_order, "sequence");
+
+        // A bare string is the single-dependency shorthand.
+        let one = found.iter().find(|r| r.label == "One").unwrap();
+        assert_eq!(one.depends_on, vec!["Build"]);
+        // VS Code's default is parallel, which surprises people — but it's the default.
+        assert_eq!(one.depends_order, "parallel");
+    }
+
+    // ── launch.json ──────────────────────────────────────────────────────
+
+    #[test]
+    fn launch_configs_run_without_a_debugger() {
+        let t = Tmp::new("launch");
+        t.write(
+            ".vscode/launch.json",
+            r#"{
+  "version": "0.2.0",
+  "configurations": [
+    { "name": "Server", "type": "node", "request": "launch",
+      "program": "${workspaceFolder}/server.js", "args": ["--port", "3000"],
+      "env": { "NODE_ENV": "development" } },
+    { "name": "Attach", "type": "node", "request": "attach", "port": 9229 },
+    { "name": "Weird", "type": "coreclr", "request": "launch" }
+  ]
+}"#,
+        );
+        let found = discover(&t.0, true);
+
+        let server = found.iter().find(|r| r.label == "Server").unwrap();
+        assert!(server.blocked.is_none());
+        assert_eq!(
+            server.exec,
+            Exec::Argv {
+                program: "node".into(),
+                args: vec![
+                    format!("{}/server.js", t.0.display()),
+                    "--port".into(),
+                    "3000".into()
+                ],
+            }
+        );
+        assert_eq!(server.env.get("NODE_ENV").map(String::as_str), Some("development"));
+        assert!(server.detail.as_deref().unwrap().contains("no debugger"));
+
+        // Honest about the two it can't do.
+        let attach = found.iter().find(|r| r.label == "Attach").unwrap();
+        assert!(attach.blocked.as_deref().unwrap().contains("attaches"));
+        let weird = found.iter().find(|r| r.label == "Weird").unwrap();
+        assert!(weird.blocked.as_deref().unwrap().contains("coreclr"));
+    }
+
+    // ── Cargo ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cargo_offers_the_commands_you_would_type_anyway() {
+        let t = Tmp::new("cargo");
+        t.write("Cargo.toml", "[package]\nname = \"x\"\nversion = \"0.1.0\"\n");
+        t.write("src/main.rs", "fn main() {}");
+        let found = discover(&t.0, true);
+        let labels: Vec<_> = found.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["check", "test", "clippy", "build", "run"]);
+        assert_eq!(found[1].exec, Exec::Shell { line: "cargo test".into() });
+    }
+
+    #[test]
+    fn a_library_crate_has_nothing_to_run() {
+        let t = Tmp::new("cargolib");
+        t.write("Cargo.toml", "[package]\nname = \"x\"\n");
+        t.write("src/lib.rs", "");
+        let found = discover(&t.0, true);
+        assert!(!found.iter().any(|r| r.label == "run"), "no binary to run");
+    }
+
+    #[test]
+    fn a_virtual_workspace_root_has_nothing_to_run() {
+        let t = Tmp::new("cargows");
+        t.write("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n");
+        t.write("src/main.rs", "fn main() {}");
+        let found = discover(&t.0, true);
+        assert!(!found.iter().any(|r| r.label == "run"));
+        assert!(found.iter().any(|r| r.label == "test"), "the workspace still tests");
+    }
+
+    // ── introspecting providers ──────────────────────────────────────────
+
+    #[test]
+    fn every_introspecting_provider_is_withheld_until_trusted() {
+        let t = Tmp::new("gates");
+        t.write("Taskfile.yml", "version: '3'\ntasks:\n  build:\n    cmds: [echo hi]\n");
+        t.write("mise.toml", "[tasks.lint]\nrun = \"echo hi\"\n");
+        let found = discover(&t.0, false);
+        for src in ["taskfile", "mise"] {
+            let row = found.iter().find(|r| r.source == src).unwrap_or_else(|| panic!("{src} row"));
+            assert!(row.blocked.as_deref().unwrap().starts_with("trust this project"));
+        }
+    }
+
+    #[test]
+    fn taskfile_json_maps_onto_runnables() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"tasks":[{"name":"build","desc":"Build it"},{"name":"quiet","desc":""}]}"#,
+        )
+        .unwrap();
+        let got = (TASKFILE.parse)(&json);
+        assert_eq!(got[0], ("build".to_string(), Some("Build it".to_string())));
+        assert_eq!(got[1], ("quiet".to_string(), None), "an empty desc is no desc");
+        assert_eq!((TASKFILE.line)("build"), "task build");
+    }
+
+    #[test]
+    fn mise_json_maps_onto_runnables() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"[{"name":"lint","description":"Lint it"}]"#).unwrap();
+        let got = (MISE.parse)(&json);
+        assert_eq!(got[0], ("lint".to_string(), Some("Lint it".to_string())));
+        assert_eq!((MISE.line)("lint"), "mise run lint");
     }
 
     #[test]
@@ -1157,6 +1750,127 @@ env = { RUST_LOG = "debug" }
         // A `##` line above the target documents it too.
         let test = found.iter().find(|r| r.label == "test").unwrap();
         assert_eq!(test.detail.as_deref(), Some("Run the suite"));
+    }
+
+    // ── writing tasks.toml ───────────────────────────────────────────────
+
+    #[test]
+    fn saving_a_task_creates_the_file_then_appends_to_it() {
+        let t = Tmp::new("write");
+        let wd = t.0.display().to_string();
+        let id = save_muster_task(
+            wd.clone(),
+            None,
+            MusterTaskInput {
+                label: "Dev server".into(),
+                run: "pnpm dev".into(),
+                group: None,
+                background: true,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(id, "muster:dev-server");
+
+        save_muster_task(
+            wd.clone(),
+            None,
+            MusterTaskInput {
+                label: "Test".into(),
+                run: "pnpm test".into(),
+                group: Some("test".into()),
+                background: false,
+                cwd: Some("app".into()),
+            },
+        )
+        .unwrap();
+
+        // Round-trips through discovery, which is the only proof that matters.
+        let found = discover(&t.0, true);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].label, "Dev server");
+        assert!(found[0].background);
+        assert_eq!(found[1].cwd, t.0.join("app").display().to_string());
+        assert_eq!(found[1].group.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn editing_a_task_preserves_hand_written_comments_and_order() {
+        let t = Tmp::new("preserve");
+        let wd = t.0.display().to_string();
+        t.write(
+            ".muster/tasks.toml",
+            "# Our team's tasks — please keep sorted.\n\n[[task]]\nlabel = \"Test\"\nrun = \"pnpm test\"\n\n[[task]]\nlabel = \"Lint\"\nrun = \"eslint .\"\n",
+        );
+        save_muster_task(
+            wd,
+            Some("test".into()),   // hand-written entries are addressed by label slug
+            MusterTaskInput {
+                label: "Test".into(),
+                run: "pnpm test --run".into(),
+                group: None,
+                background: false,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(t.0.join(".muster/tasks.toml")).unwrap();
+        assert!(text.contains("# Our team's tasks"), "the comment survives an edit");
+        assert!(text.contains("pnpm test --run"));
+        assert!(text.contains("eslint ."), "the other task is untouched");
+        assert!(text.find("Test").unwrap() < text.find("Lint").unwrap(), "order kept");
+
+        let found = discover(&t.0, true);
+        assert_eq!(found.len(), 2, "edited in place, not appended");
+    }
+
+    #[test]
+    fn deleting_a_task_leaves_the_rest_alone() {
+        let t = Tmp::new("delete");
+        let wd = t.0.display().to_string();
+        t.write(
+            ".muster/tasks.toml",
+            "[[task]]\nid = \"a\"\nlabel = \"A\"\nrun = \"a\"\n\n[[task]]\nid = \"b\"\nlabel = \"B\"\nrun = \"b\"\n",
+        );
+        delete_muster_task(wd.clone(), "a".into()).unwrap();
+        let found = discover(&t.0, true);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].label, "B");
+        assert!(delete_muster_task(wd, "gone".into()).is_err());
+    }
+
+    #[test]
+    fn a_task_needs_a_label_and_a_command() {
+        let t = Tmp::new("validate");
+        let wd = t.0.display().to_string();
+        let bad = |label: &str, run: &str| {
+            save_muster_task(
+                wd.clone(),
+                None,
+                MusterTaskInput {
+                    label: label.into(),
+                    run: run.into(),
+                    group: None,
+                    background: false,
+                    cwd: None,
+                },
+            )
+        };
+        assert!(bad("  ", "x").is_err());
+        assert!(bad("x", "  ").is_err());
+        assert!(!tasks_toml_path(&t.0.display().to_string()).exists(), "no file for a rejected task");
+    }
+
+    #[test]
+    fn muster_tasks_file_reports_whether_it_exists_yet() {
+        let t = Tmp::new("exists");
+        let wd = t.0.display().to_string();
+        let (path, exists) = muster_tasks_file(wd.clone()).unwrap();
+        assert!(path.ends_with("tasks.toml"));
+        assert!(!exists);
+        t.write(".muster/tasks.toml", "");
+        assert!(muster_tasks_file(wd).unwrap().1);
     }
 
     /// Dogfood: discovery has to work on this repo, which has both a package.json

@@ -106,7 +106,7 @@
       <input id="runInput" placeholder="Search tasks…" autocomplete="off" spellcheck="false" />
       <div class="run-list" id="runList"></div>
       <div class="run-foot">
-        <span><kbd>⏎</kbd> run</span><span><kbd>⌘</kbd><kbd>⏎</kbd> pin</span><span><kbd>⌘</kbd><kbd>R</kbd> rescan</span><span><kbd>esc</kbd> close</span>
+        <span><kbd>⏎</kbd> run</span><span><kbd>⌘</kbd><kbd>⏎</kbd> pin</span><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>R</kbd> rescan</span><span><kbd>esc</kbd> close</span>
       </div>
     </div>
 
@@ -116,6 +116,21 @@
       <div class="wt-btns">
         <button class="wt-cancel" id="inCancel">Cancel</button>
         <button class="wt-go" id="inGo">Run ▸</button>
+      </div>
+    </div>
+
+    <div class="setdlg mgrdlg" id="mgrDlg" role="dialog" aria-modal="true">
+      <div class="set-head">
+        <b>Tasks</b><span class="run-sub" id="mgrSub"></span>
+        <button class="diff-x" id="mgrClose" title="Close (Esc)">✕</button>
+      </div>
+      <div class="set-body mgr-body" id="mgrBody"></div>
+      <div class="mgr-foot">
+        <button class="tact" id="mgrBack">‹ Back</button>
+        <button class="tact" id="mgrOpen">↗ Open tasks.toml</button>
+        <span class="mgr-sp"></span>
+        <button class="tact" id="mgrNew">＋ New task</button>
+        <button class="tact hero" id="mgrSave">Save</button>
       </div>
     </div>
 

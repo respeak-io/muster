@@ -30,4 +30,5 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 toml = "0.9"
 jsonc-parser = { version = "0.33.0", features = ["serde"] }
+toml_edit = "0.25.13"
 

@@ -167,7 +167,10 @@ interface Runnable {
   id: string; label: string; detail: string | null;
   source: string; sourceFile: string; group: string | null;
   exec: Exec | ExecShell; cwd: string; env: Record<string, string>;
-  background: boolean; inputs: InputSpec[]; blocked: string | null;
+  background: boolean; inputs: InputSpec[];
+  // Labels, not ids — VS Code names dependencies by label.
+  dependsOn: string[]; dependsOrder: "parallel" | "sequence";
+  blocked: string | null;
 }
 
 interface Sess {
@@ -422,6 +425,9 @@ function removeFavorite(path: string) {
 }
 function closeSession(id: string) {
   const s = sessions.get(id); if (!s) return;
+  // Closing a pane mid-chain counts as a failure, not a hang.
+  const waiter = exitWaiters.get(id);
+  if (waiter) { exitWaiters.delete(id); waiter(-1); }
   const wasActive = activeId === id;
   // Resolve the successor while the closing session is still in the map, so its
   // sidebar position (same-project neighbour) is known.
@@ -1298,6 +1304,59 @@ async function launchTask(r: Runnable, project: string, opts: TaskLaunchOpts = {
   return id;
 }
 
+// ---------- dependsOn ----------
+// The frontend owns the panes, so it's the only side that can wait on an exit code
+// and decide whether the next thing should start at all.
+
+const exitWaiters = new Map<string, (code: number) => void>();
+function waitForExit(sessionId: string): Promise<number> {
+  return new Promise((resolve) => exitWaiters.set(sessionId, resolve));
+}
+
+/// Resolve `dependsOn` labels against the last discovery. VS Code names dependencies
+/// by label, not id, so this matches on label within the same project.
+function resolveDeps(r: Runnable, seen: Set<string>): Runnable[] {
+  const out: Runnable[] = [];
+  for (const label of r.dependsOn) {
+    const dep = [...lastRunnableById.values()].find((x) => x.label === label && x.source === r.source)
+      ?? [...lastRunnableById.values()].find((x) => x.label === label);
+    if (!dep) { toast(`${r.label}: no task named “${label}”`); return []; }
+    // A cycle would otherwise recurse until the stack gives out.
+    if (seen.has(dep.id)) { toast(`${r.label}: dependency cycle at “${label}”`); return []; }
+    out.push(dep);
+  }
+  return out;
+}
+
+// Run a task's dependencies, then the task. A failed dependency stops the chain —
+// "build then test" must not test a build that didn't happen.
+async function launchWithDeps(r: Runnable, project: string, opts: TaskLaunchOpts, seen = new Set<string>()): Promise<string | null> {
+  const deps = resolveDeps(r, seen);
+  if (!deps.length) return launchTask(r, project, opts);
+  seen.add(r.id);
+
+  const sequence = r.dependsOrder === "sequence";
+  dlog("info", `task ${r.id} · ${deps.length} dep${deps.length === 1 ? "" : "s"} (${sequence ? "sequence" : "parallel"})`);
+
+  const runDep = async (d: Runnable): Promise<boolean> => {
+    const id = await launchWithDeps(d, project, opts, new Set(seen));
+    if (!id) return false;
+    return (await waitForExit(id)) === 0;
+  };
+
+  const ok = sequence
+    // Sequential: stop at the first failure rather than running the rest.
+    ? await deps.reduce<Promise<boolean>>(async (prev, d) => (await prev) && runDep(d), Promise.resolve(true))
+    : (await Promise.all(deps.map(runDep))).every(Boolean);
+
+  if (!ok) {
+    toast(`${r.label}: a dependency failed — not running it`);
+    dlog("warn", `task ${r.id} skipped: dependency failed`);
+    return null;
+  }
+  return launchTask(r, project, opts);
+}
+
 // Re-running reuses nothing — it opens a fresh pane and closes the old one, so the
 // sidebar doesn't accumulate a row per attempt while the scrollback stays honest
 // about which attempt you're reading.
@@ -1317,13 +1376,16 @@ const lastRunnableById = new Map<string, Runnable>();
 // `trusted` is what lets the backend shell out to `just --dump` — which evaluates
 // the justfile. It takes all three of: the global toggle, the provider being on,
 // and this specific folder being one the user chose.
-async function discoverTasks(workdir: string, colorKey = workdir): Promise<Runnable[]> {
+async function discoverTasks(workdir: string, colorKey = workdir, includeHidden = false): Promise<Runnable[]> {
   const trusted = taskPrefs.introspect && taskPrefs.providers.includes("just") && (isTrusted(workdir) || isTrusted(colorKey));
   try {
-    const list = (await invoke<Runnable[]>("discover_runnables", { workdir, trusted }))
+    const all = (await invoke<Runnable[]>("discover_runnables", { workdir, trusted }))
       .filter((r) => taskPrefs.providers.includes(r.source as Provider));
-    for (const r of list) lastRunnableById.set(r.id, r);
-    return list;
+    // Resolve dependsOn against everything discovered, hidden or not — hiding a
+    // task from the picker shouldn't quietly break another task that needs it.
+    for (const r of all) lastRunnableById.set(r.id, r);
+    const hid = hiddenIds(colorKey);
+    return includeHidden ? all : all.filter((r) => !hid.includes(r.id));
   } catch (e) {
     dlog("warn", `discover failed (${workdir}): ${e}`);
     return [];
@@ -1365,7 +1427,7 @@ function submitInputPrompt() {
     vals[r.inputs[+el.dataset.n!].id] = el.value;
   });
   closeInputPrompt();
-  void launchTask(applyInputs(r, vals), project, opts);
+  void launchWithDeps(applyInputs(r, vals), project, opts);
 }
 
 /// Substitute collected values into every string that reaches the command line.
@@ -1927,7 +1989,8 @@ function sessionActions(s: Sess): PalItem[] {
 const PAL_CMDS: { key: string; label: string; glyph: string; run: () => void; sc?: string[] }[] = [
   { key: "cmd:add", label: "Add a project folder…", glyph: "＋", run: addProject },
   { key: "cmd:term", label: "Open a terminal in the current project", glyph: "❯", run: openPlainTerminal },
-  { key: "cmd:run", label: "Run a task in the current project…", glyph: "▶", run: () => { void openRunPicker(); } },
+  { key: "cmd:run", label: "Run a task in the current project…", glyph: "▶", run: () => { void openRunPicker(); }, sc: ["⌘", "⇧", "R"] },
+  { key: "cmd:tasks", label: "Manage this project's tasks…", glyph: "✎", run: () => { void openTaskManager(); } },
   { key: "cmd:settings", label: "Open settings…", glyph: "⚙", run: () => openSettings(), sc: ["⌘", ","] },
   { key: "cmd:sort", label: "Change the sidebar sort order", glyph: "≡", run: cycleSort },
   { key: "cmd:insp", label: "Toggle the inspector", glyph: "◨", run: toggleInsp, sc: ["⌘", "I"] },
@@ -1968,7 +2031,7 @@ function buildPalGroups(raw: string): PalGroup[] {
       const o = { colorKey: c.colorKey, worktree: c.worktree, branch: c.branch, discoveredIn: c.workdir };
       if (r.id === "just:__untrusted") { void askTrust(c.colorKey, c.project); return; }
       if (r.inputs.length) { openInputPrompt(r, c.project, o); return; }
-      void launchTask(r, c.project, o);
+      void launchWithDeps(r, c.project, o);
     },
   }));
   const launchCands: PalItem[] = FAVORITES.map((f) => ({ kind: "launch", key: "launch:" + f.path, label: `Launch ${f.name}`, labelHtml: esc(`Launch ${f.name}`), sub: tilde(f.path), sw: accentFor(f.path), icon: iconFor(f.path) || undefined, run: () => requestLaunch(f.name, f.path) }));
@@ -2247,6 +2310,10 @@ listen<{ sessionId: string; data: string }>("pty-output", (e) => {
 });
 listen<{ sessionId: string; code: number }>("pty-exit", (e) => {
   dlog("info", `pty-exit ${e.payload.sessionId.slice(0, 8)} · code ${e.payload.code}`);
+  // Release anything waiting on this pane before the early return below, so a
+  // dependency chain can never deadlock on a session that vanished.
+  const waiter = exitWaiters.get(e.payload.sessionId);
+  if (waiter) { exitWaiters.delete(e.payload.sessionId); waiter(e.payload.code); }
   const s = sessions.get(e.payload.sessionId); if (!s) return;
   const code = e.payload.code;
   s.attention = null;
@@ -2612,6 +2679,164 @@ function openPlainTerminal() {
   const branch = s ? s.branch : (e?.branch || "");
   launchShell(s ? s.project : basename(colorKey), wd, { colorKey, worktree, branch });
 }
+// ---------- the project tasks panel ----------
+// Manage what the picker shows. Two kinds of change live here and they persist to
+// different places on purpose: hiding a task is *yours* (localStorage), while a
+// task's command is the *project's* (.muster/tasks.toml, committable). Only
+// Muster's own file is ever written — a discovered VS Code task or justfile
+// belongs to another tool and stays read-only.
+
+const taskHidden: Record<string, string[]> = JSON.parse(localStorage.getItem("cc-task-hidden") || "{}");
+function saveHidden() { localStorage.setItem("cc-task-hidden", JSON.stringify(taskHidden)); }
+function hiddenIds(key: string): string[] { return taskHidden[key] || []; }
+function toggleHidden(key: string, id: string) {
+  const cur = hiddenIds(key);
+  taskHidden[key] = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+  if (!taskHidden[key].length) delete taskHidden[key];
+  saveHidden();
+}
+
+let mgrCtx: { project: string; colorKey: string; workdir: string } | null = null;
+let mgrList: Runnable[] = [];
+let mgrEdit: { id: string | null; label: string; run: string; group: string; background: boolean; cwd: string } | null = null;
+
+async function openTaskManager() {
+  const c = runTargetCtx();
+  if (!c) { toast("No active project"); return; }
+  mgrCtx = { project: c.project, colorKey: c.colorKey, workdir: c.workdir };
+  mgrEdit = null;
+  await refreshMgr();
+  $("mgrDlg").classList.add("show");
+  $("scrim").classList.add("show");
+}
+async function refreshMgr() {
+  if (!mgrCtx) return;
+  // Show hidden tasks too — this is the panel where you un-hide them.
+  mgrList = await discoverTasks(mgrCtx.workdir, mgrCtx.colorKey, true);
+  renderMgr();
+}
+function closeTaskManager() {
+  $("mgrDlg").classList.remove("show");
+  if (!$("palette").classList.contains("show") && !$("runPop").classList.contains("show")) $("scrim").classList.remove("show");
+  mgrCtx = null; mgrEdit = null;
+}
+
+function renderMgr() {
+  if (!mgrCtx) return;
+  const { colorKey, project } = mgrCtx;
+  $("mgrSub").textContent = project;
+
+  if (mgrEdit) { renderMgrForm(); return; }
+
+  const pins = pinnedIds(colorKey), hid = hiddenIds(colorKey);
+  $("mgrBody").innerHTML = mgrList.length
+    ? mgrList.map((r) => {
+        const own = r.source === "muster";   // only our own file is editable
+        return `<div class="mgr-row${hid.includes(r.id) ? " off" : ""}">
+          <span class="txt"><b>${esc(r.label)}</b><small>${esc(r.sourceFile)}${r.background ? " · bg" : ""}${r.blocked ? " · " + esc(r.blocked) : ""}</small></span>
+          <span class="mgr-acts">
+            <button class="mgr-b${pins.includes(r.id) ? " on" : ""}" data-pin="${esc(r.id)}" title="${pins.includes(r.id) ? "Unpin" : "Pin to the top of the picker"}">${pins.includes(r.id) ? "★" : "☆"}</button>
+            <button class="mgr-b" data-hide="${esc(r.id)}" title="${hid.includes(r.id) ? "Show in the picker" : "Hide from the picker"}">${hid.includes(r.id) ? "◌" : "◎"}</button>
+            ${own ? `<button class="mgr-b" data-edit="${esc(r.id)}" title="Edit in .muster/tasks.toml">✎</button>
+                     <button class="mgr-b danger" data-del="${esc(r.id)}" title="Delete from .muster/tasks.toml">✕</button>`
+                  : `<button class="mgr-b quiet" disabled title="${esc(r.sourceFile)} belongs to another tool — Muster only writes its own file">read-only</button>`}
+          </span>
+        </div>`;
+      }).join("")
+    : `<div class="run-empty">No tasks found in this project.</div>`;
+
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-pin]").forEach((el) =>
+    el.addEventListener("click", () => { togglePin(colorKey, el.dataset.pin!); renderMgr(); }));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-hide]").forEach((el) =>
+    el.addEventListener("click", () => { toggleHidden(colorKey, el.dataset.hide!); renderMgr(); }));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-edit]").forEach((el) =>
+    el.addEventListener("click", () => startMgrEdit(el.dataset.edit!)));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-del]").forEach((el) =>
+    el.addEventListener("click", () => void deleteMgrTask(el.dataset.del!)));
+}
+
+function startMgrEdit(id: string | null) {
+  const r = id ? mgrList.find((x) => x.id === id) : null;
+  mgrEdit = r
+    ? { id: r.id, label: r.label, run: r.exec.mode === "shell" ? r.exec.line : execCmd(r), group: r.group ?? "", background: r.background, cwd: "" }
+    : { id: null, label: "", run: "", group: "", background: false, cwd: "" };
+  renderMgr();
+}
+
+function renderMgrForm() {
+  const e = mgrEdit!;
+  $("mgrBody").innerHTML = `
+    <div class="in-field"><label class="in-lbl">Label</label>
+      <input class="in-ctl" id="mgrLabel" value="${esc(e.label)}" placeholder="Dev server" spellcheck="false" /></div>
+    <div class="in-field"><label class="in-lbl">Command<span class="in-id">runs in a login shell</span></label>
+      <input class="in-ctl" id="mgrRun" value="${esc(e.run)}" placeholder="pnpm tauri dev" spellcheck="false" /></div>
+    <div class="in-field"><label class="in-lbl">Working directory<span class="in-id">optional · relative</span></label>
+      <input class="in-ctl" id="mgrCwd" value="${esc(e.cwd)}" placeholder="src-tauri" spellcheck="false" /></div>
+    <div class="in-field"><label class="in-lbl">Group</label>
+      <span class="s-ctl">${["", "build", "test", "run", "check", "clean"].map((g) =>
+        `<button class="opt${g === e.group ? " on" : ""}" data-group="${g}">${g || "none"}</button>`).join("")}</span></div>
+    <div class="in-field"><label class="in-lbl">Long-running<span class="in-id">a server or watcher, never “done”</span></label>
+      <span class="s-ctl"><button class="opt${e.background ? " on" : ""}" data-bg="1">background</button></span></div>`;
+
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-group]").forEach((el) =>
+    el.addEventListener("click", () => { mgrEdit!.group = el.dataset.group!; syncMgrForm(); renderMgr(); }));
+  $("mgrBody").querySelector("[data-bg]")?.addEventListener("click", () => {
+    mgrEdit!.background = !mgrEdit!.background; syncMgrForm(); renderMgr();
+  });
+  ($("mgrLabel") as HTMLInputElement).focus();
+}
+// Keep typed text when a click re-renders the form.
+function syncMgrForm() {
+  if (!mgrEdit) return;
+  mgrEdit.label = ($("mgrLabel") as HTMLInputElement).value;
+  mgrEdit.run = ($("mgrRun") as HTMLInputElement).value;
+  mgrEdit.cwd = ($("mgrCwd") as HTMLInputElement).value;
+}
+
+async function saveMgrTask() {
+  if (!mgrCtx || !mgrEdit) return;
+  syncMgrForm();
+  const e = mgrEdit;
+  if (!e.label.trim() || !e.run.trim()) { toast("A task needs a label and a command"); return; }
+
+  // Creating .muster/tasks.toml puts a new committable file in someone's repo —
+  // that's a side effect worth asking about once, not something to do silently.
+  const [path, exists] = await invoke<[string, boolean]>("muster_tasks_file", { workdir: mgrCtx.workdir });
+  if (!exists) {
+    const ok = await ask(
+      `Muster will create ${tilde(path)}.\n\nIt's a normal file in your repo — commit it and your team gets these tasks too, in any editor.`,
+      { title: "Create .muster/tasks.toml?", kind: "info", okLabel: "Create", cancelLabel: "Cancel" });
+    if (!ok) return;
+  }
+  try {
+    // Discovery ids are namespaced ("muster:dev"); the file addresses the bare slug.
+    await invoke("save_muster_task", {
+      workdir: mgrCtx.workdir,
+      id: e.id ? e.id.replace(/^muster:/, "") : null,
+      task: { label: e.label.trim(), run: e.run.trim(), group: e.group || null, background: e.background, cwd: e.cwd.trim() || null },
+    });
+    toast(e.id ? `Updated ${e.label}` : `Added ${e.label}`);
+    mgrEdit = null;
+    await refreshMgr();
+  } catch (err) {
+    toast("save failed: " + err);
+    dlog("error", `save_muster_task: ${err}`);
+  }
+}
+
+async function deleteMgrTask(id: string) {
+  if (!mgrCtx) return;
+  const r = mgrList.find((x) => x.id === id);
+  const ok = await ask(`Delete “${r?.label ?? id}” from .muster/tasks.toml?`, {
+    title: "Delete task?", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel",
+  });
+  if (!ok) return;
+  try {
+    await invoke("delete_muster_task", { workdir: mgrCtx.workdir, id: id.replace(/^muster:/, "") });
+    await refreshMgr();
+  } catch (err) { toast("delete failed: " + err); }
+}
+
 // ---------- the ▶ Run picker ----------
 // A popover over the stage, grouped by source so it's obvious where each task came
 // from. Blocked runnables stay visible but greyed: hiding them reads as "Muster
@@ -2720,7 +2945,7 @@ function pickRun(pin: boolean) {
   bumpFrec("task:" + r.id);
   const o = { colorKey: ctx.colorKey, worktree: ctx.worktree, branch: ctx.branch, discoveredIn: ctx.workdir };
   if (r.inputs.length) { openInputPrompt(r, ctx.project, o); return; }
-  void launchTask(r, ctx.project, o);
+  void launchWithDeps(r, ctx.project, o);
 }
 
 // Trusting a folder means Muster may execute code from it to enumerate tasks, so
@@ -2850,6 +3075,15 @@ $("inBody").addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.preventDefault(); closeInputPrompt(); }
 });
 $("setClose").addEventListener("click", closeSettings);
+$("mgrClose").addEventListener("click", closeTaskManager);
+$("mgrNew").addEventListener("click", () => startMgrEdit(null));
+$("mgrSave").addEventListener("click", () => { void saveMgrTask(); });
+$("mgrBack").addEventListener("click", () => { mgrEdit = null; renderMgr(); });
+$("mgrOpen").addEventListener("click", () => {
+  if (mgrCtx) void invoke<[string, boolean]>("muster_tasks_file", { workdir: mgrCtx.workdir })
+    .then(([path]) => openUrl("file://" + path))
+    .catch((e) => toast("open failed: " + e));
+});
 $("runInput").addEventListener("input", () => { runSel = 0; renderRunPicker(($("runInput") as HTMLInputElement).value); });
 $("runInput").addEventListener("keydown", (e) => {
   const meta = e.metaKey || e.ctrlKey;
@@ -2857,7 +3091,7 @@ $("runInput").addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown") { e.preventDefault(); runSel = Math.min(runSel + 1, flat.length - 1); renderRunPicker(($("runInput") as HTMLInputElement).value); }
   else if (e.key === "ArrowUp") { e.preventDefault(); runSel = Math.max(runSel - 1, 0); renderRunPicker(($("runInput") as HTMLInputElement).value); }
   else if (e.key === "Enter") { e.preventDefault(); pickRun(meta); }
-  else if (meta && e.key.toLowerCase() === "r") { e.preventDefault(); void openRunPicker(); }
+  else if (meta && e.shiftKey && e.key.toLowerCase() === "r") { e.preventDefault(); void openRunPicker(); }
   else if (e.key === "Escape") { e.preventDefault(); closeRunPicker(); }
 });
 $("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
@@ -2867,7 +3101,7 @@ $("wtGo").addEventListener("click", wtCreate);
 $("wtCancel").addEventListener("click", closeWt);
 $("wtMain").addEventListener("click", () => { if (!wtCtx) return; const { project, repoDir } = wtCtx; closeWt(); launch(project, repoDir, { colorKey: repoDir }); });
 $("wtBranch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); wtCreate(); } else if (e.key === "Escape") closeWt(); });
-$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); closeRunPicker(); closeInputPrompt(); closeSettings(); });
+$("scrim").addEventListener("click", () => { closePalette(); closeWt(); closeDiff(); closeRunPicker(); closeInputPrompt(); closeSettings(); closeTaskManager(); });
 $("diffClose").addEventListener("click", closeDiff);
 // Collapse / expand a file section by clicking its header.
 $("diffBody").addEventListener("click", (e) => {
@@ -2901,9 +3135,10 @@ window.addEventListener("keydown", (e) => {
   else if (meta && e.key === "-") { e.preventDefault(); bumpFont(-0.5); }
   else if (meta && e.key === "0") { e.preventDefault(); termFontSize = 12.5; applyFontSize(); toast("Terminal font 12.5px"); }
   else if (meta && e.key === ",") { e.preventDefault(); $("setDlg").classList.contains("show") ? closeSettings() : openSettings(); }
-  else if (meta && e.key.toLowerCase() === "r" && !$("runPop").classList.contains("show")) { e.preventDefault(); void openRunPicker(); }
+  else if (meta && e.shiftKey && e.key.toLowerCase() === "r") { e.preventDefault(); void openRunPicker(); }
   else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
   else if (e.key === "Escape" && $("setDlg").classList.contains("show")) { e.preventDefault(); closeSettings(); }
+  else if (e.key === "Escape" && $("mgrDlg").classList.contains("show")) { e.preventDefault(); if (mgrEdit) { mgrEdit = null; renderMgr(); } else closeTaskManager(); }
 });
 new ResizeObserver(() => refit()).observe($("terminals"));
 

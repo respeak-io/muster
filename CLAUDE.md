@@ -41,7 +41,8 @@ Two hard constraints shape this code:
 
 Muster runs the task definitions a project already ships. A **`Runnable`** is one
 such definition. Providers: `.muster/tasks.toml` (Muster's own committable
-format), `.vscode/tasks.json`, `package.json` scripts, `justfile`, `Makefile`.
+format), `.vscode/tasks.json`, `.vscode/launch.json`, `package.json` scripts,
+`justfile`, `Taskfile.yml`, `mise.toml`, `Makefile`, `Cargo.toml`.
 Discovery is in `tasks.rs`; execution reuses the existing PTY path, because **a
 task run is just another `Sess`** — see the `kind` discriminant below. That's what
 buys tasks the phase state machine, sidebar glyphs, attention badge, tray and
@@ -56,8 +57,9 @@ Three rules constrain `tasks.rs`:
   `discover(root, trusted)`, where the frontend grants `trusted` only if the
   global introspect toggle is on, the `just` provider is enabled, *and* the
   folder is one the user chose (a `cc-favorites` project, or a one-time confirm
-  stored in `cc-trusted`). An untrusted justfile yields a single blocked row, so
-  the recipes read as withheld rather than missing. Makefiles are parsed
+  stored in `cc-trusted`). `just`, `task` and `mise` all go through the shared
+  `Introspector` shape; untrusted, each yields a single blocked row, so its tasks
+  read as withheld rather than missing. Makefiles and Cargo are parsed/inferred
   statically for exactly this reason — `make -qp` would expand `$(shell …)`.
 - **Ids are stable and namespaced** (`npm:test`, `vscode:build`, `just:deploy`).
   Pins (`cc-task-pins`) and palette frecency key off them, so they must survive a
@@ -65,13 +67,24 @@ Three rules constrain `tasks.rs`:
 - **What can't run says so.** `blocked: Some(reason)` renders greyed in the
   picker instead of being dropped — a missing row reads as "Muster didn't find my
   task". VS Code tasks are blocked when they need an editor (`${file}`,
-  `${lineNumber}`), use `dependsOn` (running half of it silently is worse than
-  declining), or have an unsupported `type`. Supported variables:
+  `${lineNumber}`) or have an unsupported `type`. Supported variables:
   `workspaceFolder`, `workspaceFolderBasename`, `cwd`, `userHome`,
   `pathSeparator`, `env:X`. `${input:X}` is deliberately **left intact** by
   discovery — only the frontend knows the answer, so it prompts (`openInputPrompt`)
   and substitutes via `applyInputs` just before launch. just recipe parameters
   without defaults become the same kind of prompt.
+
+`dependsOn` is resolved **in the frontend** (`launchWithDeps`), because only the
+side that owns the panes can wait on an exit code. Dependencies are named by
+*label*, run in parallel unless `dependsOrder: "sequence"` (VS Code's default,
+surprising as it is), and a failed dependency stops the chain. `waitForExit`
+resolves from the `pty-exit` listener *before* its early return, and
+`closeSession` resolves it with `-1`, so a chain can never deadlock on a pane
+that went away.
+
+`launch.json` configs are offered as **run without debugging** (VS Code's ⌃F5).
+Muster has no debug adapter, so `request: "attach"` and compound configs are
+blocked rather than silently started as plain processes.
 
 `spawn_task` is the third PTY entry point after `spawn_claude` / `spawn_shell`.
 It takes a `TaskSpec { exec, cwd, env }` — a resolved subset of a `Runnable` — and
@@ -97,18 +110,28 @@ which providers to scan, trust) rather than hardcoding them — and it finally
 gives `wtGroup` a control, which until now was reachable only as
 `musterWtGroup()` in the console.
 
-Task preferences live in `cc-task-prefs`; trust in `cc-trusted`. The split is
-deliberate and worth preserving: **personal preference → `localStorage`;
-project fact → `.muster/tasks.toml`**, which is committable and works for a
-colleague who never opens Muster. Muster never rewrites a file it didn't create,
-so editing a discovered VS Code task should become an *override* in
-`tasks.toml`, not a mutation of `.vscode/tasks.json`.
+Task preferences live in `cc-task-prefs`, pins in `cc-task-pins`, hidden tasks in
+`cc-task-hidden`, trust in `cc-trusted`. The split is deliberate and worth
+preserving: **personal preference → `localStorage`; project fact →
+`.muster/tasks.toml`**, which is committable and works for a colleague who never
+opens Muster.
+
+## Project tasks panel (`openTaskManager`)
+
+Pin / hide / create / edit / delete, reached from ⌘K. **`.muster/tasks.toml` is
+the only file Muster writes** — a discovered VS Code task or justfile belongs to
+another tool and is read-only in the panel (editing one should become an
+*override* in `tasks.toml`, never a mutation of `.vscode/tasks.json`). Writes go
+through `toml_edit`, not a serialize-the-whole-struct round trip, so a
+hand-written file keeps its comments, ordering and spacing — there's a test for
+exactly that. Creating the file for the first time asks, because a new
+committable file in someone's repo is a real side effect.
 
 ## Backend (`src-tauri/src/lib.rs`)
 
 `main.rs` only calls `muster_lib::run()`; `tasks.rs` holds runnable discovery. `AppState` holds the telemetry `port`, a `sessions: HashMap<session_id, Session>` (each = PTY master + writer + child killer), and the held-open `pending` permission requests.
 
-- **PTY** via `portable-pty`. `spawn_claude` opens a PTY, spawns claude, and (via the shared `stream_pty_session` helper) starts two threads: a reader that base64-encodes output into `pty-output` events, and a reaper that removes the session and emits `pty-exit`. `write_pty` / `resize_pty` / `kill_session` operate by session_id. `spawn_shell` reuses the same path to run a plain login shell (no Claude, no instrumentation) in an embedded pane — the `❯ Terminal` button opens one when the launch engine is embedded (else it opens an external terminal via `open_terminal_here`). Shell panes carry `shell:true` on the frontend `Sess` and skip telemetry/cost.
+- **PTY** via `portable-pty`. `spawn_claude` opens a PTY, spawns claude, and (via the shared `stream_pty_session` helper) starts two threads: a reader that base64-encodes output into `pty-output` events, and a reaper that removes the session and emits `pty-exit`. `write_pty` / `resize_pty` / `kill_session` operate by session_id. `spawn_shell` reuses the same path to run a plain login shell (no Claude, no instrumentation) in an embedded pane — the `❯ Terminal` button opens one when the launch engine is embedded (else it opens an external terminal via `open_terminal_here`). Shell panes carry `kind:"shell"` on the frontend `Sess` and skip telemetry/cost; `spawn_task` is the third entry point (see Runnables above).
 - **Telemetry server** (`run_telemetry_server`) forwards `/hook` and `/statusline` POSTs as one `telemetry` event each; `/permission` is the blocking path described above.
 - Commands are registered in the `invoke_handler![...]` list at the bottom of `run()` — add new `#[tauri::command]` fns there.
 
