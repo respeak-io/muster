@@ -4127,7 +4127,9 @@ function renderSetControl(c: SetControl): string {
   }
   if (c.kind === "toggle") {
     const on = c.on();
-    return `<div class="set-group set-inline">${head}` +
+    // The label and hint have to be one block, or the row lays them out as two
+    // flex siblings of the switch and the whole group centres itself.
+    return `<div class="set-group set-inline"><div class="set-itxt">${head}</div>` +
       `<button class="sw${on ? " on" : ""}" data-set="${c.set}" data-val="${on ? "0" : "1"}" role="switch" aria-checked="${on}"></button></div>`;
   }
   if (c.kind === "multi") {
@@ -4808,6 +4810,11 @@ function renderMgr() {
   const { colorKey, project } = mgrCtx;
   $("mgrSub").textContent = project;
 
+  const editing = !!mgrEdit;
+  ($("mgrBack") as HTMLButtonElement).hidden = !editing;
+  ($("mgrSave") as HTMLButtonElement).hidden = !editing;
+  ($("mgrNew") as HTMLButtonElement).hidden = editing;
+  ($("mgrOpen") as HTMLButtonElement).hidden = editing;
   if (mgrEdit) { renderMgrForm(); return; }
 
   const pins = pinnedIds(colorKey), hid = hiddenIds(colorKey);

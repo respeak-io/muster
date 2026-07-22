@@ -3504,6 +3504,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `spawn_task` hands `Exec::Shell` to a *login* shell so a task inherits the
+    /// PATH and version-manager shims the user's own terminal has. That argument
+    /// construction is the fragile part — `-l -c` vs `-lc` vs `/C` differs per
+    /// shell, and getting it wrong fails only at runtime, in a PTY, where nothing
+    /// else in this suite would notice. Exit codes matter as much as output: a
+    /// run's exit code *is* its phase in the UI.
+    #[test]
+    fn login_shell_runs_a_command_and_reports_its_exit_code() {
+        let (shell, args) = task_shell();
+        let run = |line: &str| {
+            std::process::Command::new(&shell)
+                .args(&args)
+                .arg(line)
+                .output()
+                .expect("login shell should be spawnable")
+        };
+
+        let ok = run("echo muster-task-ok");
+        assert!(ok.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "muster-task-ok");
+
+        // Non-zero must survive to the caller — the frontend turns it into `error`.
+        let bad = run("exit 3");
+        assert_eq!(bad.status.code(), Some(3));
+
+        // Shell syntax has to actually reach a shell, not be treated as one argv.
+        let piped = run("printf 'a\\nb\\n' | wc -l | tr -d ' '");
+        assert_eq!(String::from_utf8_lossy(&piped.stdout).trim(), "2");
+    }
+
     #[test]
     fn git_diff_returns_none_outside_a_repo() {
         let dir = scratch_dir();

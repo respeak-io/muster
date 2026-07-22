@@ -568,7 +568,11 @@ body { overflow: hidden; font-family: var(--font-ui); color: var(--text); backgr
 .tacts { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 12px; }
 .tact { font: 10.5px var(--font-ui); border: 1px solid var(--hair-strong); border-radius: 7px; padding: 5px 9px; background: var(--surface); color: var(--muted); cursor: pointer; text-align: left; }
 .tact:hover { background: var(--surface-2); color: var(--text); }
-.tact.hero { border-color: var(--accent-line); color: var(--accent-ink); width: 100%; }
+.tact { white-space: nowrap; }
+.tact.hero { border-color: var(--accent-line); color: var(--accent-ink); }
+/* Full width only in the inspector's action stack — in the task panel's footer
+   this same class sits in a flex row, where 100% stretches it across everything. */
+.tacts .tact.hero { width: 100%; }
 .tact.hero:hover { background: var(--accent-wash); }
 .ext-meta .mono.ok { color: var(--st-done); }
 .ext-meta .mono.bad { color: var(--st-error); }
@@ -590,7 +594,8 @@ select.in-ctl { cursor: pointer; }
 /* Chip picker + inline switch — the two control kinds the Tasks tab adds to the
    settings window. `seg` picks one of N; these cover "toggle several" and "on/off". */
 .set-inline { flex-direction: row; align-items: center; justify-content: space-between; gap: 16px; }
-.set-inline .set-glabel, .set-inline .set-hint { max-width: 40ch; }
+.set-itxt { flex: 1; min-width: 0; }
+.set-inline .set-hint { margin-bottom: 0; }
 .set-inline > .sw { flex: none; }
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip-opt { display: inline-flex; align-items: center; gap: 5px; font: 11px var(--font-ui); border: 1px solid var(--hair-strong); border-radius: 7px; padding: 4px 9px; color: var(--muted); background: var(--surface); cursor: pointer; }
