@@ -4333,7 +4333,6 @@ $("btnNew").addEventListener("click", () => {
   const c = activeProjectCtx();
   if (c) requestLaunch(c.project, c.path); else openPalette();
 });
-$("btnWorktree").addEventListener("click", () => { const c = activeProjectCtx(); if (!c) { toast("No active session"); return; } openWt(c.project, c.path); });
 $("btnTerm").addEventListener("click", openPlainTerminal);
 $("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
 $("fEngineSeg").addEventListener("click", (e) => { e.stopPropagation(); $("enginePop").classList.contains("show") ? closeEnginePop() : openEnginePopover(); });
