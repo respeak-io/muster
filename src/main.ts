@@ -1624,23 +1624,34 @@ function renderShellInspector(s: Sess) {
 // in .muster/tasks.toml, which is committable — the split is what keeps a shared
 // repo working for a colleague who never opens Muster.
 
-const ALL_PROVIDERS = ["muster", "vscode", "npm", "just", "make"] as const;
+// Must list every `source` the backend can emit (see tasks.rs `discover`): anything
+// missing here is discovered and then silently filtered out of the picker.
+const ALL_PROVIDERS = ["muster", "vscode", "launch", "npm", "just", "taskfile", "mise", "make", "cargo"] as const;
 type Provider = (typeof ALL_PROVIDERS)[number];
 const PROVIDER_LABEL: Record<Provider, string> = {
-  muster: ".muster", vscode: ".vscode", npm: "package.json", just: "justfile", make: "Makefile",
+  muster: ".muster", vscode: "tasks.json", launch: "launch.json", npm: "package.json",
+  just: "justfile", taskfile: "Taskfile", mise: "mise", make: "Makefile", cargo: "cargo",
 };
 
 interface TaskPrefs {
   providers: Provider[];
+  /// Providers that existed when this was last saved. One added later isn't in the
+  /// stored `providers` array either, and without this we couldn't tell "the user
+  /// switched it off" from "it didn't exist yet".
+  known: Provider[];
   introspect: boolean;        // may a trusted project be *run* to enumerate itself?
   cwd: "session" | "root";    // which directory a run inherits
   dismissMs: number;          // 0 = never auto-dismiss a green run
   attention: boolean;         // does a failed run raise the badge?
 }
 const DEFAULT_TASK_PREFS: TaskPrefs = {
-  providers: [...ALL_PROVIDERS], introspect: true, cwd: "session", dismissMs: 20000, attention: true,
+  providers: [...ALL_PROVIDERS], known: [...ALL_PROVIDERS], introspect: true, cwd: "session", dismissMs: 20000, attention: true,
 };
 const taskPrefs: TaskPrefs = { ...DEFAULT_TASK_PREFS, ...JSON.parse(localStorage.getItem("cc-task-prefs") || "{}") };
+for (const p of ALL_PROVIDERS) {
+  if (!taskPrefs.known.includes(p)) taskPrefs.providers = [...taskPrefs.providers, p];
+}
+taskPrefs.known = [...ALL_PROVIDERS];
 function saveTaskPrefs() { localStorage.setItem("cc-task-prefs", JSON.stringify(taskPrefs)); renderAll(); }
 
 // Folders the user has explicitly allowed Muster to introspect. Adding a folder as
@@ -4948,6 +4959,7 @@ async function deleteMgrTask(id: string) {
 let runCtx: { project: string; colorKey: string; worktree: string | null; branch: string; workdir: string } | null = null;
 let runList: Runnable[] = [];
 let runSel = 0;
+let runSource: string | null = null;   // jump-bar filter; null = every source
 
 function runTargetCtx() {
   const wd = activeCwd();
@@ -4969,6 +4981,7 @@ async function openRunPicker() {
   runCtx = { project: c.project, colorKey: c.colorKey, worktree: c.worktree, branch: c.branch, workdir: c.workdir };
   runList = await discoverTasks(c.workdir, c.colorKey);
   runSel = 0;
+  runSource = null;
   $("runSub").textContent = `${c.project}${c.worktree ? " · ⑃ " + c.branch : ""} · ${tilde(c.workdir)}`;
   const pop = $("runPop");
   pop.classList.add("show");
@@ -4985,33 +4998,92 @@ function closeRunPicker() {
 }
 
 // Pinned first (they're the ones you run fifty times a day), then by source.
-function runGroups(term: string): { name: string; items: Runnable[] }[] {
+// Short chip labels for the jump bar. Group headers use the Runnable's own
+// sourceFile instead, which is authoritative — it's the file discovery actually
+// found, so ".vscode/tasks.json" and ".vscode/launch.json" name themselves, and a
+// repo with `Justfile` doesn't get told it has a `justfile`.
+const sourceShort = (r: Runnable) => PROVIDER_LABEL[r.source as Provider] || r.source;
+
+function runMatches(term: string): Runnable[] {
   const t = term.trim().toLowerCase();
   const match = (r: Runnable) => !t || r.label.toLowerCase().includes(t) || execCmd(r).toLowerCase().includes(t) || (r.group || "").includes(t);
-  const list = runList.filter(match);
+  return runList.filter(match);
+}
+
+/// The jump bar: every source present under the current search, with its count.
+/// Built from the search results rather than the whole list, so a chip never
+/// promises rows the current term has filtered away.
+function runSources(term: string): { src: string; short: string; count: number }[] {
+  const out: { src: string; short: string; count: number }[] = [];
+  for (const r of runMatches(term)) {
+    const hit = out.find((o) => o.src === r.source);
+    if (hit) hit.count++;
+    else out.push({ src: r.source, short: sourceShort(r), count: 1 });
+  }
+  return out;
+}
+
+function runGroups(term: string): { name: string; sub?: string; items: Runnable[] }[] {
+  const list = runMatches(term).filter((r) => !runSource || r.source === runSource);
   const pins = runCtx ? pinnedIds(runCtx.colorKey) : [];
-  const groups: { name: string; items: Runnable[] }[] = [];
-  const pinned = list.filter((r) => pins.includes(r.id));
+  const groups: { name: string; sub?: string; items: Runnable[] }[] = [];
+  // Pinned float to the top, but only in the unfiltered view — inside a single
+  // source, splitting two of its own rows into a separate block just hides them.
+  const pinned = runSource ? [] : list.filter((r) => pins.includes(r.id));
   if (pinned.length) groups.push({ name: "pinned", items: pinned });
   const bySource = new Map<string, Runnable[]>();
   for (const r of list) {
-    if (pins.includes(r.id)) continue;
+    if (pinned.includes(r)) continue;
     if (!bySource.has(r.source)) bySource.set(r.source, []);
     bySource.get(r.source)!.push(r);
   }
-  const SOURCE_LABEL: Record<string, string> = { muster: ".muster/tasks.toml", npm: "package.json" };
-  for (const [src, items] of bySource) groups.push({ name: SOURCE_LABEL[src] || src, items });
+  for (const [, items] of bySource) {
+    groups.push({ name: items[0].sourceFile || sourceShort(items[0]), sub: String(items.length), items });
+  }
   return groups;
 }
 
+function renderRunTabs(term: string) {
+  const srcs = runSources(term);
+  const bar = $("runTabs");
+  // One source is not a choice — the bar would just be a label taking up a row.
+  bar.hidden = srcs.length < 2;
+  if (bar.hidden) return;
+  const total = srcs.reduce((n, s2) => n + s2.count, 0);
+  bar.innerHTML =
+    `<button class="run-tab${runSource === null ? " on" : ""}" data-src="">All<span class="n">${total}</span></button>` +
+    srcs.map((s2) =>
+      `<button class="run-tab${runSource === s2.src ? " on" : ""}" data-src="${esc(s2.src)}">${esc(s2.short)}<span class="n">${s2.count}</span></button>`).join("");
+  bar.querySelectorAll<HTMLElement>("[data-src]").forEach((el) =>
+    el.addEventListener("click", () => setRunSource(el.dataset.src || null)));
+}
+
+function setRunSource(src: string | null) {
+  runSource = src;
+  runSel = 0;
+  renderRunPicker(($("runInput") as HTMLInputElement).value);
+  ($("runInput") as HTMLInputElement).focus();
+}
+
+/// Tab / ⇧Tab step through the jump bar — the keyboard equivalent of clicking a
+/// chip, so the whole picker stays reachable without the mouse.
+function cycleRunSource(dir: 1 | -1) {
+  const srcs = runSources(($("runInput") as HTMLInputElement).value);
+  if (srcs.length < 2) return;
+  const order: (string | null)[] = [null, ...srcs.map((s2) => s2.src)];
+  const i = order.indexOf(runSource);
+  setRunSource(order[(i + dir + order.length) % order.length]);
+}
+
 function renderRunPicker(term: string) {
+  renderRunTabs(term);
   const groups = runGroups(term);
   const flat = groups.flatMap((g) => g.items);
   if (runSel >= flat.length) runSel = Math.max(0, flat.length - 1);
   const body = $("runList");
   if (!flat.length) {
     body.innerHTML = runList.length
-      ? `<div class="run-empty">Nothing matches “${esc(term)}”.</div>`
+      ? `<div class="run-empty">Nothing matches${term ? ` “${esc(term)}”` : ""}${runSource ? ` in ${esc(PROVIDER_LABEL[runSource as Provider] || runSource)}` : ""}.</div>`
       : `<div class="run-empty">No tasks found in this project.<br><span class="dim">Muster reads <code>package.json</code> scripts and <code>.muster/tasks.toml</code>.</span></div>`;
     return;
   }
@@ -5027,7 +5099,7 @@ function renderRunPicker(term: string) {
         <span class="end">${r.blocked ? esc(r.blocked) : r.background ? "bg" : pinned ? "★" : ""}</span>
       </div>`;
     }).join("");
-    return `<div class="run-grp">${esc(g.name)}</div>${rows}`;
+    return `<div class="run-grp">${esc(g.name)}${g.sub ? `<span class="n">${esc(g.sub)}</span>` : ""}</div>${rows}`;
   }).join("");
   body.querySelectorAll<HTMLElement>(".run-row").forEach((el) => {
     el.addEventListener("click", () => { runSel = +el.dataset.i!; pickRun(false); });
@@ -5197,6 +5269,7 @@ $("runInput").addEventListener("keydown", (e) => {
   else if (e.key === "ArrowUp") { e.preventDefault(); runSel = Math.max(runSel - 1, 0); renderRunPicker(($("runInput") as HTMLInputElement).value); }
   else if (e.key === "Enter") { e.preventDefault(); pickRun(meta); }
   else if (meta && e.shiftKey && e.key.toLowerCase() === "r") { e.preventDefault(); void openRunPicker(); }
+  else if (e.key === "Tab") { e.preventDefault(); cycleRunSource(e.shiftKey ? -1 : 1); }
   else if (e.key === "Escape") { e.preventDefault(); closeRunPicker(); }
 });
 $("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
