@@ -138,8 +138,8 @@ function setWtGroup(m: WtGroup) {
   localStorage.setItem("cc-worktree-group", wtGroup);
   renderAll();
 }
-// Dev affordance until the settings window ships: musterWtGroup("chip") in the console.
-(window as unknown as { musterWtGroup: typeof setWtGroup }).musterWtGroup = setWtGroup;
+// Dev affordance until the settings window ships: episkoWtGroup("chip") in the console.
+(window as unknown as { episkoWtGroup: typeof setWtGroup }).episkoWtGroup = setWtGroup;
 // While a project group is being dragged, renderSidebar() must not rebuild the
 // #projects DOM — doing so would destroy the node the browser is dragging,
 // killing the drop. Telemetry ticks call renderAll() constantly, so this guard
@@ -342,7 +342,7 @@ function onRlUpdate(win: RlWin, prevPct: number | null, prevReset: number | null
   maybeMidSnap(win, newReset);
 }
 
-// Claude Code sessions started OUTSIDE Muster (a plain terminal, an IDE). We
+// Claude Code sessions started OUTSIDE Episko (a plain terminal, an IDE). We
 // discover them from ~/.claude/sessions/<pid>.json (via the backend), show them
 // in the sidebar as read-only, and can jump to their terminal window.
 interface ExtSession {
@@ -355,7 +355,7 @@ interface ExtSession {
 let externals: ExtSession[] = [];
 
 // ---------- restorable sessions ----------
-// Muster's launch uuid IS Claude's --session-id, so every session we launch already
+// Episko's launch uuid IS Claude's --session-id, so every session we launch already
 // has a transcript at ~/.claude/projects/<enc(workdir)>/<id>.jsonl. Restoring is
 // therefore not about capturing conversation state — Claude already has it — but
 // about remembering which sessions were on screen at quit, and with what identity.
@@ -369,7 +369,7 @@ interface Restorable {
 }
 let dormants: Restorable[] = [];
 
-// The roster is "what was open when Muster last closed". Closing a session removes
+// The roster is "what was open when Episko last closed". Closing a session removes
 // it — an explicit close means done, so only survivors come back. Shell panes are
 // excluded: a login shell has no transcript and nothing to resume.
 function rosterEntry(s: Sess): Restorable {
@@ -399,7 +399,7 @@ function queueRosterSave() {
   rosterTimer = window.setTimeout(flushRoster, 1500);
 }
 function flushRoster() { clearTimeout(rosterTimer); rosterSavedAt = Date.now(); saveRoster(); }
-// The stage shows exactly ONE thing: a live Muster session (activeId), a live
+// The stage shows exactly ONE thing: a live Episko session (activeId), a live
 // external session mirrored read-only, or a dormant session restorable from a past
 // run. Holding the two read-only kinds in a single discriminated pointer — rather
 // than a flag per kind — is what stops them fighting over the stage on the next
@@ -591,7 +591,7 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
   let term: Terminal | undefined;
   let fit: FitAddon | undefined;
   if (external) {
-    pane.innerHTML = `<div class="ext-pane"><div class="ext-logo"></div><h2>Running in ${esc(eng.label)}</h2><p>${esc(project)}${opts.worktree ? " · " + esc(opts.worktree) : ""} — the terminal is in your ${esc(eng.label)} window.<br>Muster still tracks its status, cost &amp; context here.</p></div>`;
+    pane.innerHTML = `<div class="ext-pane"><div class="ext-logo"></div><h2>Running in ${esc(eng.label)}</h2><p>${esc(project)}${opts.worktree ? " · " + esc(opts.worktree) : ""} — the terminal is in your ${esc(eng.label)} window.<br>Episko still tracks its status, cost &amp; context here.</p></div>`;
   } else {
     term = new Terminal({
       fontFamily: MONO, fontSize: termFontSize, cursorBlink: true, scrollback: 8000,
@@ -671,7 +671,7 @@ async function addProject() {
   addProjectPath(dir);
 }
 // Pin a folder to the sidebar. Also reachable from the context menu of a folder
-// Muster knows about but hasn't been asked to keep (an external session's cwd).
+// Episko knows about but hasn't been asked to keep (an external session's cwd).
 function addProjectPath(dir: string) {
   if (FAVORITES.some((f) => f.path === dir)) { toast("Already a project"); return; }
   FAVORITES.push({ name: basename(dir), path: dir });
@@ -790,7 +790,7 @@ async function refreshExternals() {
         mirror = { kind: "ext", id: e.session_id, pid: e.pid };
         renderExtHeader(e); renderExtInspector(e);
       } else {
-        // Truly gone — fall back to a Muster session or the empty state.
+        // Truly gone — fall back to an Episko session or the empty state.
         closeExternalView();
         const next = orderedSessions()[0];
         if (next) setActive(next.id);
@@ -875,7 +875,7 @@ function renderPastInspector(d: Restorable) {
   const pill = $("iPill"); pill.className = "pill idle";
   $("iPillTxt").textContent = "not running";
   const action = busy
-    ? `<div class="ext-note warn">This session is running right now — in Muster or another terminal. Resuming it a second time would interleave both conversations into one transcript, so it can't be restored until the other one exits.</div>`
+    ? `<div class="ext-note warn">This session is running right now — in Episko or another terminal. Resuming it a second time would interleave both conversations into one transcript, so it can't be restored until the other one exits.</div>`
     : `<button class="ext-jump-btn" data-resume="${esc(d.id)}">⟲ Resume this session</button>
        <div class="ext-note">Claude picks the conversation back up where it left off. It may offer to compact the context first — that's normal for a long session.</div>`;
   $("inspector").innerHTML = `
@@ -888,7 +888,7 @@ function renderPastInspector(d: Restorable) {
       <div class="ext-meta"><span class="label">Session</span><span class="mono">${esc(d.resumeId.slice(0, 8))}</span></div>
       ${action}
       <button class="ext-forget-btn" data-forget="${esc(d.id)}">Remove from list</button>
-      <div class="ext-note">Removing only clears this row from Muster. The conversation stays on disk — <span class="mono">/resume</span> inside any Claude session in this folder always lists them all.</div>
+      <div class="ext-note">Removing only clears this row from Episko. The conversation stays on disk — <span class="mono">/resume</span> inside any Claude session in this folder always lists them all.</div>
     </div>`;
 }
 function resumeDormant(id: string) {
@@ -979,7 +979,7 @@ function renderExtHeader(e: ExtSession) {
   $("hPath").textContent = tilde(e.cwd);
 }
 // A read-only working-set peek for an external session's folder — the same card as a
-// Muster session's, minus the fetch/pull/push row (we don't drive this checkout).
+// Episko session's, minus the fetch/pull/push row (we don't drive this checkout).
 // Shown only when the folder actually has uncommitted changes.
 function extPeekHtml(e: ExtSession, g: DiffStat): string {
   const tot = g.added + g.removed || 1;
@@ -1001,7 +1001,7 @@ function renderExtInspector(e: ExtSession) {
   const peek = isDirty(g) ? extPeekHtml(e, g!) : "";
   $("inspector").innerHTML = `
     <div class="ext-card">
-      <div class="ext-hl">↗ Running outside Muster</div>
+      <div class="ext-hl">↗ Running outside Episko</div>
       <div class="ext-meta"><span class="label">Project</span><span>${esc(basename(e.cwd))}</span></div>
       <div class="ext-meta"><span class="label">Path</span><span class="mono ell">${esc(tilde(e.cwd))}</span></div>
       <div class="ext-meta"><span class="label">Status</span><span>${esc(e.status || "idle")}</span></div>
@@ -1009,7 +1009,7 @@ function renderExtInspector(e: ExtSession) {
       <div class="ext-meta"><span class="label">Claude</span><span>${e.version ? "v" + esc(e.version) : "–"}</span></div>
       <div class="ext-meta"><span class="label">PID</span><span class="mono">${e.pid}</span></div>
       <button class="ext-jump-btn" data-jump="${e.pid}">↗ Jump to its terminal</button>
-      <div class="ext-note">Muster can't drive this session — it was launched in another terminal. The panel on the left is a live read-only mirror of its transcript.</div>
+      <div class="ext-note">Episko can't drive this session — it was launched in another terminal. The panel on the left is a live read-only mirror of its transcript.</div>
     </div>${peek}`;
 }
 
@@ -1081,7 +1081,7 @@ function permCmd(data: any): string {
   return "";
 }
 // Fully clear a session's pending-permission/attention state — used both when the
-// user answers via Muster's buttons and when they answer directly in the CLI (in
+// user answers via Episko's buttons and when they answer directly in the CLI (in
 // which case a later lifecycle event, not a button, is our signal to reset). If a
 // blocking request is still held server-side, release it so it doesn't leak.
 function clearPending(s: Sess) {
@@ -1207,8 +1207,8 @@ function splitByWorktree(list: ProjGroup[]): ProjGroup[] {
   }
   return out;
 }
-// Every project Muster knows about: the favourites, plus any repo discovered from a
-// live session, an external (non-Muster) session, or a dormant one. Unsorted and never
+// Every project Episko knows about: the favourites, plus any repo discovered from a
+// live session, an external (non-Episko) session, or a dormant one. Unsorted and never
 // worktree-split — callers that need order or splitting layer it on.
 //
 // The sidebar and the launch palette MUST agree on this set. Building the palette from
@@ -1380,7 +1380,7 @@ function extRow(e: ExtSession, chip?: WtCluster): string {
   return `<div class="srow extrow${chip ? " o3e" : ""} ${e.session_id === extMirrorId() ? "active" : ""}" data-ext="${e.session_id}" data-key="${esc(e.cwd)}">
     <span class="sglyph ${working ? "g-work" : "g-idle"}">${working ? "●" : "○"}</span>
     <span class="sbranch">${esc(e.name || basename(e.cwd))}</span>${chipHtml}
-    <span class="ext-tag" title="Running outside Muster · Claude v${esc(e.version)} · pid ${e.pid}">ext</span>
+    <span class="ext-tag" title="Running outside Episko · Claude v${esc(e.version)} · pid ${e.pid}">ext</span>
     <span class="sjump" data-jump="${e.pid}" title="Jump to its terminal ↗">↗</span></div>`;
 }
 function renderSidebar() {
@@ -1406,7 +1406,7 @@ function renderSidebar() {
       const tail = p.externals.length
         ? `<span class="pcount ext">${p.externals.length} ext</span>`
         : `<span class="pcount ext">${p.dormants.length} past</span>`;
-      head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}${tail}<span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch a Muster session here">＋</span></div>`;
+      head = `<div class="phead ext-only" data-key="${esc(p.path)}" title="${esc(tilde(p.path))}">${projGlyph(p.path, p.accent)}<span class="pname">${esc(p.name)}</span>${dot}${tail}<span class="padd" data-launch="${esc(p.path)}" data-proj="${esc(p.name)}" title="Launch an Episko session here">＋</span></div>`;
     }
     return `<div class="pgroup" data-path="${esc(p.path)}">${head}${rows ? `<div class="psessions">${rows}</div>` : ""}</div>`;
   }).join("");
@@ -1582,7 +1582,7 @@ function renderShellInspector(s: Sess) {
       <div class="ext-hl">❯ Plain shell</div>
       <div class="ext-meta"><span class="label">Project</span><span>${esc(s.project)}</span></div>
       <div class="ext-meta"><span class="label">Path</span><span class="ell" title="${esc(tilde(s.workdir))}">${esc(tilde(s.workdir))}</span></div>
-      <div class="ext-note">A regular login shell running inside Muster — no Claude, no telemetry. Handy for commands you don't want to run inside a session.</div>
+      <div class="ext-note">A regular login shell running inside Episko — no Claude, no telemetry. Handy for commands you don't want to run inside a session.</div>
     </div>`;
 }
 // ---- inspector: shared helpers for the redesigned modules ----
@@ -1769,7 +1769,7 @@ const DSTAT: Record<DiffFile["status"], [string, string]> = {
   modified: ["M", "s-mod"], added: ["A", "s-add"], deleted: ["D", "s-del"], renamed: ["R", "s-ren"],
 };
 let diffOpen = false;
-// Keyed by folder (workdir/cwd), not session id, so the same viewer serves Muster's
+// Keyed by folder (workdir/cwd), not session id, so the same viewer serves Episko's
 // own sessions and read-only external ones alike — both are just a git working tree.
 async function openDiff(workdir: string, title: string) {
   if (!workdir) return;
@@ -2260,7 +2260,7 @@ function usagePanelHtml(): string {
   const ranges = USAGE_RANGES.map(([n, l]) => `<button class="u-rbtn${n === usageRange ? " on" : ""}" data-urange="${n}">${l}</button>`).join("");
   return `<div class="u-pane">
     <header class="u-paneh"><div><div class="label">Analytics</div><h2 class="u-title">Usage &amp; spend</h2>
-      <p class="u-hint">Every session Muster launches, account-wide. History stays on this machine.</p></div>
+      <p class="u-hint">Every session Episko launches, account-wide. History stays on this machine.</p></div>
       <div class="u-range">${ranges}</div></header>
     ${uTiles()}
     ${forecastBlockHtml()}
@@ -2365,16 +2365,16 @@ function updateTray() {
   });
   const needy = needsYouSessions();
   const n = list.length;
-  let title = "", tooltip = "Muster — no active sessions";
+  let title = "", tooltip = "Episko — no active sessions";
   if (n > 0) {
     if (needy.length) {
       const dom = reactorState(needy[0]);
       const c = needy.filter((s) => reactorState(s) === dom).length;
       title = `${GLYPH[dom]} ${c}`;
-      tooltip = `Muster — ${n} session${n === 1 ? "" : "s"}, ${reactorLabel(dom, c)}`;
+      tooltip = `Episko — ${n} session${n === 1 ? "" : "s"}, ${reactorLabel(dom, c)}`;
     } else {
       title = `● ${n}`;
-      tooltip = `Muster — ${n} session${n === 1 ? "" : "s"}`;
+      tooltip = `Episko — ${n} session${n === 1 ? "" : "s"}`;
     }
   }
   const sig = title + "|" + tooltip + "|" + items.map((i) => i.label).join("§");
@@ -2386,7 +2386,7 @@ function renderAll() {
   renderSidebar(); renderMini(); renderFoot(); renderAttn();
   // When mirroring an external session, activeId is null but the stage/inspector
   // belong to that external — render it, NOT the null "no session" state. Skipping
-  // this is what let a background Muster session's telemetry tick blank the
+  // this is what let a background Episko session's telemetry tick blank the
   // external header/inspector ~1s after clicking it.
   if (pastMirrorId()) {
     const d = dormants.find((x) => x.id === pastMirrorId());
@@ -2404,7 +2404,7 @@ function renderAll() {
 
 // ---------- debug console ----------
 // A lightweight in-app event log + live state snapshot, surfaced via the 🐞 button
-// (in the footer) and mirrored to a fixed file (muster-debug.json) so an external
+// (in the footer) and mirrored to a fixed file (episko-debug.json) so an external
 // tool — or an LLM agent debugging the running app — can read what it's doing.
 // The most useful signal here is "unrouted telemetry": telemetry arriving for a
 // session id the UI doesn't know (the class of bug that made panes look ended).
@@ -2450,7 +2450,7 @@ function renderDbgPanel() {
   const snap = dbgSnapshot();
   const srows = snap.sessions.length
     ? snap.sessions.map((s) => `<tr><td>${esc(s.project)}</td><td class="mono">${s.id.slice(0, 8)}</td><td class="ph-${s.phase}">${s.phase}${s.attention ? " ⚠" : ""}</td><td>${s.ctxPct != null ? Math.round(s.ctxPct) + "%" : "–"}</td><td>${s.cost != null ? "$" + s.cost.toFixed(2) : "–"}</td><td class="mono">${esc(s.lastEvent || "–")}</td></tr>`).join("")
-    : `<tr><td colspan="6" class="dbg-dim">no Muster sessions</td></tr>`;
+    : `<tr><td colspan="6" class="dbg-dim">no Episko sessions</td></tr>`;
   const logRows = dbgLog.slice().reverse().slice(0, 250)
     .map((e) => `<div class="dl ${e.lvl}"><span class="dl-t">${dbgTime(e.t)}</span><span class="dl-l">${e.lvl}</span><span class="dl-m">${esc(e.msg)}</span></div>`).join("")
     || `<div class="dbg-dim" style="padding:8px">no events yet</div>`;
@@ -3101,10 +3101,10 @@ function wtDetailHtml(d: Dest | undefined): string {
         + `Removing it deletes the folder; the branch is a separate decision.</div>`;
     } else if (st === "detached") {
       warn = `<div class="wt-warn"><span class="t">No branch checked out</span>`
-        + `HEAD is detached here, so commits made in this checkout belong to no branch — Muster can't tell you whether they're merged, and won't offer to delete anything.</div>`;
+        + `HEAD is detached here, so commits made in this checkout belong to no branch — Episko can't tell you whether they're merged, and won't offer to delete anything.</div>`;
     } else if (st === "foreign") {
       warn = `<div class="wt-warn"><span class="t">Outside .cc-worktrees</span>`
-        + `Muster didn't create this checkout, so it doesn't own the path. Removal still works; the folder just isn't where new worktrees go.</div>`;
+        + `Episko didn't create this checkout, so it doesn't own the path. Removal still works; the folder just isn't where new worktrees go.</div>`;
     }
     if (w.locked) {
       warn += `<div class="wt-warn"><span class="t">Locked</span>`
@@ -3186,7 +3186,7 @@ function wtConfirmHtml(d: Dest): string {
   if (w.dirty) {
     return `<div class="wt-danger"><span class="q">Remove ${folder}?</span>`
       + `<span class="w"><span class="em">Uncommitted changes</span> live only in this checkout — nothing else has them. `
-      + `Muster won't force it; it'll open a terminal in the repo root with the command ready.</span>`
+      + `Episko won't force it; it'll open a terminal in the repo root with the command ready.</span>`
       + `<span class="row"><button class="wt-cbtn" type="button" data-wtact="rm0">Open a terminal there</button>`
       + `<button class="wt-cbtn ghost" type="button" data-wtact="cancel">Cancel</button></span></div>`;
   }
@@ -3224,7 +3224,7 @@ function wtBranchConfirmHtml(d: Dest): string {
   }
   return `<div class="wt-danger"><span class="q">Delete ${name}?</span>`
     + `<span class="w">${why}</span>`
-    + `<span class="w">Muster only runs the safe <b>git branch -d</b>, so git refuses anything it can't see as merged`
+    + `<span class="w">Episko only runs the safe <b>git branch -d</b>, so git refuses anything it can't see as merged`
     + `${b.gone ? " — which includes a squash-merged branch" : ""}. If it does, you get a terminal with <b>-D</b> ready.</span>`
     + `<span class="row"><button class="wt-cbtn danger" type="button" data-wtact="delbranch">Delete branch</button>`
     + `<button class="wt-cbtn ghost" type="button" data-wtact="cancel">Cancel</button></span></div>`;
@@ -3268,7 +3268,7 @@ function wtBaseOptions(): BranchPick[] {
     .concat(wtBranches.filter((b) => !b.current).map((b) => ({ name: b.name, note: b.rel || "" })));
 }
 
-// Move the root folder itself to another branch. Muster's answer to "work on another
+// Move the root folder itself to another branch. Episko's answer to "work on another
 // branch" is normally a worktree, and this stays deliberately secondary — but the root's
 // branch is the default parent of every new worktree, so a root parked somewhere stale
 // needed an escape that wasn't "drop to a shell".
@@ -3279,7 +3279,7 @@ function wtSwitchHtml(): string {
   if (running) {
     return `<div class="wt-danger"><span class="q">Switch this folder's branch?</span>`
       + `<span class="w"><span class="em">${running} session${running === 1 ? " is" : "s are"} running here.</span> `
-      + `Switching would move the ground under ${running === 1 ? "it" : "them"} mid-edit, so Muster won't. Close ${running === 1 ? "it" : "them"} first.</span>`
+      + `Switching would move the ground under ${running === 1 ? "it" : "them"} mid-edit, so Episko won't. Close ${running === 1 ? "it" : "them"} first.</span>`
       + `<span class="row"><button class="wt-cbtn ghost" type="button" data-wtact="cancel">Cancel</button></span></div>`;
   }
   if (!pick.length) {
@@ -3292,7 +3292,7 @@ function wtSwitchHtml(): string {
     + `<span class="w">The repo's own folder moves — every worktree keeps its own branch, untouched. `
     + `This also changes what new worktrees branch from by default.</span>`
     + `<span class="row">${wtPickBtn("switch", sel)}</span>`
-    + `<span class="w">Muster only switches a <b>clean</b> tree: git would carry uncommitted changes across to the new branch, `
+    + `<span class="w">Episko only switches a <b>clean</b> tree: git would carry uncommitted changes across to the new branch, `
     + `which is a change it never announced. If yours is dirty you get a terminal instead.</span>`
     + `<span class="row"><button class="wt-cbtn danger" type="button" data-wtact="doswitch">Switch branch</button>`
     + `<button class="wt-cbtn ghost" type="button" data-wtact="cancel">Cancel</button></span></div>`;
@@ -3636,7 +3636,7 @@ function wtDemoHead(name: string, count: number, wt?: string): string {
 // real sidebar does.
 function wtPreviewBody(mode: WtGroup): string {
   if (mode === "subheader") {
-    return wtDemoHead("muster", WT_DEMO.length) + wtDemoClusters().map((c) =>
+    return wtDemoHead("episko", WT_DEMO.length) + wtDemoClusters().map((c) =>
       `<div class="p-wthead"><span class="p-fork" style="color:${c.hue}">⑃</span>`
       + `<span class="p-wtname" style="color:${c.hue}">${esc(c.branch)}</span>`
       + `<span class="p-wtcount">${c.sessions.length}</span></div>`
@@ -3646,12 +3646,12 @@ function wtPreviewBody(mode: WtGroup): string {
   if (mode === "toplevel") {
     const cs = wtDemoClusters();
     const main = cs.find((c) => c.isMain)!;
-    let h = wtDemoHead("muster", main.sessions.length) + `<div class="p-rows">${main.sessions.map((s) => wtDemoRow(s)).join("")}</div>`;
-    for (const c of cs.filter((c) => !c.isMain)) h += wtDemoHead("muster", c.sessions.length, c.branch) + `<div class="p-rows">${c.sessions.map((s) => wtDemoRow(s)).join("")}</div>`;
+    let h = wtDemoHead("episko", main.sessions.length) + `<div class="p-rows">${main.sessions.map((s) => wtDemoRow(s)).join("")}</div>`;
+    for (const c of cs.filter((c) => !c.isMain)) h += wtDemoHead("episko", c.sessions.length, c.branch) + `<div class="p-rows">${c.sessions.map((s) => wtDemoRow(s)).join("")}</div>`;
     return h;
   }
   const chip = mode === "chip";
-  return wtDemoHead("muster", WT_DEMO.length) + `<div class="p-rows">${WT_DEMO.map((s) => wtDemoRow(s, chip)).join("")}</div>`;
+  return wtDemoHead("episko", WT_DEMO.length) + `<div class="p-rows">${WT_DEMO.map((s) => wtDemoRow(s, chip)).join("")}</div>`;
 }
 // The worktree-grouping picker as a grid of selectable, live-preview cards. Each card
 // carries the same data-set/data-val the seg picker uses, so the existing #setBody
@@ -3887,7 +3887,7 @@ function openCtxMenu(key: string, x: number, y: number) {
   const rows: (CtxRow | null)[] = [
     { act: "launch", ic: "＋", label: "New session", sub: live ? `${live} already running here` : "start Claude Code in this folder" },
     { act: "worktree", ic: "⑃", label: "New worktree session…", sub: "on a branch of its own" },
-    { act: "terminal", ic: "❯", label: "Open terminal here", sub: termEngine === "embedded" ? "shell pane inside Muster" : engineDef(termEngine).label },
+    { act: "terminal", ic: "❯", label: "Open terminal here", sub: termEngine === "embedded" ? "shell pane inside Episko" : engineDef(termEngine).label },
     null,
     { act: "folder", ic: "⌂", label: "Open project folder", sub: FILE_MANAGER },
     { act: "copypath", ic: "⧉", label: "Copy path" },
@@ -4209,7 +4209,7 @@ $("setBody").addEventListener("mouseleave", () => { uTip.hidden = true; });
 $("railCollapse").addEventListener("click", toggleRail);
 $("railSort").addEventListener("click", cycleSort);
 $("inspBtn").addEventListener("click", toggleInsp);
-// The active project context is either a Muster session or an external one.
+// The active project context is either an Episko session or an external one.
 function activeProjectCtx(): { project: string; path: string } | null {
   // For an external session use its repo root, not the worktree cwd, so launching a
   // session / opening a worktree from it operates on the repo (and groups under it).
@@ -4353,7 +4353,7 @@ $("btnNew").addEventListener("click", () => {
   if (c) requestLaunch(c.project, c.path); else openPalette();
 });
 $("btnTerm").addEventListener("click", openPlainTerminal);
-$("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/muster").catch(() => {}); });
+$("fRepo").addEventListener("click", (e) => { e.preventDefault(); openUrl("https://github.com/respeak-io/episko").catch(() => {}); });
 $("fEngineSeg").addEventListener("click", (e) => { e.stopPropagation(); $("enginePop").classList.contains("show") ? closeEnginePop() : openEnginePopover(); });
 $("fUsageSeg").addEventListener("click", (e) => { e.stopPropagation(); $("usagePop").classList.contains("show") ? closeUsagePop() : openUsagePop(); });
 $("fShortSeg").addEventListener("click", (e) => { e.stopPropagation(); $("shortPop").classList.contains("show") ? closeShortPop() : openShortPop(); });
@@ -4481,7 +4481,7 @@ new ResizeObserver(() => {
 getVersion().then((v) => { appVersion = v; $("fVer").textContent = "v" + v; }).catch(() => {});
 
 // ---------- app self-update (Tauri updater plugin) ----------
-// Checks the latest GitHub release (respeak-io/muster) for a newer Muster.
+// Checks the latest GitHub release (respeak-io/episko) for a newer Episko.
 // Installing an update RESTARTS the app, which kills every live PTY/Claude
 // session — so we never auto-install: the update surfaces as a footer chip and
 // a one-time toast, and only downloads + relaunches after an explicit,
@@ -4499,7 +4499,7 @@ async function checkForUpdates(manual: boolean) {
       chip.textContent = `⇧ update to v${upd.version}`;
       chip.hidden = false;
       dlog("info", `update available: v${upd.version}`);
-      if (manual) toast(`Muster v${upd.version} is available`);
+      if (manual) toast(`Episko v${upd.version} is available`);
     } else {
       chip.hidden = true;
       if (manual) toast("You're on the latest version");
@@ -4525,10 +4525,10 @@ async function runUpdate() {
   if (!pendingUpdate || updateBusy) return;
   const live = [...sessions.values()].filter((s) => !s.external).length;
   const warn = live
-    ? `Muster will download v${pendingUpdate.version}, close ${live} running session${live === 1 ? "" : "s"}, and restart.`
-    : `Muster will download v${pendingUpdate.version} and restart.`;
+    ? `Episko will download v${pendingUpdate.version}, close ${live} running session${live === 1 ? "" : "s"}, and restart.`
+    : `Episko will download v${pendingUpdate.version} and restart.`;
   const ok = await ask(`${warn}\n\nContinue?`, {
-    title: "Update Muster",
+    title: "Update Episko",
     kind: "warning",
     okLabel: "Update & restart",
     cancelLabel: "Not now",
@@ -4554,7 +4554,7 @@ $("fVer").addEventListener("click", () => checkForUpdates(true));
 setTimeout(() => checkForUpdates(false), 3000);
 // "Check for Updates…" in the menu-bar menu. Without this the only checks are the
 // one at launch and the easily-missed click on the version label, so a long-running
-// Muster never learns about a release until it's restarted. Manual → it reports
+// Episko never learns about a release until it's restarted. Manual → it reports
 // either way ("you're on the latest version"), so the menu item always answers.
 listen("tray-check-updates", () => { void checkForUpdates(true); });
 
@@ -4563,7 +4563,7 @@ listen("tray-check-updates", () => { void checkForUpdates(true); });
 // Windows the backend intercepts CloseRequested (closing the window is the quit
 // gesture there — it has no app menu). Both arrive here as `quit-requested`
 // rather than tearing the app down. We only nag
-// when something would actually be lost — an idle Muster quits immediately, keeping
+// when something would actually be lost — an idle Episko quits immediately, keeping
 // the Cmd+Q muscle memory intact.
 listen("quit-requested", async () => {
   const live = [...sessions.values()].filter((s) => s.phase !== "ended");
@@ -4574,7 +4574,7 @@ listen("quit-requested", async () => {
   if (agents) parts.push(`${agents} running ${agents === 1 ? "session" : "sessions"}`);
   if (terms) parts.push(`${terms} ${terms === 1 ? "terminal" : "terminals"}`);
   const ok = await ask(`${parts.join(" and ")} still running — quitting ends ${agents + terms === 1 ? "it" : "them"}.`, {
-    title: "Quit Muster?",
+    title: "Quit Episko?",
     kind: "warning",
     okLabel: "Quit",
     cancelLabel: "Cancel",
@@ -4637,11 +4637,11 @@ setInterval(() => {
   if (s) void refreshSessionStats(s);
 }, 4000);
 
-// discover Claude Code sessions running outside Muster and keep them fresh.
+// discover Claude Code sessions running outside Episko and keep them fresh.
 refreshExternals();
 setInterval(refreshExternals, 3000);
 
-// surface the sessions that were open when Muster last closed, so they can be
+// surface the sessions that were open when Episko last closed, so they can be
 // resumed instead of lost. Read-only until the user actually clicks Resume.
 void loadDormants();
 // Nothing else persists the roster on the way out: closeSession and the telemetry

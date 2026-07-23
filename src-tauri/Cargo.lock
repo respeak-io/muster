@@ -959,6 +959,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "episko"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "tiny_http",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2187,27 +2208,6 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "muster"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "log",
- "portable-pty",
- "serde",
- "serde_json",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-log",
- "tauri-plugin-opener",
- "tauri-plugin-process",
- "tauri-plugin-updater",
- "tiny_http",
  "windows-sys 0.61.2",
 ]
 

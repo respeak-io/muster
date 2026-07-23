@@ -35,7 +35,7 @@ struct Session {
 struct AppState {
     port: u16,
     sessions: Mutex<HashMap<String, Session>>,
-    /// PIDs of the `claude` processes Muster spawned in an embedded PTY. Matched
+    /// PIDs of the `claude` processes Episko spawned in an embedded PTY. Matched
     /// against the on-disk session registry so our own sessions never masquerade
     /// as "external" — robust to the session id changing under /resume or /clear
     /// (which rewrites `~/.claude/sessions/<pid>.json` with the new id).
@@ -45,7 +45,7 @@ struct AppState {
     pending: Mutex<HashMap<String, tiny_http::Request>>,
     next_perm: std::sync::atomic::AtomicU64,
     /// The single running `caffeinate` child, if the user has toggled it on.
-    /// Started with `-w <our pid>` so it self-terminates if Muster ever dies
+    /// Started with `-w <our pid>` so it self-terminates if Episko ever dies
     /// without a clean stop — no orphaned process keeps the Mac awake forever.
     #[cfg(not(windows))]
     caffeinate: Mutex<Option<std::process::Child>>,
@@ -74,7 +74,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Receive hook + statusLine POSTs from Claude Code and forward each to the
-/// frontend as a `telemetry` event. Every request carries Muster's stable launch
+/// frontend as a `telemetry` event. Every request carries Episko's stable launch
 /// id (`X-CC-Session` header, or `?sid=` for the permission hook); we force it onto
 /// the payload as `session_id` so the frontend routes by it — immune to Claude
 /// rotating its own runtime session_id on /clear, /compact or /resume.
@@ -203,7 +203,7 @@ fn write_instrument_settings(port: u16, session_id: &str) -> std::io::Result<Str
     dir.push("cc-launcher");
     std::fs::create_dir_all(&dir)?;
 
-    // Tag every POST with Muster's STABLE launch id via an `X-CC-Session` header,
+    // Tag every POST with Episko's STABLE launch id via an `X-CC-Session` header,
     // so telemetry keeps routing to the right pane even after Claude rotates its own
     // runtime session_id (/clear, /compact, /resume all mint a new one). The id is
     // baked into the generated command — no dependence on env propagation.
@@ -352,7 +352,7 @@ fn augmented_path() -> String {
 /// Force a UTF-8 locale on a PTY child. A macOS app launched from Finder inherits no
 /// `LANG`, so the child falls back to the C/POSIX locale and mangles non-ASCII output
 /// (UTF-8 rendered as Mac Roman — `ü`→`√º`, emoji shredded). Terminal.app/iTerm set a
-/// UTF-8 locale on startup; mirror that. Preserve an already-UTF-8 `LANG` (e.g. Muster
+/// UTF-8 locale on startup; mirror that. Preserve an already-UTF-8 `LANG` (e.g. Episko
 /// launched from a terminal), else default one; and pin `LC_CTYPE` so an inherited
 /// `LC_CTYPE=C` can't re-break the charset behind a good `LANG`.
 #[cfg(windows)]
@@ -527,7 +527,7 @@ fn interactive_shell() -> (String, Vec<String>) {
 }
 
 /// Open a plain login shell in an embedded PTY (no Claude, no instrumentation) — a
-/// scratch terminal that lives in a Muster pane just like a session. Wired to the
+/// scratch terminal that lives in an Episko pane just like a session. Wired to the
 /// same `pty-output` / `write_pty` / `pty-exit` path as `spawn_claude`.
 #[tauri::command]
 fn spawn_shell(
@@ -604,7 +604,7 @@ fn find_ghostty() -> Option<String> {
 
 /// Launch the instrumented `claude` session in an external Ghostty window,
 /// tinted to the project's accent. Telemetry still flows via the hooks/statusline,
-/// so the session appears in Muster's cockpit — just without an embedded terminal.
+/// so the session appears in Episko's cockpit — just without an embedded terminal.
 #[tauri::command]
 fn spawn_ghostty(
     state: State<AppState>,
@@ -705,7 +705,7 @@ fn spawn_external_terminal(
 /// (Terminal.app / iTerm2). We write an executable `.command` wrapper that sets
 /// up PATH, cd's into the workdir and execs claude, then hand it to `open -a`.
 /// Telemetry still flows via the per-session settings hooks, so the session shows
-/// up in Muster's cockpit just like an embedded/Ghostty one.
+/// up in Episko's cockpit just like an embedded/Ghostty one.
 #[cfg(not(windows))]
 #[tauri::command]
 fn spawn_external_terminal(
@@ -736,7 +736,7 @@ fn spawn_external_terminal(
         None => format!("--session-id {}", sh_quote(&session_id)),
     };
     let body = format!(
-        "#!/bin/zsh\n# Muster session: {title}\nexport PATH={path}\ncd {wd} || exit 1\nexec {claude} {id_args} --settings {settings}\n",
+        "#!/bin/zsh\n# Episko session: {title}\nexport PATH={path}\ncd {wd} || exit 1\nexec {claude} {id_args} --settings {settings}\n",
         title = title.replace(['\n', '\r'], " "),
         path = sh_quote(&augmented_path()),
         wd = sh_quote(&workdir),
@@ -790,7 +790,7 @@ fn open_terminal_here(workdir: String, _engine: String) -> Result<(), String> {
 
 /// Open a plain (non-Claude) shell in an external terminal at `workdir` — a quick
 /// scratch terminal for running commands next to a session. There's no
-/// instrumentation here: it's just a shell, so it does NOT appear in Muster's
+/// instrumentation here: it's just a shell, so it does NOT appear in Episko's
 /// cockpit. `engine` is a hint (the user's chosen launch engine); embedded has no
 /// external window, so it falls back to Terminal.app.
 #[cfg(not(windows))]
@@ -877,14 +877,14 @@ fn write_debug_file(contents: String) -> Result<String, String> {
     let mut dir = std::env::temp_dir();
     dir.push("cc-launcher");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("muster-debug.json");
+    let path = dir.join("episko-debug.json");
     std::fs::write(&path, contents).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Tee a frontend `dlog()` line into the backend rolling log (muster.log), tagged
+/// Tee a frontend `dlog()` line into the backend rolling log (episko.log), tagged
 /// `[ui]`. The UI's event stream is otherwise only an in-memory ring mirrored to
-/// the *overwritten* muster-debug.json snapshot — so it doesn't survive a crash.
+/// the *overwritten* episko-debug.json snapshot — so it doesn't survive a crash.
 /// Forwarding it here puts the whole timeline (UI + backend) in one durable,
 /// time-ordered file: after #12 the backend was crash-visible but the UI half
 /// wasn't. Fire-and-forget from the frontend; a dropped line is not worth an error.
@@ -982,7 +982,7 @@ fn set_caffeinate(state: State<AppState>, active: bool, flags: Vec<String>) -> R
     if let Some(bad) = flags.iter().find(|f| !valid_caffeinate_flag(f)) {
         return Err(format!("refusing unknown caffeinate flag: {bad}"));
     }
-    // `-w <our pid>`: caffeinate exits on its own the moment Muster does, so a
+    // `-w <our pid>`: caffeinate exits on its own the moment Episko does, so a
     // crash or force-quit can't leave the display pinned awake.
     let mut cmd = std::process::Command::new("/usr/bin/caffeinate");
     cmd.arg("-w").arg(std::process::id().to_string());
@@ -1454,13 +1454,13 @@ fn git_commit_info(dir: String, rev: String) -> Option<CommitInfo> {
 
 /// Move the repo's main working tree to another branch.
 ///
-/// Muster's whole model is "don't switch, branch out" — worktrees exist so two pieces
+/// Episko's whole model is "don't switch, branch out" — worktrees exist so two pieces
 /// of work never fight over one checkout. But the root folder's branch is also the
 /// default parent of every new worktree, so a root parked somewhere stale is a real
 /// problem, and a terminal was the only way out. This is that lever, with the guards
 /// that make it safe to expose:
 ///
-/// - Refused while Muster sessions run in the root: switching moves the ground under a
+/// - Refused while Episko sessions run in the root: switching moves the ground under a
 ///   live agent's cwd mid-edit.
 /// - Refused when the target is checked out in another worktree (git refuses too, but
 ///   this says which one).
@@ -2275,17 +2275,17 @@ fn read_custom_icon(path: String) -> Result<ProjectIcon, String> {
         .ok_or_else(|| "Not a usable image (PNG, SVG, ICO, JPEG, WEBP or GIF, max 512 KB)".to_string())
 }
 
-// ---------- external (non-Muster) Claude Code sessions ----------
+// ---------- external (non-Episko) Claude Code sessions ----------
 //
 // Claude Code writes a per-process registry file at
 // `~/.claude/sessions/<pid>.json` for every running interactive session, e.g.
 //   {"pid":80629,"sessionId":"…","cwd":"/…","name":"repo-a3","status":"idle",…}
-// Muster's own sessions DO register here too (verified on CC 2.1.211), so we
+// Episko's own sessions DO register here too (verified on CC 2.1.211), so we
 // filter them out by pid — see `owned_pids` and the ancestry walk in
 // `list_external_sessions`. We must NOT filter by session id alone: /resume and
 // /clear rewrite this file with a new id, which would otherwise resurface our
 // own live session as "external". What remains is the sessions started outside
-// Muster (a plain terminal, an IDE, etc.) — we jump to their terminal window and
+// Episko (a plain terminal, an IDE, etc.) — we jump to their terminal window and
 // show a read-only mirror of their transcript.
 //
 // The registry format and directory are identical on Windows (verified on CC
@@ -2374,7 +2374,7 @@ impl ProcTable {
     }
 
     /// True if `pid` is `ancestor`, or a descendant of it (walks the ppid chain).
-    /// Used to recognise `claude` processes Muster launched — directly (embedded
+    /// Used to recognise `claude` processes Episko launched — directly (embedded
     /// PTY) or via a child terminal (e.g. Ghostty) — regardless of their session
     /// id. The iteration cap also bounds ppid cycles, which Windows can produce
     /// after pid reuse (a dead parent's pid handed to a new process).
@@ -2420,8 +2420,8 @@ fn parse_registry_entry(txt: &str) -> Option<ExternalSession> {
     })
 }
 
-/// List interactive Claude Code sessions running OUTSIDE Muster. `exclude` is the
-/// set of session ids Muster already owns (belt-and-suspenders — ours don't
+/// List interactive Claude Code sessions running OUTSIDE Episko. `exclude` is the
+/// set of session ids Episko already owns (belt-and-suspenders — ours don't
 /// register anyway). Dead/stale registry files are filtered by verifying the pid
 /// is still a live `claude` process.
 #[tauri::command(async)]
@@ -2455,9 +2455,9 @@ fn list_external_sessions(state: State<AppState>, exclude: Vec<String>) -> Vec<E
     let table = ProcTable::snapshot();
     parsed.retain(|s| table.is_live_claude(s.pid));
 
-    // Drop Muster's OWN sessions, matched by pid — NOT by session id. Their id on
+    // Drop Episko's OWN sessions, matched by pid — NOT by session id. Their id on
     // disk changes when the user runs /resume or /clear (the pid file is rewritten
-    // with the new id), so a session-id exclude alone lets a live, Muster-owned
+    // with the new id), so a session-id exclude alone lets a live, Episko-owned
     // session resurface here as "external". The pid is stable for the process'
     // lifetime. `owned_pids` covers embedded PTYs directly; the ancestry walk also
     // catches sessions launched into a child terminal (e.g. Ghostty).
@@ -2968,7 +2968,7 @@ fn read_transcript(cwd: String, session_id: String, limit: usize) -> Result<Vec<
 /// item (see the app menu in `run`), which asks the frontend to confirm instead
 /// of quitting; the frontend calls this once the user (or an empty session list)
 /// has approved the quit. Kept as a command so the *only* immediate-exit paths
-/// are this and the tray's "Quit Muster".
+/// are this and the tray's "Quit Episko".
 #[tauri::command]
 fn confirm_quit(app: AppHandle) {
     app.exit(0);
@@ -3006,13 +3006,13 @@ fn update_tray(
     }
     let menu = mb
         .separator()
-        .text("show", "Show Muster")
+        .text("show", "Show Episko")
         // Keep this trio in sync with the initial menu built in `run()` — this
         // command *replaces* the whole menu, so anything missing here vanishes the
         // moment the frontend first renders.
         .text("check-updates", "Check for Updates…")
         .separator()
-        .text("quit", "Quit Muster")
+        .text("quit", "Quit Episko")
         .build()
         .map_err(|e| e.to_string())?;
     tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
@@ -3026,7 +3026,7 @@ fn update_tray(
 /// dies. A panic that unwinds out of `main` terminates a GUI app *cleanly* as far
 /// as the OS is concerned: no crash dump, no WER/CrashReporter entry, the window
 /// just vanishes. This hook is the only on-disk trace of that failure class. It
-/// writes through the `log` facade (→ the rolling muster.log) AND appends raw to
+/// writes through the `log` facade (→ the rolling episko.log) AND appends raw to
 /// `panic.log` in the same directory, in case the logger itself is what broke.
 fn install_panic_hook(log_dir: std::path::PathBuf) {
     let prev = std::panic::take_hook();
@@ -3062,7 +3062,7 @@ pub fn run() {
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("muster".into()),
+                        file_name: Some("episko".into()),
                     }),
                 ])
                 .level(log::LevelFilter::Info)
@@ -3091,7 +3091,7 @@ pub fn run() {
         .setup(|app| {
             // Before anything that can panic: from here on, panics leave a trace.
             install_panic_hook(app.path().app_log_dir()?);
-            log::info!("muster v{} starting", app.package_info().version);
+            log::info!("episko v{} starting", app.package_info().version);
 
             let server = tiny_http::Server::http("127.0.0.1:0")
                 .expect("bind telemetry server on 127.0.0.1");
@@ -3113,10 +3113,10 @@ pub fn run() {
             // macOS menu-bar (tray) icon — its menu mirrors the sidebar and is
             // rebuilt from the frontend via `update_tray`.
             let tray_menu = MenuBuilder::new(app)
-                .text("show", "Show Muster")
+                .text("show", "Show Episko")
                 .text("check-updates", "Check for Updates…")
                 .separator()
-                .text("quit", "Quit Muster")
+                .text("quit", "Quit Episko")
                 .build()?;
             // Monochrome `>_` glyph, rendered as a macOS template image so it
             // adapts to the light/dark menu bar. Falls back to the app icon.
@@ -3125,11 +3125,11 @@ pub fn run() {
             TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .icon_as_template(true)
-                .tooltip("Muster")
+                .tooltip("Episko")
                 .menu(&tray_menu)
                 // Double-click the icon → show the window. NOTE: on macOS the tray
                 // crate never emits DoubleClick (it's Windows/Linux-only), so there
-                // the "Show Muster" menu item is the reliable path; this handler
+                // the "Show Episko" menu item is the reliable path; this handler
                 // covers the other platforms.
                 .on_tray_icon_event(|tray, event| {
                     if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
@@ -3191,17 +3191,17 @@ pub fn run() {
             // in-window menu bar full of mac-only items — and muda's predefined
             // Hide item there does a raw Win32 ShowWindow(SW_HIDE) behind tao's
             // visibility flags, after which tao's show() no-ops and the window is
-            // unrecoverable, tray "Show Muster" included (muda 0.19.3
+            // unrecoverable, tray "Show Episko" included (muda 0.19.3
             // windows/mod.rs:1217 vs tao 0.35.3 window_state.rs apply_diff).
             // Windows needs no menu at all: WebView2 handles the edit shortcuts
             // natively, and quitting goes through the CloseRequested hook on the
             // builder above.
             #[cfg(target_os = "macos")]
             {
-                let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Muster")
+                let quit_item = MenuItemBuilder::with_id("quit-confirm", "Quit Episko")
                     .accelerator("CmdOrCtrl+Q")
                     .build(app)?;
-                let app_menu = SubmenuBuilder::new(app, "Muster")
+                let app_menu = SubmenuBuilder::new(app, "Episko")
                     .about(None)
                     .separator()
                     .services()
@@ -3311,12 +3311,12 @@ mod tests {
 
     #[test]
     fn parse_usage_line_extracts_day_tokens_family_and_project() {
-        let line = r#"{"type":"assistant","timestamp":"2026-07-21T10:00:00.000Z","cwd":"/Users/tim/dev/muster","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":4}}}"#;
+        let line = r#"{"type":"assistant","timestamp":"2026-07-21T10:00:00.000Z","cwd":"/Users/tim/dev/episko","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":4}}}"#;
         let lu = parse_usage_line(line).expect("assistant usage line should parse");
         assert_eq!(lu.day, "2026-07-21");
         assert_eq!(lu.tokens, [10, 20, 300, 4]);
         assert_eq!(lu.family, "opus");
-        assert_eq!(lu.project, "muster"); // basename of cwd
+        assert_eq!(lu.project, "episko"); // basename of cwd
         // Missing token fields default to 0; unknown model → "other"; no cwd → "unknown".
         let partial = r#"{"timestamp":"2026-07-21T10:00:00Z","message":{"usage":{"output_tokens":7}}}"#;
         let lu = parse_usage_line(partial).expect("should parse");
@@ -3358,7 +3358,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn norm_path_is_identity_off_windows() {
-        assert_eq!(norm_path("/Users/tim/dev/muster"), "/Users/tim/dev/muster");
+        assert_eq!(norm_path("/Users/tim/dev/episko"), "/Users/tim/dev/episko");
         assert_eq!(norm_path("a\\b"), "a\\b"); // a backslash is a legal filename char here
     }
 
@@ -3387,7 +3387,7 @@ mod tests {
     /// an atomic counter keep it unique even under cargo's parallel test threads).
     fn scratch_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("muster_git_diff_test_{}_{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("episko_git_diff_test_{}_{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3838,9 +3838,9 @@ mod tests {
 
     #[test]
     fn proc_table_identity_and_ancestry() {
-        // muster(100) → ghostty(200) → claude(300); unrelated claude(400) under init.
+        // episko(100) → ghostty(200) → claude(300); unrelated claude(400) under init.
         let t = table(&[
-            (100, Some(1), "muster"),
+            (100, Some(1), "episko"),
             (200, Some(100), "ghostty"),
             (300, Some(200), "claude"),
             (400, Some(1), "claude.exe"),
@@ -3875,10 +3875,10 @@ mod tests {
     fn parse_registry_entry_accepts_interactive_rejects_rest() {
         // Shape verified against a real CC 2.1.216 registry file on Windows;
         // the keys are identical on macOS.
-        let win = r#"{"pid":41708,"sessionId":"20283E01-6874-4FBB-B696-C29A89F13CC6","cwd":"E:\\Programming\\Work\\Respeak\\muster","startedAt":1784613714619,"procStart":"639202177128968910","version":"2.1.216","peerProtocol":1,"kind":"interactive","entrypoint":"cli","name":"muster-15","nameSource":"derived","status":"busy","updatedAt":1784614124255,"statusUpdatedAt":1784614124255}"#;
+        let win = r#"{"pid":41708,"sessionId":"20283E01-6874-4FBB-B696-C29A89F13CC6","cwd":"E:\\Programming\\Work\\Respeak\\episko","startedAt":1784613714619,"procStart":"639202177128968910","version":"2.1.216","peerProtocol":1,"kind":"interactive","entrypoint":"cli","name":"episko-15","nameSource":"derived","status":"busy","updatedAt":1784614124255,"statusUpdatedAt":1784614124255}"#;
         let s = parse_registry_entry(win).expect("interactive entry should parse");
         assert_eq!(s.pid, 41708);
-        assert_eq!(s.cwd, r"E:\Programming\Work\Respeak\muster");
+        assert_eq!(s.cwd, r"E:\Programming\Work\Respeak\episko");
         assert_eq!(s.status, "busy");
         assert_eq!(s.status_updated_at, Some(1784614124255));
 

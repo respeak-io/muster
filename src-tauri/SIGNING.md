@@ -1,4 +1,4 @@
-# Signing Muster
+# Signing Episko
 
 Three independent "signings" — do **not** conflate them:
 
@@ -16,7 +16,7 @@ Three independent "signings" — do **not** conflate them:
 3. **macOS code-signing + notarization (Apple Developer ID)** — a **separate** Apple
    account (~99 $/yr). The Azure profile **cannot** sign macOS binaries. Notarization sits
    **on top of** Developer ID signing (Apple malware-scan + a stapled ticket); it does not
-   replace signing. Not configured yet — Muster is ad-hoc signed (`signingIdentity: "-"`)
+   replace signing. Not configured yet — Episko is ad-hoc signed (`signingIdentity: "-"`)
    and users clear quarantine with `xattr` (see the release notes in `release.yml`).
 
 ## Windows — activate Azure Trusted Signing
@@ -54,7 +54,7 @@ SCOPE=$(az resource show -g "$AZURE_RESOURCE_GROUP" -n "$TRUSTED_SIGNING_ACCOUNT
 
 # Create the SP AND assign only the signer role at that scope, in one shot.
 az ad sp create-for-rbac \
-  --name "muster-ci-signer" \
+  --name "episko-ci-signer" \
   --role "Artifact Signing Certificate Profile Signer" \
   --scopes "$SCOPE"
 ```
@@ -123,8 +123,8 @@ password), `APPLE_TEAM_ID`. Own decision, own account — the Azure profile does
 The only blocker for a local `tauri build` is the updater key (#1). Generate a throwaway one:
 
 ```powershell
-pnpm tauri signer generate -- -w $env:USERPROFILE\.tauri\muster_test.key -p ""
-$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $env:USERPROFILE\.tauri\muster_test.key -Raw
+pnpm tauri signer generate -- -w $env:USERPROFILE\.tauri\episko_test.key -p ""
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content $env:USERPROFILE\.tauri\episko_test.key -Raw
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 pnpm tauri build
 ```
