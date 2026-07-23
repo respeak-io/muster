@@ -203,6 +203,11 @@ void (async () => {
     await document.fonts.ready;
   } catch { /* Font Loading API unavailable — the browser still applies the @font-face */ }
   for (const s of sessions.values()) s.term?.clearTextureAtlas();
+  // A session opened before the font arrived had its cell width measured against
+  // the *fallback* metrics, so its column count (and the size we spawned Claude at)
+  // is slightly off and stays off until the next resize. Re-fit now that the real
+  // font's metrics are in, so the PTY width matches what we actually render.
+  refit();
 })();
 
 // Account-wide rate limits. Every session's statusLine reports the same account
@@ -714,8 +719,7 @@ function setActive(id: string) {
   for (const x of sessions.values()) x.pane.classList.toggle("active", x.id === id);
   document.documentElement.style.setProperty("--accent", accentFor(s.colorKey));
   if (s.term && s.fit) {
-    try { s.fit.fit(); } catch { /* pane not measurable yet */ }
-    invoke("resize_pty", { sessionId: id, rows: s.term.rows, cols: s.term.cols });
+    fitSession(s);
     s.term.focus();
   }
   renderHeader(s); renderInspector(s); renderSidebar(); renderMini(); renderFoot();
@@ -2667,7 +2671,22 @@ function setTheme(t: "dark" | "light") {
   renderSettings(); // keep the settings picker in sync if it's open
 }
 function toggleTheme() { setTheme(effectiveTheme() === "dark" ? "light" : "dark"); }
-function refit() { if (!activeId) return; const s = sessions.get(activeId); if (!s?.term || !s.fit) return; try { s.fit.fit(); invoke("resize_pty", { sessionId: s.id, rows: s.term.rows, cols: s.term.cols }); } catch { /* */ } }
+// Fit one terminal to its pane, push the new size to its PTY, and force a full
+// repaint. The repaint is not cosmetic: on a resize the WebGL renderer only redraws
+// cells its damage tracker flagged, so a cell that went glyph→blank can keep a stale
+// glyph in the GL framebuffer (the "floating chars" past a shrunk table). refresh()
+// re-rasterizes every visible row straight from the buffer, clearing those ghosts.
+// Only ever call this on the *active* pane — an inactive one is display:none, so
+// fit() would measure a zero-size box and resize the PTY to garbage.
+function fitSession(s: Sess) {
+  if (!s.term || !s.fit) return;
+  try {
+    s.fit.fit();
+    invoke("resize_pty", { sessionId: s.id, rows: s.term.rows, cols: s.term.cols });
+    s.term.refresh(0, s.term.rows - 1);
+  } catch { /* pane not measurable yet */ }
+}
+function refit() { if (!activeId) return; const s = sessions.get(activeId); if (s) fitSession(s); }
 function applyFontSize() { for (const s of sessions.values()) if (s.term) s.term.options.fontSize = termFontSize; refit(); localStorage.setItem("cc-term-font", String(termFontSize)); }
 function bumpFont(d: number) { termFontSize = Math.max(8, Math.min(28, termFontSize + d)); applyFontSize(); toast(`Terminal font ${termFontSize}px`); }
 
@@ -4445,7 +4464,17 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "Escape" && diffOpen) { e.preventDefault(); closeDiff(); }
   else if (e.key === "Escape" && settingsOpen()) { e.preventDefault(); closeSettings(); }
 });
-new ResizeObserver(() => refit()).observe($("terminals"));
+// Debounce container resizes. A window drag or a sidebar/inspector toggle fires this
+// many times per second; without a settle delay each tick pushes a new width to the
+// PTY, and Claude's Ink renderer — which erases its previous frame by line count at
+// the *old* width — can't keep up, leaving orphaned cells. One resize at the settled
+// size lets Ink do a single clean relayout. Direct refit() callers (font/panel
+// toggles) stay immediate; this only tames the observer's storm.
+let refitTimer: number | undefined;
+new ResizeObserver(() => {
+  clearTimeout(refitTimer);
+  refitTimer = window.setTimeout(refit, 120);
+}).observe($("terminals"));
 
 // show the running app's version (from tauri.conf.json) in the footer, so it's
 // clear which build is installed after an update.
