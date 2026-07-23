@@ -2275,6 +2275,142 @@ fn read_custom_icon(path: String) -> Result<ProjectIcon, String> {
         .ok_or_else(|| "Not a usable image (PNG, SVG, ICO, JPEG, WEBP or GIF, max 512 KB)".to_string())
 }
 
+// ---------- one-time recovery of localStorage stranded by a rename ----------
+//
+// macOS keys a WKWebView app's localStorage to its bundle identifier, so the
+// rename `io.respeak.cclauncher` (Muster) -> `io.respeak.episko` pointed the app
+// at a fresh, empty store and left every `cc-*` key (the daily cost rollup, the
+// project/session roster, favourites, colours, icons) behind under the old id.
+// This reads those keys straight off the old on-disk SQLite so the frontend can
+// import any it doesn't already have (fill-absent-only — it never clobbers data
+// this install legitimately holds; see the boot shim in `main.ts`). Returns an
+// empty map wherever there is nothing to recover, so the caller is a no-op.
+
+/// WebKit stores localStorage values as UTF-16LE BLOBs (no BOM).
+#[cfg(target_os = "macos")]
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Depth-limited walk for `localstorage.sqlite3` under a WebsiteData/Default
+/// tree (the origin salt/hash dirs are minted at runtime, so the path isn't
+/// known ahead of time). Returns the largest match — the store with the most
+/// data — since a stale empty one can linger beside the real one.
+#[cfg(target_os = "macos")]
+fn newest_localstorage_db(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    let mut stack = vec![(base.to_path_buf(), 0u8)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 6 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push((p, depth + 1));
+            } else if p.file_name().and_then(|n| n.to_str()) == Some("localstorage.sqlite3") {
+                let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if best.as_ref().map_or(true, |(b, _)| sz > *b) {
+                    best = Some((sz, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Read every `cc-*` key from a WebKit `localstorage.sqlite3`. Works on a private
+/// copy (never the original) so SQLite can fold in a stranded `-wal` — the old
+/// store may hold uncheckpointed writes the main file doesn't yet have.
+#[cfg(target_os = "macos")]
+fn read_itemtable_cc_keys(
+    db: &std::path::Path,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let tmp_dir = std::env::temp_dir().join("cc-launcher");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp = tmp_dir.join("legacy-localstorage.sqlite3");
+    for ext in ["sqlite3", "sqlite3-wal", "sqlite3-shm"] {
+        let _ = std::fs::remove_file(tmp.with_extension(ext));
+    }
+    std::fs::copy(db, &tmp).map_err(|e| format!("copy legacy store: {e}"))?;
+    for ext in ["sqlite3-wal", "sqlite3-shm"] {
+        let src = db.with_extension(ext);
+        if src.exists() {
+            let _ = std::fs::copy(&src, tmp.with_extension(ext));
+        }
+    }
+
+    let read = (|| -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = rusqlite::Connection::open(&tmp).map_err(|e| format!("open legacy store: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM ItemTable")
+            .map_err(|e| format!("query legacy store: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let val: rusqlite::types::Value = row.get(1)?;
+                Ok((key, val))
+            })
+            .map_err(|e| format!("read legacy rows: {e}"))?;
+        let mut out = std::collections::HashMap::new();
+        for (key, val) in rows.flatten() {
+            if !key.starts_with("cc-") {
+                continue;
+            }
+            let text = match val {
+                rusqlite::types::Value::Blob(b) => decode_utf16le(&b),
+                rusqlite::types::Value::Text(t) => t,
+                _ => continue,
+            };
+            out.insert(key, text);
+        }
+        Ok(out)
+    })();
+
+    for ext in ["sqlite3", "sqlite3-wal", "sqlite3-shm"] {
+        let _ = std::fs::remove_file(tmp.with_extension(ext));
+    }
+    read
+}
+
+#[tauri::command]
+fn read_legacy_localstorage() -> Result<std::collections::HashMap<String, String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Previous bundle ids, newest-first. Only the installed-app id belongs
+        // here; the `pnpm tauri dev` store ("muster") is intentionally excluded.
+        const LEGACY_IDS: &[&str] = &["io.respeak.cclauncher"];
+        let home = home_dir();
+        for id in LEGACY_IDS {
+            let base = std::path::Path::new(&home)
+                .join("Library/WebKit")
+                .join(id)
+                .join("WebsiteData/Default");
+            let Some(db) = newest_localstorage_db(&base) else {
+                continue;
+            };
+            let map = read_itemtable_cc_keys(&db)?;
+            if !map.is_empty() {
+                return Ok(map);
+            }
+        }
+        Ok(std::collections::HashMap::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows/WebView2 keeps localStorage in a LevelDB, not SQLite, and the
+        // pre-rename Windows build predates this scheme — nothing to recover.
+        Ok(std::collections::HashMap::new())
+    }
+}
+
 // ---------- external (non-Episko) Claude Code sessions ----------
 //
 // Claude Code writes a per-process registry file at
@@ -3278,6 +3414,7 @@ pub fn run() {
             token_usage_by_day,
             find_project_icon,
             read_custom_icon,
+            read_legacy_localstorage,
             open_folder,
             write_debug_file,
             log_frontend,
@@ -3308,6 +3445,44 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// The legacy-store reader must decode WebKit's UTF-16LE BLOBs, keep only
+    /// `cc-*` keys, and survive a stranded `-wal`. Fixture mirrors the real
+    /// `ItemTable` schema so no machine-specific store is needed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_itemtable_decodes_utf16le_and_filters_cc_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "episko-legacy-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("localstorage.sqlite3");
+        let _ = std::fs::remove_file(&db);
+        let utf16le = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch(
+                "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB NOT NULL ON CONFLICT FAIL);",
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO ItemTable(key,value) VALUES(?1,?2)",
+                rusqlite::params!["cc-usage", utf16le(r#"{"2026-07-21":603.45}"#)],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO ItemTable(key,value) VALUES(?1,?2)",
+                rusqlite::params!["not-a-cc-key", utf16le("ignore me")],
+            )
+            .unwrap();
+        }
+        let map = read_itemtable_cc_keys(&db).unwrap();
+        assert_eq!(map.get("cc-usage").map(String::as_str), Some(r#"{"2026-07-21":603.45}"#));
+        assert!(!map.contains_key("not-a-cc-key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_usage_line_extracts_day_tokens_family_and_project() {
