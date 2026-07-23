@@ -214,7 +214,16 @@ interface Sess {
   lastEvent: string; activity: Act[];
   kind: SessKind; external: boolean; term?: Terminal; fit?: FitAddon; pane: HTMLElement;
   // task panes only
-  run?: { id: string; label: string; source: string; sourceFile: string; cmd: string; background: boolean; startedAt: number; exitCode: number | null; tail: string[] };
+  run?: {
+    id: string; label: string; source: string; sourceFile: string; cmd: string; background: boolean;
+    startedAt: number; exitCode: number | null; tail: string[];
+    /// The directory discovery ran in — where `sourceFile` is rooted, so *reveal
+    /// source* can find the file even for a task whose run cwd is a subfolder.
+    root: string;
+    /// Set when a run-on-stop rule started this — the session whose turn it was
+    /// verifying, and therefore the one a failure should be offered back to.
+    forSession?: string;
+  };
 }
 const sessions = new Map<string, Sess>();
 let activeId: string | null = null;
@@ -1140,7 +1149,9 @@ function applyHook(s: Sess, data: any) {
     }
     case "PostToolUse": closeActivity(s, data.tool_name); if (!bg()) setPhase(s, "working"); break;
     case "PostToolUseFailure": closeActivity(s, data.tool_name); if (!bg()) setPhase(s, "error"); break;
-    case "Stop": setPhase(s, "done"); clearPending(s); s.curTool = ""; s.curArg = ""; break;
+    // The turn is over — which is exactly when a project's run-on-stop rule, if it
+    // has one, gets to check the agent's work.
+    case "Stop": setPhase(s, "done"); clearPending(s); s.curTool = ""; s.curArg = ""; void maybeRunOnStop(s); break;
     case "StopFailure": setPhase(s, "error"); clearPending(s); break;
     case "SessionEnd": setPhase(s, "ended"); clearPending(s); s.curTool = ""; s.curArg = ""; break;
     case "Notification": {
@@ -1693,6 +1704,138 @@ function togglePin(key: string, id: string) {
   renderAll();
 }
 
+// ---------- package-runner override ----------
+// The lockfile decides the runner in Rust (`package_runner`), and it's right for
+// essentially every repo. This is the escape hatch for one that lies — a stray
+// pnpm-lock in an npm project. It's a *personal* per-project fact, so localStorage,
+// and it's applied here rather than in Rust: an npm task's exec is already
+// `{program:<runner>, args:["run", name]}`, so swapping the program after discovery
+// is the whole change — the discovery cache never has to learn about it.
+const RUNNERS = ["auto", "npm", "pnpm", "yarn", "bun"] as const;
+type Runner = (typeof RUNNERS)[number];
+const taskRunner: Record<string, Runner> = JSON.parse(localStorage.getItem("cc-task-runner") || "{}");
+function runnerFor(key: string): Runner { return taskRunner[key] || "auto"; }
+function setRunner(key: string, r: Runner) {
+  if (r === "auto") delete taskRunner[key]; else taskRunner[key] = r;
+  localStorage.setItem("cc-task-runner", JSON.stringify(taskRunner));
+  renderAll();
+}
+function applyRunner(list: Runnable[], key: string): Runnable[] {
+  const r = runnerFor(key);
+  if (r === "auto") return list;
+  return list.map((t) => t.source === "npm" && t.exec.mode === "argv"
+    ? { ...t, exec: { ...t.exec, program: r } } : t);
+}
+
+// ---------- remembered ${input:…} values ----------
+// A task with an input prompt shouldn't ask cold every time. Values are remembered
+// per project + task + input, so next run pre-fills what you typed last. Passwords
+// are never stored — the whole point of `password:true` is that it doesn't linger.
+const taskInputs: Record<string, string> = JSON.parse(localStorage.getItem("cc-task-inputs") || "{}");
+const inputKey = (project: string, taskId: string, inputId: string) => `${project}␟${taskId}␟${inputId}`;
+function rememberInput(project: string, taskId: string, inputId: string, val: string) {
+  taskInputs[inputKey(project, taskId, inputId)] = val;
+  localStorage.setItem("cc-task-inputs", JSON.stringify(taskInputs));
+}
+function rememberedInput(project: string, taskId: string, inputId: string): string | undefined {
+  return taskInputs[inputKey(project, taskId, inputId)];
+}
+
+// ↗ Reveal source — where a task came from, selected in the OS file manager. `root`
+// is the directory discovery ran in, so the repo-relative `sourceFile` resolves; a
+// blocked/synthetic row has no real file and shows nothing to reveal.
+function revealSource(root: string, sourceFile: string) {
+  invoke("reveal_path", { dir: root, rel: sourceFile }).catch((e) => toast("reveal failed: " + e));
+}
+
+// ---------- run on stop ----------
+// The part a plain terminal can't do. Muster already receives Claude's `Stop`
+// hook, so a project can say "when an agent finishes a turn here, run the tests" —
+// and every turn becomes a verified turn. A green run auto-dismisses like any
+// other; a red one persists, raises the same badge a blocked session does, and
+// offers its output back to the very session that caused it.
+//
+// One rule per project, keyed like pins (project root → task). The label is stored
+// beside the id only so Settings can list the rules without running discovery for
+// every project first.
+type StopRule = { id: string; label: string };
+const stopRules: Record<string, StopRule> = JSON.parse(localStorage.getItem("cc-task-onstop") || "{}");
+function saveStopRules() { localStorage.setItem("cc-task-onstop", JSON.stringify(stopRules)); }
+function toggleStopRule(key: string, r: Runnable) {
+  if (stopRules[key]?.id === r.id) delete stopRules[key];
+  else stopRules[key] = { id: r.id, label: r.label };
+  saveStopRules();
+  renderAll();
+}
+function clearStopRule(key: string) { delete stopRules[key]; saveStopRules(); renderAll(); }
+
+/// Why this task can't be a rule, or "" if it can. Unattended means unattended: an
+/// `${input:…}` prompt would block on a dialog nobody opened, a background task
+/// never exits so it could only pile up one dev server per turn, and a blocked one
+/// can't run at all.
+function stopRuleBlocked(r: Runnable): string {
+  if (r.blocked) return r.blocked;
+  if (r.background) return "a long-running task never finishes a turn";
+  if (r.inputs.length) return "it asks for input, which needs someone there";
+  return "";
+}
+
+// A Stop fires at the end of *every* turn — that's the point — but two can land in
+// quick succession, and a slow suite must never race a second copy of itself in
+// the same worktree. The floor is deliberately short: it exists to swallow a
+// double-fire, not to ration runs.
+const stopRunAt = new Map<string, number>();
+const STOP_RUN_FLOOR = 5000;
+// A run-on-stop launch is only visible as a pane *after* its dependency chain has
+// run — so a rule with `dependsOn` has no `run.id === rule.id` pane during the whole
+// dep phase, and the 5s floor alone can't stop a turn that lands mid-build from
+// racing a second chain. This marks "a chain for this project is starting", claimed
+// synchronously before the first await and cleared once the launch settles; by then
+// the rule pane exists and the in-flight scan below takes over.
+const stopInFlight = new Set<string>();
+
+async function maybeRunOnStop(s: Sess) {
+  const rule = stopRules[s.colorKey];
+  if (!rule || !isAgent(s)) return;
+  // Claimed before the first await: discovery is async, so two Stops in the same
+  // tick would otherwise both get past this.
+  if (Date.now() - (stopRunAt.get(s.colorKey) ?? 0) < STOP_RUN_FLOOR) return;
+  // A chain still starting (deps running, rule pane not created yet) wins — the pane
+  // scan below can't see it, so this covers the window the floor can't.
+  if (stopInFlight.has(s.colorKey)) {
+    dlog("info", `run-on-stop ${rule.id} skipped — a chain is already starting`);
+    return;
+  }
+  // A run of this rule still in flight wins. Restarting the suite from the top
+  // mid-flight tells you nothing and doubles the load on the machine.
+  if ([...sessions.values()].some((x) => x.kind === "task" && x.colorKey === s.colorKey && x.run?.id === rule.id && x.run.exitCode == null)) {
+    dlog("info", `run-on-stop ${rule.id} skipped — still running`);
+    return;
+  }
+  stopRunAt.set(s.colorKey, Date.now());
+  stopInFlight.add(s.colorKey);
+  try {
+    // Discover in the *session's* workdir, so with several worktrees of one repo
+    // open the run verifies the checkout the agent actually just edited. Hidden
+    // tasks count — hiding is about the picker, not about what may run.
+    const spec = (await discoverTasks(s.workdir, s.colorKey, true)).find((r) => r.id === rule.id);
+    if (!spec) {
+      dlog("warn", `run-on-stop ${rule.id} gone from ${s.project}`);
+      toast(`Run after a turn: “${rule.label}” isn’t in ${s.project} any more`);
+      return;
+    }
+    const why = stopRuleBlocked(spec);
+    if (why) { dlog("warn", `run-on-stop ${rule.id} skipped: ${why}`); return; }
+    dlog("info", `run-on-stop ${rule.id} · ${s.project} · ${s.id.slice(0, 8)} finished a turn`);
+    await launchWithDeps(spec, s.project, {
+      colorKey: s.colorKey, worktree: s.worktree, branch: s.branch,
+      discoveredIn: spec.cwd, forSession: s.id, focus: false,
+    });
+  } finally {
+    stopInFlight.delete(s.colorKey);
+  }
+}
+
 /// The command as a human reads it — the picker's subtitle and the inspector's
 /// "command" row both show exactly what will run.
 function execCmd(r: Runnable): string {
@@ -1730,9 +1873,15 @@ function renderTaskInspector(s: Sess) {
   // terminal can't do. Only agents, and only when the run actually failed.
   // Embedded panes only: a session running in Ghostty/iTerm has no PTY we can type
   // into, so offering the handoff there would fail at the click.
-  const targets = failed ? [...sessions.values()].filter((x) => isAgent(x) && !x.external && x.colorKey === s.colorKey && x.phase !== "ended") : [];
-  const handoff = targets.length
-    ? `<button class="tact hero" data-send="${targets[0].id}">↩ Send output to “${esc(targets[0].title || targets[0].branch || "session")}”</button>`
+  const candidates = failed ? [...sessions.values()].filter((x) => isAgent(x) && !x.external && x.colorKey === s.colorKey && x.phase !== "ended") : [];
+  // A run-on-stop failure goes back to the session whose turn it was checking — and
+  // *only* that session. If it's gone (ended) or unreachable (external, no PTY to
+  // type into), offer nothing rather than misdirecting the output to an unrelated
+  // agent that happens to sort first. A hand-run task (no forSession) still offers
+  // the first live agent, which is the useful default there.
+  const target = r.forSession ? candidates.find((x) => x.id === r.forSession) : candidates[0];
+  const handoff = target
+    ? `<button class="tact hero" data-send="${target.id}">↩ Send output to “${esc(target.title || target.branch || "session")}”</button>`
     : "";
 
   $("inspector").innerHTML = `
@@ -1748,12 +1897,14 @@ function renderTaskInspector(s: Sess) {
       ${handoff}
       <button class="tact" data-rerun="1">⟳ Re-run</button>
       <button class="tact" data-pin="1">${pinnedIds(s.colorKey).includes(r.id) ? "★ Unpin" : "☆ Pin"}</button>
+      <button class="tact" data-reveal="1">↗ Reveal source</button>
       ${running ? `<button class="tact" data-kill="1">■ Stop</button>` : ""}
     </div>`;
 
   const insp = $("inspector");
   insp.querySelector("[data-rerun]")?.addEventListener("click", () => rerunTask(s));
   insp.querySelector("[data-pin]")?.addEventListener("click", () => togglePin(s.colorKey, r.id));
+  insp.querySelector("[data-reveal]")?.addEventListener("click", () => revealSource(r.root, r.sourceFile));
   insp.querySelector("[data-kill]")?.addEventListener("click", () => invoke("kill_session", { sessionId: s.id }).catch(() => {}));
   insp.querySelector("[data-send]")?.addEventListener("click", (e) => {
     sendOutputToSession(s, (e.currentTarget as HTMLElement).dataset.send!);
@@ -1777,7 +1928,14 @@ function sendOutputToSession(task: Sess, targetId: string) {
 
 // `discoveredIn` is the directory discovery ran in, which is how we tell a task
 // that declared its own cwd from one that merely inherited the default.
-interface TaskLaunchOpts { colorKey?: string; worktree?: string | null; branch?: string; discoveredIn?: string }
+interface TaskLaunchOpts {
+  colorKey?: string; worktree?: string | null; branch?: string; discoveredIn?: string;
+  /// `false` for a run nobody clicked — a run-on-stop pane must not yank the stage
+  /// away from the session you were reading. It still appears in the sidebar.
+  focus?: boolean;
+  /// The session whose turn this run is verifying (see run-on-stop).
+  forSession?: string;
+}
 
 // Start one run of a Runnable in its own pane. Mirrors launchShell — same PTY,
 // same xterm setup — because a task genuinely is just another pane.
@@ -1816,10 +1974,13 @@ async function launchTask(r: Runnable, project: string, opts: TaskLaunchOpts = {
     curTool: "", curArg: "", todos: [], ctxHist: [], costHist: [], git: null, res: null,
     lastEvent: "", activity: [],
     resumeId: id, kind: "task", external: false, term, fit, pane,
-    run: { id: r.id, label: r.label, source: r.source, sourceFile: r.sourceFile, cmd, background: r.background, startedAt: Date.now(), exitCode: null, tail: [] },
+    run: { id: r.id, label: r.label, source: r.source, sourceFile: r.sourceFile, cmd, background: r.background, startedAt: Date.now(), exitCode: null, tail: [], root: opts.discoveredIn ?? colorKey, forSession: opts.forSession },
   };
   sessions.set(id, s);
-  setActive(id);
+  // An unfocused pane can't be measured, so it starts at xterm's default 24×80 and
+  // gets a real size the moment you activate it (setActive refits and resizes the
+  // PTY). Only run-on-stop takes that path.
+  if (opts.focus !== false) setActive(id);
   dlog("info", `task ${r.id} · ${project} · ${cmd}`);
   term.writeln(`\x1b[90m$ ${cmd}\x1b[0m\r\n`);
   try {
@@ -1873,8 +2034,13 @@ async function launchWithDeps(r: Runnable, project: string, opts: TaskLaunchOpts
   const sequence = r.dependsOrder === "sequence";
   dlog("info", `task ${r.id} · ${deps.length} dep${deps.length === 1 ? "" : "s"} (${sequence ? "sequence" : "parallel"})`);
 
+  // A dependency inherits the stage behaviour (`focus`) but not the identity of the
+  // run that pulled it in: `forSession` belongs to the rule pane, not its build step,
+  // and `discoveredIn` is the parent's cwd, wrong for the dep's own *reveal source*.
+  // Let the dep resolve its own root (falls back to the project root).
+  const depOpts: TaskLaunchOpts = { ...opts, forSession: undefined, discoveredIn: undefined };
   const runDep = async (d: Runnable): Promise<boolean> => {
-    const id = await launchWithDeps(d, project, opts, new Set(seen));
+    const id = await launchWithDeps(d, project, depOpts, new Set(seen));
     if (!id) return false;
     return (await waitForExit(id)) === 0;
   };
@@ -1914,8 +2080,11 @@ const lastRunnableById = new Map<string, Runnable>();
 async function discoverTasks(workdir: string, colorKey = workdir, includeHidden = false): Promise<Runnable[]> {
   const trusted = taskPrefs.introspect && taskPrefs.providers.includes("just") && (isTrusted(workdir) || isTrusted(colorKey));
   try {
-    const all = (await invoke<Runnable[]>("discover_runnables", { workdir, trusted }))
+    const raw = (await invoke<Runnable[]>("discover_runnables", { workdir, trusted }))
       .filter((r) => taskPrefs.providers.includes(r.source as Provider));
+    // Swap in the project's runner override before anything caches the result, so a
+    // re-run months later uses the same runner the picker showed.
+    const all = applyRunner(raw, colorKey);
     // Resolve dependsOn against everything discovered, hidden or not — hiding a
     // task from the picker shouldn't quietly break another task that needs it.
     for (const r of all) lastRunnableById.set(r.id, r);
@@ -1925,6 +2094,13 @@ async function discoverTasks(workdir: string, colorKey = workdir, includeHidden 
     dlog("warn", `discover failed (${workdir}): ${e}`);
     return [];
   }
+}
+
+// Drop the backend's cached parse for this project so the next discover re-reads
+// from disk. The stamp already catches edits to files Muster reads; this is the
+// escape hatch for what it can't see — a file an introspector imports itself.
+async function rescanTasks(workdir: string) {
+  await invoke("rescan_runnables", { workdir }).catch((e) => dlog("warn", `rescan: ${e}`));
 }
 
 // ---------- the inputs prompt ----------
@@ -1937,9 +2113,13 @@ function openInputPrompt(r: Runnable, project: string, opts: TaskLaunchOpts) {
   inputCtx = { r, project, opts };
   $("inSub").textContent = `${r.label} · ${r.inputs.length} input${r.inputs.length === 1 ? "" : "s"}`;
   $("inBody").innerHTML = r.inputs.map((i, n) => {
+    // What you typed last for this exact input wins over the file's default — but a
+    // password is never remembered, so it always starts empty.
+    const remembered = i.password ? undefined : rememberedInput(project, r.id, i.id);
+    const val = remembered ?? i.default ?? "";
     const field = i.kind === "pickString"
-      ? `<select class="in-ctl" data-n="${n}">${i.options.map((o) => `<option value="${esc(o)}"${o === i.default ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>`
-      : `<input class="in-ctl" data-n="${n}" type="${i.password ? "password" : "text"}" value="${esc(i.default ?? "")}" placeholder="${esc(i.default ?? "")}" spellcheck="false" autocomplete="off" />`;
+      ? `<select class="in-ctl" data-n="${n}">${i.options.map((o) => `<option value="${esc(o)}"${o === val ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>`
+      : `<input class="in-ctl" data-n="${n}" type="${i.password ? "password" : "text"}" value="${esc(val)}" placeholder="${esc(i.default ?? "")}" spellcheck="false" autocomplete="off" />`;
     return `<div class="in-field">
       <label class="in-lbl">${esc(i.description)}<span class="in-id">${esc(i.id)}</span></label>
       ${field}
@@ -1959,7 +2139,10 @@ function submitInputPrompt() {
   const { r, project, opts } = inputCtx;
   const vals: Record<string, string> = {};
   $("inBody").querySelectorAll<HTMLInputElement | HTMLSelectElement>(".in-ctl").forEach((el) => {
-    vals[r.inputs[+el.dataset.n!].id] = el.value;
+    const input = r.inputs[+el.dataset.n!];
+    vals[input.id] = el.value;
+    // Remember for next time — but never a password.
+    if (!input.password) rememberInput(project, r.id, input.id, el.value);
   });
   closeInputPrompt();
   void launchWithDeps(applyInputs(r, vals), project, opts);
@@ -4040,6 +4223,13 @@ const SET_TABS: SetTab[] = [
       { kind: "toggle", set: "taskattn", label: "Raise attention when a run fails",
         hint: "Uses the same badge and tray notification as a blocked session.",
         on: () => taskPrefs.attention },
+      // Set where the tasks are (the project's task panel); reviewed and revoked
+      // here, the same shape as the trust list above.
+      { kind: "multi", set: "unstop", label: "Run after a session stops",
+        hint: "When an agent finishes a turn in one of these projects, its task runs — unfocused, so it never takes the stage. A failure keeps its pane and offers the output back to that session. Click to remove.",
+        on: () => Object.keys(stopRules),
+        segs: () => Object.entries(stopRules).map(([path, r]) => ({ value: path, label: `${basename(path)} · ${r.label}`, sub: tilde(path) })),
+        empty: "No rules yet — set one with ⟲ in a project's task panel (⌘K → Manage this project's tasks)." },
     ],
   },
   {
@@ -4194,6 +4384,7 @@ function applySetting(set: string, val: string) {
   else if (set === "dismiss") { taskPrefs.dismissMs = +val; saveTaskPrefs(); }
   else if (set === "taskattn") { taskPrefs.attention = val === "1"; saveTaskPrefs(); }
   else if (set === "untrust") untrustProject(val);
+  else if (set === "unstop") clearStopRule(val);
   renderSettings();
 }
 function setFontFromSettings(cmd: string) {
@@ -4236,6 +4427,9 @@ listen<{ sessionId: string; code: number }>("pty-exit", (e) => {
       ? `\r\n\x1b[32m✓ ${s.run!.label} — exit 0\x1b[0m`
       : `\r\n\x1b[31m✕ ${s.run!.label} — exit ${code}\x1b[0m`);
     if (code === 0) scheduleDismiss(s);
+    // Nobody clicked this one and its pane isn't on screen, so the badge alone
+    // would be the only sign it went red.
+    else if (s.run!.forSession) toast(`${s.run!.label} failed after that turn — exit ${code}`);
     dlog(code === 0 ? "info" : "warn", `task ${s.run!.id} exit ${code}`);
   } else {
     s.phase = "ended";
@@ -4808,7 +5002,12 @@ function toggleHidden(key: string, id: string) {
 
 let mgrCtx: { project: string; colorKey: string; workdir: string } | null = null;
 let mgrList: Runnable[] = [];
-let mgrEdit: { id: string | null; label: string; run: string; group: string; background: boolean; cwd: string } | null = null;
+// The discovered ids the project overrides — a discovered task edited into a
+// committable `[override.*]` rather than a mutation of the file it came from.
+let mgrOverrides: string[] = [];
+// `kind` decides where a save lands: "own" writes a `[[task]]`, "override" writes an
+// `[override."<id>"]` keyed by the discovered task's id.
+let mgrEdit: { id: string | null; kind: "own" | "override"; label: string; run: string; group: string; background: boolean; cwd: string } | null = null;
 
 async function openTaskManager() {
   const c = runTargetCtx();
@@ -4823,6 +5022,7 @@ async function refreshMgr() {
   if (!mgrCtx) return;
   // Show hidden tasks too — this is the panel where you un-hide them.
   mgrList = await discoverTasks(mgrCtx.workdir, mgrCtx.colorKey, true);
+  mgrOverrides = await invoke<string[]>("list_task_overrides", { workdir: mgrCtx.workdir }).catch(() => []);
   renderMgr();
 }
 function closeTaskManager() {
@@ -4841,46 +5041,104 @@ function renderMgr() {
   ($("mgrSave") as HTMLButtonElement).hidden = !editing;
   ($("mgrNew") as HTMLButtonElement).hidden = editing;
   ($("mgrOpen") as HTMLButtonElement).hidden = editing;
+  ($("mgrRescan") as HTMLButtonElement).hidden = editing;
   if (mgrEdit) { renderMgrForm(); return; }
 
   const pins = pinnedIds(colorKey), hid = hiddenIds(colorKey);
-  $("mgrBody").innerHTML = mgrList.length
-    ? mgrList.map((r) => {
-        const own = r.source === "muster";   // only our own file is editable
+  const rule = stopRules[colorKey];
+  // A committable command edit lands in .muster/tasks.toml either way: our own
+  // task in place, a discovered one as an [override.*] that never touches its file.
+  const rowsHtml = mgrList.map((r) => {
+        const own = r.source === "muster";
+        const overridden = mgrOverrides.includes(r.id);
+        const dangling = r.id.startsWith("override:");   // an override whose target vanished
+        const editable = !r.blocked;
+        // At most one task per project runs after a turn, so the glyph is a radio
+        // in disguise: clicking another moves the rule, clicking this one clears it.
+        const onStop = rule?.id === r.id;
+        const noStop = stopRuleBlocked(r);
+        const tags = `${r.background ? " · bg" : ""}${overridden ? " · overridden" : ""}${r.blocked ? " · " + esc(r.blocked) : ""}${onStop ? " · runs after each turn" : ""}`;
+        const editBtn = own
+          ? `<button class="mgr-b" data-edit="${esc(r.id)}" title="Edit in .muster/tasks.toml">✎</button>
+             <button class="mgr-b danger" data-del="${esc(r.id)}" title="Delete from .muster/tasks.toml">✕</button>`
+          : `<button class="mgr-b" data-edit="${esc(r.id)}" title="Edit — writes an override into .muster/tasks.toml, never ${esc(r.sourceFile)}">✎</button>`;
+        const revertBtn = (overridden || dangling)
+          ? `<button class="mgr-b" data-revert="${esc(dangling ? r.id.slice("override:".length) : r.id)}" title="Revert to what ${esc(r.sourceFile)} declares">↺</button>`
+          : "";
         return `<div class="mgr-row${hid.includes(r.id) ? " off" : ""}">
-          <span class="txt"><b>${esc(r.label)}</b><small>${esc(r.sourceFile)}${r.background ? " · bg" : ""}${r.blocked ? " · " + esc(r.blocked) : ""}</small></span>
+          <span class="txt"><b>${esc(r.label)}</b><small>${esc(r.sourceFile)}${tags}</small></span>
           <span class="mgr-acts">
             <button class="mgr-b${pins.includes(r.id) ? " on" : ""}" data-pin="${esc(r.id)}" title="${pins.includes(r.id) ? "Unpin" : "Pin to the top of the picker"}">${pins.includes(r.id) ? "★" : "☆"}</button>
             <button class="mgr-b" data-hide="${esc(r.id)}" title="${hid.includes(r.id) ? "Show in the picker" : "Hide from the picker"}">${hid.includes(r.id) ? "◌" : "◎"}</button>
-            ${own ? `<button class="mgr-b" data-edit="${esc(r.id)}" title="Edit in .muster/tasks.toml">✎</button>
-                     <button class="mgr-b danger" data-del="${esc(r.id)}" title="Delete from .muster/tasks.toml">✕</button>`
-                  : `<button class="mgr-b quiet" disabled title="${esc(r.sourceFile)} belongs to another tool — Muster only writes its own file">read-only</button>`}
+            <button class="mgr-b${onStop ? " on" : ""}${noStop ? " quiet" : ""}" ${noStop ? "disabled" : ""} data-onstop="${esc(r.id)}"
+              title="${noStop ? esc(`Can't run after a turn — ${noStop}`) : onStop ? "Stop running this after a turn" : "Run this whenever a session in this project finishes a turn"}">⟲</button>
+            ${revertBtn}${editable ? editBtn : ""}
           </span>
         </div>`;
-      }).join("")
-    : `<div class="run-empty">No tasks found in this project.</div>`;
+      }).join("");
+  // A per-project runner override — only meaningful when the project actually has
+  // npm scripts. Absent everywhere else, so it doesn't imply a knob that does nothing.
+  const runnerStrip = mgrList.some((r) => r.source === "npm")
+    ? `<div class="mgr-row mgr-runner">
+         <span class="txt"><b>Package runner</b><small>the lockfile picks this — override a repo that ships the wrong one</small></span>
+         <span class="s-ctl">${RUNNERS.map((rn) =>
+           `<button class="opt${runnerFor(colorKey) === rn ? " on" : ""}" data-runner="${rn}">${rn}</button>`).join("")}</span>
+       </div>`
+    : "";
+  $("mgrBody").innerHTML = mgrList.length ? runnerStrip + rowsHtml : `<div class="run-empty">No tasks found in this project.</div>`;
 
   $("mgrBody").querySelectorAll<HTMLElement>("[data-pin]").forEach((el) =>
     el.addEventListener("click", () => { togglePin(colorKey, el.dataset.pin!); renderMgr(); }));
   $("mgrBody").querySelectorAll<HTMLElement>("[data-hide]").forEach((el) =>
     el.addEventListener("click", () => { toggleHidden(colorKey, el.dataset.hide!); renderMgr(); }));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-onstop]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const r = mgrList.find((x) => x.id === el.dataset.onstop!);
+      if (!r) return;
+      toggleStopRule(colorKey, r);
+      toast(stopRules[colorKey]?.id === r.id
+        ? `${r.label} will run when a session here finishes a turn`
+        : `${r.label} no longer runs after a turn`);
+      renderMgr();
+    }));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-runner]").forEach((el) =>
+    el.addEventListener("click", () => { setRunner(colorKey, el.dataset.runner as Runner); void refreshMgr(); }));
   $("mgrBody").querySelectorAll<HTMLElement>("[data-edit]").forEach((el) =>
     el.addEventListener("click", () => startMgrEdit(el.dataset.edit!)));
+  $("mgrBody").querySelectorAll<HTMLElement>("[data-revert]").forEach((el) =>
+    el.addEventListener("click", () => void revertMgrOverride(el.dataset.revert!)));
   $("mgrBody").querySelectorAll<HTMLElement>("[data-del]").forEach((el) =>
     el.addEventListener("click", () => void deleteMgrTask(el.dataset.del!)));
 }
 
 function startMgrEdit(id: string | null) {
   const r = id ? mgrList.find((x) => x.id === id) : null;
+  // Editing a discovered task doesn't rewrite its file — it captures the effective
+  // command as an override. Our own tasks edit in place.
+  const kind: "own" | "override" = r && r.source !== "muster" ? "override" : "own";
   mgrEdit = r
-    ? { id: r.id, label: r.label, run: r.exec.mode === "shell" ? r.exec.line : execCmd(r), group: r.group ?? "", background: r.background, cwd: "" }
-    : { id: null, label: "", run: "", group: "", background: false, cwd: "" };
+    ? { id: r.id, kind, label: r.label, run: r.exec.mode === "shell" ? r.exec.line : execCmd(r), group: r.group ?? "", background: r.background, cwd: "" }
+    : { id: null, kind: "own", label: "", run: "", group: "", background: false, cwd: "" };
   renderMgr();
+}
+
+async function revertMgrOverride(id: string) {
+  if (!mgrCtx) return;
+  try {
+    await invoke("remove_task_override", { workdir: mgrCtx.workdir, id });
+    toast(`Reverted “${id}” to its own definition`);
+    await refreshMgr();
+  } catch (err) { toast("revert failed: " + err); }
 }
 
 function renderMgrForm() {
   const e = mgrEdit!;
-  $("mgrBody").innerHTML = `
+  // Editing a task another tool owns is an override, not a rewrite — say so, because
+  // it's the surprising-but-deliberate half of "Muster never touches a file it didn't create".
+  const note = e.kind === "override"
+    ? `<div class="mgr-note">Saving writes an <b>override</b> into <code>.muster/tasks.toml</code>. The original stays as its tool declared it; ↺ Revert removes the override.</div>`
+    : "";
+  $("mgrBody").innerHTML = note + `
     <div class="in-field"><label class="in-lbl">Label</label>
       <input class="in-ctl" id="mgrLabel" value="${esc(e.label)}" placeholder="Dev server" spellcheck="false" /></div>
     <div class="in-field"><label class="in-lbl">Command<span class="in-id">runs in a login shell</span></label>
@@ -4923,19 +5181,22 @@ async function saveMgrTask() {
       { title: "Create .muster/tasks.toml?", kind: "info", okLabel: "Create", cancelLabel: "Cancel" });
     if (!ok) return;
   }
+  const task = { label: e.label.trim(), run: e.run.trim(), group: e.group || null, background: e.background, cwd: e.cwd.trim() || null };
   try {
-    // Discovery ids are namespaced ("muster:dev"); the file addresses the bare slug.
-    await invoke("save_muster_task", {
-      workdir: mgrCtx.workdir,
-      id: e.id ? e.id.replace(/^muster:/, "") : null,
-      task: { label: e.label.trim(), run: e.run.trim(), group: e.group || null, background: e.background, cwd: e.cwd.trim() || null },
-    });
-    toast(e.id ? `Updated ${e.label}` : `Added ${e.label}`);
+    if (e.kind === "override") {
+      // The override is keyed by the discovered id verbatim ("vscode:test").
+      await invoke("save_task_override", { workdir: mgrCtx.workdir, id: e.id, task });
+      toast(`Overrode ${e.label}`);
+    } else {
+      // Discovery ids are namespaced ("muster:dev"); the file addresses the bare slug.
+      await invoke("save_muster_task", { workdir: mgrCtx.workdir, id: e.id ? e.id.replace(/^muster:/, "") : null, task });
+      toast(e.id ? `Updated ${e.label}` : `Added ${e.label}`);
+    }
     mgrEdit = null;
     await refreshMgr();
   } catch (err) {
     toast("save failed: " + err);
-    dlog("error", `save_muster_task: ${err}`);
+    dlog("error", `save task: ${err}`);
   }
 }
 
@@ -5261,6 +5522,7 @@ $("mgrOpen").addEventListener("click", () => {
     .then(([path]) => openUrl("file://" + path))
     .catch((e) => toast("open failed: " + e));
 });
+$("mgrRescan").addEventListener("click", () => { if (mgrCtx) void rescanTasks(mgrCtx.workdir).then(() => refreshMgr()).then(() => toast("Rescanned")); });
 $("runInput").addEventListener("input", () => { runSel = 0; renderRunPicker(($("runInput") as HTMLInputElement).value); });
 $("runInput").addEventListener("keydown", (e) => {
   const meta = e.metaKey || e.ctrlKey;
@@ -5268,7 +5530,8 @@ $("runInput").addEventListener("keydown", (e) => {
   if (e.key === "ArrowDown") { e.preventDefault(); runSel = Math.min(runSel + 1, flat.length - 1); renderRunPicker(($("runInput") as HTMLInputElement).value); }
   else if (e.key === "ArrowUp") { e.preventDefault(); runSel = Math.max(runSel - 1, 0); renderRunPicker(($("runInput") as HTMLInputElement).value); }
   else if (e.key === "Enter") { e.preventDefault(); pickRun(meta); }
-  else if (meta && e.shiftKey && e.key.toLowerCase() === "r") { e.preventDefault(); void openRunPicker(); }
+  // ⌘⇧R inside the picker is a *real* rescan: drop the cache, then re-discover.
+  else if (meta && e.shiftKey && e.key.toLowerCase() === "r") { e.preventDefault(); if (runCtx) void rescanTasks(runCtx.workdir).then(() => openRunPicker()); }
   else if (e.key === "Tab") { e.preventDefault(); cycleRunSource(e.shiftKey ? -1 : 1); }
   else if (e.key === "Escape") { e.preventDefault(); closeRunPicker(); }
 });

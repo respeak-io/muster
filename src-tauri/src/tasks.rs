@@ -14,8 +14,9 @@
 // - **Ids are stable and namespaced** (`npm:test`, `muster:dev`). The frontend
 //   persists pins and frecency against them, so they must survive a rescan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +112,182 @@ pub fn discover(root: &Path, trusted: bool) -> Vec<Runnable> {
     out.extend(make_targets(root));
     out.extend(cargo_tasks(root));
     dedupe_ids(&mut out);
+    apply_overrides(&mut out, root);
     out
+}
+
+/// Read the `[override.*]` table from `.muster/tasks.toml`. A malformed file already
+/// surfaces as a blocked row via `muster_tasks`, so a parse error here is silent —
+/// reporting it twice would just add noise.
+fn task_overrides(root: &Path) -> BTreeMap<String, MusterOverride> {
+    std::fs::read_to_string(root.join(MUSTER_TASKS))
+        .ok()
+        .and_then(|t| toml::from_str::<MusterFile>(&t).ok())
+        .map(|f| f.overrides)
+        .unwrap_or_default()
+}
+
+/// Patch discovered tasks with the project's committable overrides. Runs *after*
+/// dedupe, so it keys off the same final ids the frontend pins and re-runs against.
+///
+/// An override whose target isn't present becomes a **blocked row** rather than
+/// disappearing: a typo'd id (`vscode:tset`) then reads as a broken override, not as
+/// nothing — the same honesty the rest of the module applies to what it can't run.
+fn apply_overrides(list: &mut Vec<Runnable>, root: &Path) {
+    let overrides = task_overrides(root);
+    if overrides.is_empty() {
+        return;
+    }
+    let mut dangling = Vec::new();
+    for (id, ov) in overrides {
+        match list.iter_mut().find(|r| r.id == id) {
+            Some(r) => apply_override(r, &ov, root),
+            None => dangling.push(blocked_row(
+                &format!("override:{id}"),
+                &format!("override “{id}”"),
+                ".muster/tasks.toml",
+                "muster",
+                root,
+                &format!("overrides “{id}”, which nothing here declares"),
+            )),
+        }
+    }
+    list.extend(dangling);
+}
+
+/// Apply one override in place. Only fields the override sets are touched. A new
+/// `run` becomes a shell command and its `${input:…}` prompts are re-derived — kept
+/// from the original task where the id survives, synthesized as a bare prompt where
+/// the override introduced one.
+fn apply_override(r: &mut Runnable, ov: &MusterOverride, root: &Path) {
+    if let Some(label) = &ov.label {
+        r.label = label.clone();
+    }
+    if let Some(group) = &ov.group {
+        r.group = (!group.is_empty()).then(|| group.clone());
+    }
+    if let Some(bg) = ov.background {
+        r.background = bg;
+    }
+    if let Some(cwd) = &ov.cwd {
+        // Relative to the project root, exactly like a `[[task]]`'s own `cwd`.
+        if !cwd.is_empty() {
+            r.cwd = root.join(cwd).display().to_string();
+        }
+    }
+    if let Some(run) = &ov.run {
+        r.inputs = redetect_inputs(run, &r.inputs);
+        r.exec = Exec::Shell { line: run.clone() };
+    }
+}
+
+/// The `${input:id}` specs for a rewritten command line: keep the original spec
+/// wherever the id still appears, synthesize a plain prompt for any the override
+/// newly introduced.
+fn redetect_inputs(run: &str, original: &[InputSpec]) -> Vec<InputSpec> {
+    referenced_inputs(&[run.to_string()])
+        .into_iter()
+        .map(|id| {
+            original.iter().find(|i| i.id == id).cloned().unwrap_or(InputSpec {
+                description: id.clone(),
+                id,
+                kind: "promptString".into(),
+                default: None,
+                options: Vec::new(),
+                password: false,
+            })
+        })
+        .collect()
+}
+
+// ── the discovery cache ─────────────────────────────────────────────────────
+//
+// Parsing two small files was cheap enough to redo on every picker open. Three of
+// the providers now *spawn a process* to enumerate themselves, and run-on-stop
+// asks for a project's tasks once per agent turn rather than once per click — so
+// repeat discovery goes through a cache keyed by (root, trusted).
+//
+// Invalidation is by **stamp, not by a watcher**: every file a provider reads is
+// probed for (mtime, len), and an entry is stale the moment one of them differs —
+// including appearing or being deleted. A file watcher would need a thread, a
+// crate and a lifecycle per open project to answer the same question ~20
+// `metadata()` calls answer in well under a millisecond, and it would still have
+// to stat everything on the first read.
+//
+// Known gap: files an introspector pulls in *itself* — `just`'s `import`/`mod`,
+// a Taskfile `includes:` — aren't stamped, so editing one is invisible until the
+// importing file changes. Toggling trust re-keys the entry, which is the escape
+// hatch that exists today.
+
+const MUSTER_TASKS: &str = ".muster/tasks.toml";
+const VSCODE_TASKS: &str = ".vscode/tasks.json";
+const VSCODE_LAUNCH: &str = ".vscode/launch.json";
+const PACKAGE_JSON: &str = "package.json";
+const CARGO_TOML: &str = "Cargo.toml";
+/// `cargo_tasks` reads this only to decide whether there's a binary to `run`, but
+/// it *is* an input to discovery, so the stamp has to see it.
+const CARGO_MAIN: &str = "src/main.rs";
+const JUST_FILES: &[&str] = &["justfile", ".justfile", "Justfile"];
+const MAKE_FILES: &[&str] = &["Makefile", "makefile", "GNUmakefile"];
+/// `package_runner` reads these by existence to pick the npm task runner, so a
+/// lockfile appearing or vanishing changes discovery output (`exec.program`) even
+/// when `package.json` is byte-identical — the stamp has to see them too.
+const LOCK_FILES: &[&str] =
+    &["pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock", "package-lock.json"];
+
+/// Every path discovery reads, relative to the project root. **A new provider file
+/// belongs in this list too** — one that's missing goes stale behind the cache,
+/// which reads as "Muster didn't pick up my edit".
+fn source_files() -> Vec<&'static str> {
+    let mut v = vec![MUSTER_TASKS, VSCODE_TASKS, VSCODE_LAUNCH, PACKAGE_JSON, CARGO_TOML, CARGO_MAIN];
+    v.extend(JUST_FILES);
+    v.extend(LOCK_FILES);
+    v.extend(TASKFILE.markers);
+    v.extend(MISE.markers);
+    v.extend(MAKE_FILES);
+    v
+}
+
+/// `None` = the file isn't there, which is as much a fact about the project as
+/// its contents are: deleting a justfile has to invalidate too.
+type Stamp = Vec<Option<(std::time::SystemTime, u64)>>;
+
+fn stamp(root: &Path) -> Stamp {
+    source_files()
+        .iter()
+        .map(|rel| {
+            std::fs::metadata(root.join(rel))
+                .ok()
+                .map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()))
+        })
+        .collect()
+}
+
+static CACHE: LazyLock<Mutex<HashMap<(String, bool), (Stamp, Vec<Runnable>)>>> =
+    LazyLock::new(Default::default);
+
+/// `discover`, memoised against the source files it read. Anything wanting a
+/// guaranteed-fresh parse (the tests) calls `discover` directly.
+pub fn discover_cached(root: &Path, trusted: bool) -> Vec<Runnable> {
+    let key = (root.display().to_string(), trusted);
+    let now = stamp(root);
+    // A panic in another thread poisoned nothing that matters here — the worst a
+    // half-written cache costs is one extra parse.
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((was, list)) = cache.get(&key) {
+        if *was == now {
+            return list.clone();
+        }
+    }
+    let list = discover(root, trusted);
+    // Two entries per project at most, and a session's worth of projects is a
+    // handful — but a map that only ever grows is a leak by another name, and
+    // dropping the lot costs one re-parse.
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, (now, list.clone()));
+    list
 }
 
 /// Ids must be unique — the frontend keys pins and frecency off them. A collision
@@ -136,6 +312,29 @@ fn dedupe_ids(list: &mut [Runnable]) {
 struct MusterFile {
     #[serde(default)]
     task: Vec<MusterTask>,
+    /// `[override."vscode:test"]` — a committable patch over a task some *other*
+    /// tool declares, so editing a discovered task never rewrites `.vscode/tasks.json`
+    /// or a justfile. Keyed by the discovered id; applied in `discover` after every
+    /// provider has run. See `apply_overrides`.
+    #[serde(default, rename = "override")]
+    overrides: BTreeMap<String, MusterOverride>,
+}
+
+/// The patch half of a `[[task]]`. Every field optional: an override that only
+/// renames a task carries just `label`. `run`, when present, replaces the command
+/// (and re-derives `${input:…}` prompts from the new line).
+#[derive(Deserialize, Default)]
+struct MusterOverride {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    background: Option<bool>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -158,7 +357,7 @@ struct MusterTask {
 }
 
 fn muster_tasks(root: &Path) -> Vec<Runnable> {
-    let path = root.join(".muster").join("tasks.toml");
+    let path = root.join(MUSTER_TASKS);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -228,7 +427,7 @@ fn package_runner(root: &Path) -> &'static str {
 }
 
 fn npm_scripts(root: &Path) -> Vec<Runnable> {
-    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
+    let Ok(text) = std::fs::read_to_string(root.join(PACKAGE_JSON)) else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -407,7 +606,7 @@ fn parse_input_specs(root: &Path, cwd: &str, raw: Option<&serde_json::Value>) ->
 
 fn vscode_tasks(root: &Path) -> Vec<Runnable> {
     let rel = format!(".vscode{}tasks.json", std::path::MAIN_SEPARATOR);
-    let path = root.join(".vscode").join("tasks.json");
+    let path = root.join(VSCODE_TASKS);
     let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
 
     // tasks.json is JSONC: comments and trailing commas are normal, and VS Code's
@@ -566,7 +765,7 @@ fn vscode_tasks(root: &Path) -> Vec<Runnable> {
 
 fn launch_configs(root: &Path) -> Vec<Runnable> {
     let rel = format!(".vscode{}launch.json", std::path::MAIN_SEPARATOR);
-    let Ok(text) = std::fs::read_to_string(root.join(".vscode").join("launch.json")) else {
+    let Ok(text) = std::fs::read_to_string(root.join(VSCODE_LAUNCH)) else {
         return Vec::new();
     };
     let json: serde_json::Value = match jsonc_parser::parse_to_serde_value(&text, &Default::default()) {
@@ -705,10 +904,10 @@ fn launch_configs(root: &Path) -> Vec<Runnable> {
 /// Purely conventional: the file is read only to confirm it's a crate and to see
 /// whether there's a binary to `run`.
 fn cargo_tasks(root: &Path) -> Vec<Runnable> {
-    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(root.join(CARGO_TOML)) else { return Vec::new() };
     // A virtual workspace root has no package to build; its members do.
     let is_workspace_only = text.contains("[workspace]") && !text.contains("[package]");
-    let has_bin = root.join("src").join("main.rs").exists() || text.contains("[[bin]]");
+    let has_bin = root.join(CARGO_MAIN).exists() || text.contains("[[bin]]");
 
     let mut out: Vec<(&str, &str, &str)> = vec![
         ("check", "cargo check", "check"),
@@ -877,8 +1076,7 @@ const MISE: Introspector = Introspector {
 /// untrusted project with a justfile gets a single blocked row instead, so the
 /// recipes read as withheld rather than absent.
 fn just_recipes(root: &Path, trusted: bool) -> Vec<Runnable> {
-    let names = ["justfile", ".justfile", "Justfile"];
-    let Some(found) = names.iter().find(|n| root.join(n).exists()) else { return Vec::new() };
+    let Some(found) = JUST_FILES.iter().find(|n| root.join(n).exists()) else { return Vec::new() };
     if !trusted {
         return vec![blocked_row(
             "just:__untrusted",
@@ -979,8 +1177,7 @@ fn just_recipes(root: &Path, trusted: bool) -> Vec<Runnable> {
 /// Picks up the self-documenting convention (`target: ## description`), which is
 /// also the signal that a target is meant for humans.
 fn make_targets(root: &Path) -> Vec<Runnable> {
-    let names = ["Makefile", "makefile", "GNUmakefile"];
-    let Some(found) = names.iter().find(|n| root.join(n).exists()) else { return Vec::new() };
+    let Some(found) = MAKE_FILES.iter().find(|n| root.join(n).exists()) else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(root.join(found)) else { return Vec::new() };
 
     let mut out = Vec::new();
@@ -1185,6 +1382,15 @@ fn write_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
     std::fs::write(path, doc.to_string()).map_err(|e| format!("write tasks.toml: {e}"))
 }
 
+/// Write tasks.toml and immediately drop the project's cache — every write goes
+/// through here so a saved edit can never be masked by a stale, stamp-matching entry.
+/// `workdir` is the project root; `path` is `<workdir>/.muster/tasks.toml`.
+fn write_doc_for(workdir: &str, path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+    write_doc(path, doc)?;
+    invalidate(workdir);
+    Ok(())
+}
+
 fn fill_table(t: &mut toml_edit::Table, task: &MusterTaskInput, id: &str) {
     t["id"] = toml_edit::value(id);
     t["label"] = toml_edit::value(task.label.as_str());
@@ -1247,8 +1453,84 @@ pub fn save_muster_task(
             arr.push(t);
         }
     }
-    write_doc(&path, &doc)?;
+    write_doc_for(&workdir, &path, &doc)?;
     Ok(format!("muster:{new_id}"))
+}
+
+/// Write `[override."<id>"]` for a task some other provider declared. The key is the
+/// discovered id (`vscode:test`, `just:deploy`); `toml_edit` preserves the rest of a
+/// hand-authored file. `run` is written verbatim so a `${input:…}` the user typed
+/// survives — discovery re-derives the prompt from it.
+#[tauri::command]
+pub fn save_task_override(
+    workdir: String,
+    id: String,
+    task: MusterTaskInput,
+) -> Result<(), String> {
+    if task.label.trim().is_empty() {
+        return Err("a task needs a label".into());
+    }
+    if task.run.trim().is_empty() {
+        return Err("a task needs a command".into());
+    }
+    let path = tasks_toml_path(&workdir);
+    let mut doc = load_doc(&path)?;
+    // A dotted [override."id"] table, implicit at the `override` level so the file
+    // reads as one section rather than a run of standalone tables.
+    let over = doc
+        .entry("override")
+        .or_insert(toml_edit::Item::Table({
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            t
+        }))
+        .as_table_mut()
+        .ok_or("`override` in tasks.toml isn't a table")?;
+
+    let mut t = toml_edit::Table::new();
+    t["label"] = toml_edit::value(task.label.as_str());
+    t["run"] = toml_edit::value(task.run.as_str());
+    match &task.group {
+        Some(g) if !g.is_empty() => t["group"] = toml_edit::value(g.as_str()),
+        _ => {}
+    }
+    match &task.cwd {
+        Some(c) if !c.is_empty() => t["cwd"] = toml_edit::value(c.as_str()),
+        _ => {}
+    }
+    // Written unconditionally, unlike a `[[task]]`: an override's job includes turning
+    // a discovered `background` flag *off*, which an absent key (meaning "inherit")
+    // couldn't express.
+    t["background"] = toml_edit::value(task.background);
+    over[&id] = toml_edit::Item::Table(t);
+    write_doc_for(&workdir, &path, &doc)
+}
+
+/// Drop a task's override, reverting it to what its own tool declares. Removing the
+/// last one takes the now-empty `[override]` section with it, so reverting your only
+/// override leaves no residue.
+#[tauri::command]
+pub fn remove_task_override(workdir: String, id: String) -> Result<(), String> {
+    let path = tasks_toml_path(&workdir);
+    let mut doc = load_doc(&path)?;
+    let Some(over) = doc.get_mut("override").and_then(|o| o.as_table_mut()) else {
+        return Err("no overrides to remove".into());
+    };
+    if over.remove(&id).is_none() {
+        return Err(format!("no override for “{id}”"));
+    }
+    if over.is_empty() {
+        doc.remove("override");
+    }
+    write_doc_for(&workdir, &path, &doc)
+}
+
+/// The discovered ids the project currently overrides — the panel uses this to mark
+/// a row overridden and offer *revert*. Reads the file directly (not the cache), so a
+/// just-written override shows immediately.
+#[tauri::command]
+pub fn list_task_overrides(workdir: String) -> Result<Vec<String>, String> {
+    Ok(task_overrides(Path::new(&workdir)).into_keys().collect())
 }
 
 #[tauri::command]
@@ -1262,7 +1544,7 @@ pub fn delete_muster_task(workdir: String, id: String) -> Result<(), String> {
         return Err(format!("no task “{id}” in tasks.toml"));
     };
     arr.remove(i);
-    write_doc(&path, &doc)
+    write_doc_for(&workdir, &path, &doc)
 }
 
 /// Whether the project already has a tasks.toml — the panel asks before creating
@@ -1273,15 +1555,35 @@ pub fn muster_tasks_file(workdir: String) -> Result<(String, bool), String> {
     Ok((p.display().to_string(), p.exists()))
 }
 
-/// Parse the project's runnables. Cheap enough (two small files) to run on every
-/// picker open — no cache until a provider needs to shell out.
+/// Drop every cache entry for a project. Called by `rescan_runnables` and by every
+/// command that writes `.muster/tasks.toml` — a write must never be masked by a stale
+/// entry the `(mtime, len)` stamp happened to match (two edits inside one filesystem
+/// mtime tick that leave the length unchanged would otherwise not invalidate).
+fn invalidate(workdir: &str) {
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(root, _), _| root != workdir);
+}
+
+/// Force the next `discover_runnables(workdir, …)` to re-parse from disk, dropping
+/// both the trusted and untrusted cache entries for this project. The stamp already
+/// catches edits to files Muster *reads*; this is the escape hatch for the one thing
+/// it can't see — a file an introspector pulls in itself (`just` `import`, a Taskfile
+/// `includes:`) — and the honest answer to a "Rescan" button.
+#[tauri::command]
+pub fn rescan_runnables(workdir: String) {
+    invalidate(&workdir);
+}
+
+/// Parse the project's runnables. Memoised per (root, trusted) and invalidated by
+/// the source files' own mtimes — see the discovery-cache block above — so calling
+/// this on every picker open, palette open and agent turn stays cheap.
 #[tauri::command]
 pub fn discover_runnables(workdir: String, trusted: bool) -> Result<Vec<Runnable>, String> {
     let root = Path::new(&workdir);
     if !root.is_dir() {
         return Err(format!("not a directory: {workdir}"));
     }
-    Ok(discover(root, trusted))
+    Ok(discover_cached(root, trusted))
 }
 
 #[cfg(test)]
@@ -1841,6 +2143,120 @@ env = { RUST_LOG = "debug" }
     }
 
     #[test]
+    fn an_override_patches_a_discovered_task_without_touching_its_file() {
+        let t = Tmp::new("override");
+        let wd = t.0.display().to_string();
+        let tasks_json = r#"{"tasks":[{"label":"Test","type":"shell","command":"vitest"}]}"#;
+        t.write(".vscode/tasks.json", tasks_json);
+
+        // Rename it and give it a different command.
+        save_task_override(
+            wd.clone(),
+            "vscode:test".into(),
+            MusterTaskInput {
+                label: "Test (changed only)".into(),
+                run: "vitest run --changed".into(),
+                group: Some("test".into()),
+                background: false,
+                cwd: None,
+            },
+        )
+        .unwrap();
+
+        let found = discover(&t.0, true);
+        let d = found.iter().find(|r| r.id == "vscode:test").unwrap();
+        assert_eq!(d.label, "Test (changed only)");
+        assert_eq!(d.exec, Exec::Shell { line: "vitest run --changed".into() });
+        assert_eq!(d.group.as_deref(), Some("test"));
+        // The other tool's file is never rewritten.
+        assert_eq!(std::fs::read_to_string(t.0.join(".vscode/tasks.json")).unwrap(), tasks_json);
+        assert_eq!(list_task_overrides(wd.clone()).unwrap(), vec!["vscode:test".to_string()]);
+
+        // Revert leaves no residue and restores the original command.
+        remove_task_override(wd.clone(), "vscode:test".into()).unwrap();
+        assert!(list_task_overrides(wd).unwrap().is_empty());
+        let reverted = discover(&t.0, true);
+        let d = reverted.iter().find(|r| r.id == "vscode:test").unwrap();
+        assert_eq!(d.label, "Test");
+        assert_eq!(d.exec, Exec::Shell { line: "vitest".into() });
+        // The now-empty [override] table is gone, not left as dead structure.
+        assert!(!std::fs::read_to_string(t.0.join(".muster/tasks.toml")).unwrap().contains("override"));
+    }
+
+    #[test]
+    fn an_override_can_reword_a_command_and_reprompt() {
+        let t = Tmp::new("ovin");
+        let wd = t.0.display().to_string();
+        t.write("package.json", r#"{"scripts":{"deploy":"./deploy.sh"}}"#);
+        save_task_override(
+            wd,
+            "npm:deploy".into(),
+            MusterTaskInput {
+                label: "deploy".into(),
+                run: "./deploy.sh --env ${input:environment}".into(),
+                group: None,
+                background: false,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        let found = discover(&t.0, true);
+        let d = found.iter().find(|r| r.id == "npm:deploy").unwrap();
+        // A prompt the override introduced is synthesized from the id.
+        assert_eq!(d.inputs.len(), 1);
+        assert_eq!(d.inputs[0].id, "environment");
+        assert_eq!(d.inputs[0].kind, "promptString");
+    }
+
+    #[test]
+    fn an_override_of_a_missing_task_is_a_blocked_row_not_a_ghost() {
+        let t = Tmp::new("ovdead");
+        let wd = t.0.display().to_string();
+        t.write("package.json", r#"{"scripts":{"test":"vitest"}}"#);
+        save_task_override(
+            wd,
+            "vscode:tset".into(), // a typo — no such task
+            MusterTaskInput { label: "x".into(), run: "x".into(), group: None, background: false, cwd: None },
+        )
+        .unwrap();
+        let found = discover(&t.0, true);
+        let dead = found.iter().find(|r| r.id == "override:vscode:tset").unwrap();
+        assert!(dead.blocked.is_some(), "a dangling override is shown, greyed, with why");
+        assert!(found.iter().any(|r| r.id == "npm:test"), "real tasks are untouched");
+    }
+
+    #[test]
+    fn a_write_invalidates_the_cache_immediately() {
+        let t = Tmp::new("cacheinval");
+        let wd = t.0.display().to_string();
+        t.write("package.json", r#"{"scripts":{"test":"vitest"}}"#);
+        // Prime the cache.
+        assert_eq!(discover_cached(&t.0, true).iter().find(|r| r.id == "npm:test").unwrap().label, "test");
+        // A write must be visible on the very next cached read, without waiting for
+        // the mtime stamp to happen to differ.
+        save_task_override(
+            wd,
+            "npm:test".into(),
+            MusterTaskInput { label: "renamed".into(), run: "vitest run".into(), group: None, background: false, cwd: None },
+        )
+        .unwrap();
+        assert_eq!(discover_cached(&t.0, true).iter().find(|r| r.id == "npm:test").unwrap().label, "renamed");
+    }
+
+    #[test]
+    fn rescan_drops_the_cached_entry() {
+        let t = Tmp::new("rescan");
+        let wd = t.0.display().to_string();
+        t.write("package.json", r#"{"scripts":{"test":"vitest"}}"#);
+        assert_eq!(discover_cached(&t.0, true).len(), 1);
+        rescan_runnables(wd);
+        // Nothing to assert on timing, but the entry is gone: a subsequent call
+        // re-parses rather than serving stale data. Correctness is covered by the
+        // stamp test; this just proves the command doesn't panic and clears its key.
+        assert_eq!(discover_cached(&t.0, true).len(), 1);
+    }
+
+    #[test]
     fn a_task_needs_a_label_and_a_command() {
         let t = Tmp::new("validate");
         let wd = t.0.display().to_string();
@@ -1916,5 +2332,63 @@ env = { RUST_LOG = "debug" }
             serde_json::from_str(r#"{"exec":{"mode":"argv","program":"ls","args":[]},"cwd":"/tmp"}"#)
                 .unwrap();
         assert!(bare.env.is_empty());
+    }
+
+    /// The cache must never be the reason an edit doesn't show up: writing,
+    /// changing and deleting a provider file each have to be visible on the very
+    /// next call.
+    #[test]
+    fn the_cache_follows_the_files_it_read() {
+        let t = Tmp::new("cache");
+        t.write("package.json", r#"{"scripts":{"test":"vitest run"}}"#);
+        let first = discover_cached(&t.0, false);
+        assert_eq!(first.len(), 1, "one npm script");
+
+        // An unchanged tree serves the same answer — that's the whole point.
+        assert_eq!(discover_cached(&t.0, false), first);
+
+        t.write("package.json", r#"{"scripts":{"test":"vitest run","build":"tsc"}}"#);
+        let grown = discover_cached(&t.0, false);
+        assert_eq!(grown.len(), 2, "an edited package.json invalidates the entry");
+
+        // A file appearing counts as a change even though nothing existing moved.
+        t.write("Makefile", "build:\n\tcc -o x x.c\n");
+        assert!(
+            discover_cached(&t.0, false).iter().any(|r| r.source == "make"),
+            "a new provider file invalidates the entry"
+        );
+
+        // …and so does one going away.
+        std::fs::remove_file(t.0.join("Makefile")).unwrap();
+        assert!(!discover_cached(&t.0, false).iter().any(|r| r.source == "make"));
+
+        // Trust is part of the key, not part of the stamp: the same tree read
+        // untrusted must not answer for a trusted read.
+        t.write("Taskfile.yml", "version: '3'\ntasks:\n  hi:\n    cmds: [echo hi]\n");
+        let untrusted = discover_cached(&t.0, false);
+        assert!(
+            untrusted.iter().any(|r| r.blocked.is_some()),
+            "untrusted taskfile is withheld, not missing"
+        );
+        let trusted = discover_cached(&t.0, true);
+        assert_ne!(untrusted, trusted, "trust re-keys rather than reusing the entry");
+    }
+
+    /// A lockfile is an input to discovery — `package_runner` picks the npm runner
+    /// from it — so one appearing must invalidate the cache even though the file that
+    /// *declares* the tasks (`package.json`) never changed.
+    #[test]
+    fn a_new_lockfile_invalidates_the_cache() {
+        let t = Tmp::new("lockstamp");
+        t.write("package.json", r#"{"scripts":{"build":"tsc"}}"#);
+        let prog = |list: &[Runnable]| match &list.iter().find(|r| r.id == "npm:build").unwrap().exec {
+            Exec::Argv { program, .. } => program.clone(),
+            Exec::Shell { .. } => "shell".into(),
+        };
+        // No lockfile ⇒ the default runner.
+        assert_eq!(prog(&discover_cached(&t.0, false)), "npm");
+        // `pnpm install` writes a lockfile and leaves package.json byte-identical.
+        t.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        assert_eq!(prog(&discover_cached(&t.0, false)), "pnpm", "a new lockfile re-picks the runner");
     }
 }

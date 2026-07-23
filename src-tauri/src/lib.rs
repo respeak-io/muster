@@ -946,6 +946,73 @@ fn open_folder(dir: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Reveal a file in the OS file manager, selected — the "↗ Reveal source" action on
+/// a task, which answers "where did this come from?". `dir` is the project root and
+/// `rel` the repo-relative source file (`.vscode/tasks.json`); revealing by relative
+/// path keeps a `..` from a malformed override from escaping the project. Falls back
+/// to opening the containing folder where the OS can't select a file.
+#[tauri::command]
+fn reveal_path(dir: String, rel: String) -> Result<(), String> {
+    let root = std::path::Path::new(&dir);
+    if !root.is_dir() {
+        return Err(format!("not a directory: {dir}"));
+    }
+    // Reject anything that would climb out of the project — `rel` is nominally
+    // repo-relative, but it reaches us from discovery data, so don't trust it. A
+    // `..` climbs out; a rooted (`/x`) or drive-prefixed (`C:x`) component is what
+    // `join` replaces the whole base with — note `/x` is *not* `is_absolute()` on
+    // Windows (no prefix), so the component check, not `is_absolute`, is the guard.
+    let rel_path = std::path::Path::new(&rel);
+    if rel_path.is_absolute()
+        || rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("not a project-relative path: {rel}"));
+    }
+    let target = root.join(rel_path);
+    // A source that no longer exists (a task from a file since deleted): reveal the
+    // project folder rather than erroring on a path the user can't do anything about.
+    let exists = target.is_file();
+    #[cfg(target_os = "macos")]
+    {
+        let mut c = std::process::Command::new("open");
+        if exists {
+            c.arg("-R").arg(&target);
+        } else {
+            c.arg(root);
+        }
+        c.spawn().map_err(|e| format!("open Finder: {e}"))?;
+    }
+    #[cfg(windows)]
+    {
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let mut c = std::process::Command::new(format!(r"{sysroot}\explorer.exe"));
+        if exists {
+            // /select, takes one argument: the file to highlight in its folder.
+            c.arg(format!("/select,{}", target.display().to_string().replace('/', "\\")));
+        } else {
+            c.arg(dir.replace('/', "\\"));
+        }
+        c.spawn().map_err(|e| format!("open Explorer: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select the file" across Linux file managers; open the folder.
+        let open_target = if exists { target.parent().unwrap_or(root) } else { root };
+        std::process::Command::new("xdg-open")
+            .arg(open_target)
+            .spawn()
+            .map_err(|e| format!("xdg-open: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Persist a debug snapshot (JSON built by the frontend) to a fixed, discoverable
 /// path so an external tool — or an LLM agent debugging the running app — can read
 /// live state and the recent event log. Returns the path written.
@@ -3347,8 +3414,12 @@ pub fn run() {
             spawn_shell,
             spawn_task,
             tasks::discover_runnables,
+            tasks::rescan_runnables,
             tasks::save_muster_task,
             tasks::delete_muster_task,
+            tasks::save_task_override,
+            tasks::remove_task_override,
+            tasks::list_task_overrides,
             tasks::muster_tasks_file,
             available_terminals,
             spawn_external_terminal,
@@ -3361,6 +3432,7 @@ pub fn run() {
             find_project_icon,
             read_custom_icon,
             open_folder,
+            reveal_path,
             write_debug_file,
             log_frontend,
             update_tray,

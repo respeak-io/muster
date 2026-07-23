@@ -103,6 +103,46 @@ in ⌘K, and a task inspector offering re-run / pin / stop / *send output to a
 session*. Successful non-background runs auto-dismiss after 20s unless focused;
 failures persist and raise attention.
 
+Discovery is **memoised in Rust** (`discover_cached`), keyed by `(root, trusted)`
+and invalidated by a *stamp* — the `(mtime, len)` of every file a provider reads,
+where a missing file is itself part of the stamp so creating or deleting one
+invalidates too. Not a file watcher: no thread, no crate and no per-project
+lifecycle to answer what ~20 `metadata()` calls answer instantly. **A new provider
+file must be added to `source_files()`**, or its tasks go stale behind the cache.
+Known gap: files an introspector pulls in itself (`just` `import`, Taskfile
+`includes:`) aren't stamped.
+
+## Run on stop — the agent/task loop
+
+The part a plain terminal can't do, and the reason tasks live inside Muster: the
+`Stop` hook already arrives here, so a project can say *"when an agent finishes a
+turn in this folder, run this"* and every turn becomes a verified turn. One rule
+per project (`cc-task-onstop`, keyed by project root like pins), set with `⟲` in
+the project tasks panel, reviewed and revoked in Settings › Tasks.
+
+- **Unattended means unattended.** `stopRuleBlocked` refuses a background task (it
+  never finishes a turn, so it could only pile up one dev server per turn), one
+  with `${input:…}` (it would block on a dialog nobody opened), and a blocked one.
+- **The run must not take the stage.** `launchTask` takes `focus: false` for this
+  path only — the pane appears in the sidebar but the session you were reading
+  stays on screen. Consequence: an unfocused pane can't be measured, so it starts
+  at xterm's default 24×80 and gets a real size when you first activate it.
+- **Never two at once, never twice per turn.** A run of the rule still in flight
+  wins, and `STOP_RUN_FLOOR` swallows a double-fired `Stop`. The floor timestamp
+  *and* a per-project in-flight marker are both claimed *before* the first `await`
+  (discovery is async); the marker is what covers a rule with `dependsOn`, whose
+  pane doesn't exist until its whole dependency chain has run — so the pane scan
+  alone can't see the chain starting.
+- **Discovery runs in the session's `workdir`**, so with several worktrees of one
+  repo open the run verifies the checkout that agent just edited.
+- **A failure goes back to the session that caused it.** `run.forSession` records
+  which session's turn was being checked, and the inspector's *↩ Send output to…*
+  offers it back to that session alone — if it has ended or lives in an external
+  terminal (no PTY to type into), the handoff is withheld rather than misdirected to
+  whichever agent in this project sorts first. A hand-run task (no `forSession`)
+  still offers the first live agent. The handoff types without a trailing newline —
+  Muster prefills, the human presses Enter.
+
 ## Task settings (Settings ⌘, → **Tasks** tab)
 
 The settings window is `SET_TABS` + `renderSetControl` — declarative controls, not
@@ -113,21 +153,50 @@ task settings belong in that tab as control descriptors; `applySetting` dispatch
 them.
 
 Task preferences live in `cc-task-prefs`, pins in `cc-task-pins`, hidden tasks in
-`cc-task-hidden`, trust in `cc-trusted`. The split is deliberate and worth
+`cc-task-hidden`, run-on-stop rules in `cc-task-onstop`, trust in `cc-trusted`. The split is deliberate and worth
 preserving: **personal preference → `localStorage`; project fact →
 `.muster/tasks.toml`**, which is committable and works for a colleague who never
 opens Muster.
 
 ## Project tasks panel (`openTaskManager`)
 
-Pin / hide / create / edit / delete, reached from ⌘K. **`.muster/tasks.toml` is
-the only file Muster writes** — a discovered VS Code task or justfile belongs to
-another tool and is read-only in the panel (editing one should become an
-*override* in `tasks.toml`, never a mutation of `.vscode/tasks.json`). Writes go
-through `toml_edit`, not a serialize-the-whole-struct round trip, so a
-hand-written file keeps its comments, ordering and spacing — there's a test for
-exactly that. Creating the file for the first time asks, because a new
+Pin / hide / create / edit / delete / **override**, reached from ⌘K.
+**`.muster/tasks.toml` is the only file Muster writes** — a discovered VS Code task
+or justfile belongs to another tool, so editing one writes an `[override."<id>"]`
+into `tasks.toml` keyed by its discovered id, **never** a mutation of
+`.vscode/tasks.json`. Writes go through `toml_edit`, not a serialize-the-whole-struct
+round trip, so a hand-written file keeps its comments, ordering and spacing — there's
+a test for exactly that. Creating the file for the first time asks, because a new
 committable file in someone's repo is a real side effect.
+
+## Overrides, and the rest of P4
+
+Overrides (`[override.*]`) close the "Muster never rewrites a file it didn't create"
+loop: `apply_overrides` patches discovered rows *after* dedupe (so it keys off final
+ids), and an override whose target vanished becomes a **blocked row** (`override:<id>`)
+rather than a silent no-op — a typo'd id reads as broken, not missing, exactly like
+the rest of the module. `save_task_override` writes `background` unconditionally
+(unlike a `[[task]]`, whose absent key means `false`) because an override's job
+includes turning a discovered background flag *off*. Overriding `run` re-derives its
+`${input:…}` prompts (`redetect_inputs`). Reverting removes the key and, if it was the
+last, the whole `[override]` table. The panel learns which ids are overridden from
+`list_task_overrides` (reads the file, not the cache, so a just-saved override shows).
+
+Four smaller P4 affordances, all in the frontend:
+
+- **Package-runner override** (`cc-task-runner`, per project). Detection stays in
+  Rust; the override is applied *after* discovery by swapping an npm task's
+  `exec.program` (`applyRunner`), so the discovery cache never has to know about it.
+  Surfaced as a strip atop the panel, shown only when the project has npm scripts.
+- **Remembered `${input:…}` values** (`cc-task-inputs`, keyed project + task + input).
+  Pre-fills the prompt with what you typed last; **never a password** (`i.password`).
+- **↗ Reveal source** — `reveal_path` selects the source file in the OS file manager,
+  guarding against a `..` escape and falling back to the folder if the file is gone.
+  `run.root` (the discovery dir) is stored on the pane so it resolves the relative
+  `sourceFile` even for a task whose run cwd is a subfolder.
+- **⟳ Rescan** — `rescan_runnables` drops the project's cache entries; the panel
+  button and the picker's ⌘⇧R both route through it. The escape hatch for the one
+  thing the stamp can't see: a file an introspector imports itself.
 
 ## Backend (`src-tauri/src/lib.rs`)
 
@@ -149,7 +218,7 @@ One large `main.ts`, no framework. State lives in a `sessions: Map<session_id, S
   applies to a claude session.
 - **Event wiring**: `listen("pty-output" | "pty-exit" | "telemetry" | "permission" | "tray-select")` at the bottom of the file. Telemetry is routed by `data.session_id?.toLowerCase()` — session ids are matched case-insensitively, so keep them lowercase.
 - `applyHook` maps lifecycle events → a `Phase` state machine (idle/thinking/working/done/error/ended) and attention flags; `applyStatusline` fills model/context%/cost/duration. **Rate limits are account-wide**, held in a single `rl` object and shown identically on every session, not per-session.
-- **Persistence is all `localStorage`**, ~15 keys prefixed `cc-` (favorites, drag order, colours, icons, engine, font size, sort/grouping, frecency, caffeinate, the `cc-usage` daily cost rollup, the `cc-restore` roster). `grep '"cc-'` for the current set.
+- **Persistence is all `localStorage`**, ~20 keys prefixed `cc-` (favorites, drag order, colours, icons, engine, font size, sort/grouping, frecency, caffeinate, the `cc-usage` daily cost rollup, the `cc-restore` roster, and the task keys `cc-task-{prefs,pins,hidden,onstop,runner,inputs}` + `cc-trusted`). `grep '"cc-'` for the current set.
 - **Debug console** (🐞 button, bottom-right): an in-app event log + live state via `dlog()`/`dbgSnapshot()`. It flags **unrouted telemetry** (the routing-drift class of bug above) and JS errors, and mirrors a snapshot to `$TMPDIR/cc-launcher/muster-debug.json` (written by the `write_debug_file` command) so an external tool or an LLM agent can read live app state while it runs.
 - **Two-tier logging — live snapshot vs. durable timeline.** The `muster-debug.json` snapshot is a *state-of-now* blob that is overwritten each flush and does **not** survive a crash (the frontend never flushes if the process dies). The durable tier is the backend rolling `muster.log` (+ `panic.log`) in the OS app-log dir (macOS `~/Library/Logs/io.respeak.cclauncher/`), via `tauri-plugin-log` and a panic hook — the only on-disk trace of a panic that unwinds cleanly out of `main` (no crash dump / WER otherwise). Every `dlog()` line tees into it through the `log_frontend` command (tagged `[ui]`), so the UI and backend event streams land in **one time-ordered file**. A `muster.log` that stops without an `exit · clean shutdown` line is itself evidence of an abnormal termination. Use the snapshot for "what is it doing *now*", the rolling log for "why did it *die*".
 

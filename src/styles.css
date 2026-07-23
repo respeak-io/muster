@@ -642,6 +642,12 @@ select.in-ctl { cursor: pointer; }
 .mgr-b.quiet { font: 9px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; opacity: .5; cursor: default; }
 .mgr-b.quiet:hover { color: var(--muted); border-color: var(--hair-strong); }
 .mgr-body .in-field { gap: 5px; }
+/* The per-project runner override sits above the task rows, set apart from them. */
+.mgr-row.mgr-runner { background: var(--surface-2); border-style: dashed; }
+.mgr-row.mgr-runner .s-ctl { flex: none; }
+/* The "this is an override, not a rewrite" note atop the edit form. */
+.mgr-note { font: 10.5px var(--font-ui); line-height: 1.5; color: var(--muted); background: var(--accent-wash); border: 1px solid var(--accent-line); border-radius: var(--radius-sm); padding: 7px 9px; }
+.mgr-note code { font: 10px var(--font-mono); color: var(--accent-ink); }
 .mgr-foot { display: flex; align-items: center; gap: 6px; padding: 9px 13px; border-top: 1px solid var(--hair); background: var(--surface); }
 .mgr-foot .mgr-sp { flex: 1; }
 
