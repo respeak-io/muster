@@ -5284,17 +5284,35 @@ function runSources(term: string): { src: string; short: string; count: number }
   return out;
 }
 
+// How many tasks the "recent" group floats to the top. Small on purpose — it's a
+// shortcut to the two or three you keep re-running, not a second copy of the list.
+const RUN_RECENT_MAX = 5;
+
 function runGroups(term: string): { name: string; sub?: string; items: Runnable[] }[] {
   const list = runMatches(term).filter((r) => !runSource || r.source === runSource);
   const pins = runCtx ? pinnedIds(runCtx.colorKey) : [];
   const groups: { name: string; sub?: string; items: Runnable[] }[] = [];
+  // A row shown in a float-to-top group (pinned, recent) is pulled out of its source
+  // group below, so nothing appears twice.
+  const lifted = new Set<string>();
   // Pinned float to the top, but only in the unfiltered view — inside a single
   // source, splitting two of its own rows into a separate block just hides them.
   const pinned = runSource ? [] : list.filter((r) => pins.includes(r.id));
-  if (pinned.length) groups.push({ name: "pinned", items: pinned });
+  if (pinned.length) { groups.push({ name: "pinned", items: pinned }); pinned.forEach((r) => lifted.add(r.id)); }
+  // Recent: the tasks you actually reach for, ranked by the same frecency the palette
+  // uses (every launch bumps `task:<id>`). Only in the unfiltered "all" view — typing
+  // or picking a source is already a narrower intent, and a Recent block there would
+  // just be another thing to scan. Pinned are already up top, so they don't repeat.
+  if (!runSource && !term.trim()) {
+    const recent = list
+      .filter((r) => !lifted.has(r.id) && !r.blocked && frecScore("task:" + r.id) > 0)
+      .sort((a, b) => frecScore("task:" + b.id) - frecScore("task:" + a.id))
+      .slice(0, RUN_RECENT_MAX);
+    if (recent.length) { groups.push({ name: "recent", items: recent }); recent.forEach((r) => lifted.add(r.id)); }
+  }
   const bySource = new Map<string, Runnable[]>();
   for (const r of list) {
-    if (pinned.includes(r)) continue;
+    if (lifted.has(r.id)) continue;
     if (!bySource.has(r.source)) bySource.set(r.source, []);
     bySource.get(r.source)!.push(r);
   }

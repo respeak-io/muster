@@ -98,7 +98,8 @@ The `Exec` wire format is pinned by a round-trip test — the frontend hands a
 discovered `exec` straight back to `spawn_task`, so a rename there breaks every
 launch silently.
 
-Surfaces: the `▶ Run` header button (picker grouped by source), a **Tasks** group
+Surfaces: the `▶ Run` header button (picker: pinned, then a frecency-ranked
+**recent** group in the unfiltered view, then grouped by source), a **Tasks** group
 in ⌘K, and a task inspector offering re-run / pin / stop / *send output to a
 session*. Successful non-background runs auto-dismiss after 20s unless focused;
 failures persist and raise attention.
