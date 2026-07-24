@@ -49,3 +49,10 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
+# macOS-only: read the pre-rename WebKit localStorage SQLite to recover cost/
+# roster data stranded when the bundle id changed (`read_legacy_localstorage`).
+# `bundled` compiles SQLite in so CI needn't rely on system headers. Windows'
+# WebView2 uses LevelDB, not SQLite, so this dep is scoped to macOS only.
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+

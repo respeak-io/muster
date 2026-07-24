@@ -13,6 +13,36 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { parsePatch, type DiffFile, type DiffHunk } from "./diff";
 
+// One-time recovery of localStorage stranded when the app was renamed
+// Muster -> Episko: the bundle id changed (io.respeak.cclauncher ->
+// io.respeak.episko) and macOS keys a WKWebView's localStorage to that id, so
+// the renamed app opened a fresh, empty store. The backend reads the old store
+// off disk (`read_legacy_localstorage`, macOS-only; returns {} elsewhere) and
+// we import any `cc-*` key this store is MISSING — fill-absent only, so an
+// install that already has its own data is never clobbered. Guarded by a flag
+// so it runs at most once; a fresh upgrader (empty store) reloads once to boot
+// with the restored data. Fire-and-forget: the module-scope reads below run on
+// this first (empty) pass, then the reload re-enters with everything present.
+void (async () => {
+  const DONE = "cc-legacy-import-done";
+  if (localStorage.getItem(DONE)) return;
+  try {
+    const legacy = await invoke<Record<string, string>>("read_legacy_localstorage");
+    let imported = 0;
+    for (const k in legacy) {
+      if (k.startsWith("cc-") && localStorage.getItem(k) === null) {
+        localStorage.setItem(k, legacy[k]);
+        imported++;
+      }
+    }
+    localStorage.setItem(DONE, new Date().toISOString());
+    if (imported > 0) location.reload();
+  } catch {
+    // Command missing (non-macOS) or read failed: leave the flag unset so a
+    // later launch can retry. Harmless — nothing was written.
+  }
+})();
+
 function loadWebgl(term: Terminal) {
   try {
     const w = new WebglAddon();
