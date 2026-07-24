@@ -1,10 +1,10 @@
-# Muster
+# Episko
 
-![Muster — a cockpit for many parallel Claude Code sessions](docs/screenshot.png)
+![Episko — a cockpit for many parallel Claude Code sessions](docs/screenshot.png)
 
 A cross-platform desktop app to **launch and manage many [Claude Code](https://claude.com/claude-code) sessions at once** — each in its own embedded terminal, with live status, cost, and context telemetry streamed back to the app.
 
-> **Status: early spike.** Muster grew out of a Phase-0 spike (see [`SPIKE.md`](./SPIKE.md)) proving the two risky pieces — embedding a real terminal and instrumenting Claude Code per-launch. It runs on macOS today and is under active development. Expect rough edges.
+> **Status: early spike.** Episko grew out of a Phase-0 spike (see [`SPIKE.md`](./SPIKE.md)) proving the two risky pieces — embedding a real terminal and instrumenting Claude Code per-launch. It runs on macOS today and is under active development. Expect rough edges.
 
 ## What it does
 
@@ -16,7 +16,7 @@ A cross-platform desktop app to **launch and manage many [Claude Code](https://c
 
 ## How it works
 
-On each launch, Muster generates a throwaway `--settings` file whose `statusLine` command and `hooks` POST lifecycle events to a tiny localhost HTTP server the app runs. Because it also passes `--session-id`, every event maps back to the right pane before any output appears. See [`SPIKE.md`](./SPIKE.md) for the full architecture, the verified event lifecycle, and design notes.
+On each launch, Episko generates a throwaway `--settings` file whose `statusLine` command and `hooks` POST lifecycle events to a tiny localhost HTTP server the app runs. Because it also passes `--session-id`, every event maps back to the right pane before any output appears. See [`SPIKE.md`](./SPIKE.md) for the full architecture, the verified event lifecycle, and design notes.
 
 ## Stack
 
@@ -28,21 +28,21 @@ On each launch, Muster generates a throwaway `--settings` file whose `statusLine
 
 ## Install (macOS)
 
-Download the latest `.dmg` from the [Releases page](https://github.com/respeak-io/muster/releases).
+Download the latest `.dmg` from the [Releases page](https://github.com/respeak-io/episko/releases).
 
-Muster is self-signed, **not notarized through Apple**, so macOS Gatekeeper quarantines the download and refuses to open it ("… is damaged and can't be opened"). Clear the quarantine flag from the terminal **before** opening the `.dmg`:
-
-```sh
-xattr -dr com.apple.quarantine ~/Downloads/Muster_*.dmg
-```
-
-Then open the `.dmg`, drag **Muster** into Applications, and launch it. If the app is still blocked on first launch, run the same command on the installed app:
+Episko is self-signed, **not notarized through Apple**, so macOS Gatekeeper quarantines the download and refuses to open it ("… is damaged and can't be opened"). Clear the quarantine flag from the terminal **before** opening the `.dmg`:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/Muster.app
+xattr -dr com.apple.quarantine ~/Downloads/Episko_*.dmg
 ```
 
-Muster keeps itself up to date after that: it checks the latest GitHub release on launch and offers an in-app update (it never auto-installs — a restart would close your running sessions).
+Then open the `.dmg`, drag **Episko** into Applications, and launch it. If the app is still blocked on first launch, run the same command on the installed app:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Episko.app
+```
+
+Episko keeps itself up to date after that: it checks the latest GitHub release on launch and offers an in-app update (it never auto-installs — a restart would close your running sessions).
 
 ## Build from source
 

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Muster",
-  "version": "0.9.0",
-  "identifier": "io.respeak.cclauncher",
+  "productName": "Episko",
+  "version": "0.10.0",
+  "identifier": "io.respeak.episko",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Muster",
+        "title": "Episko",
         "width": 1200,
         "height": 800,
         "dragDropEnabled": true
@@ -42,7 +42,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1QzE4MTkxMEIyOTUzRDgKUldUWVV5a0xrWUhCOWRBTG5nMlhjdEE5V0xJc0xCRUFGQnlnRFEvVUNZMU5jSWdtVW5XUnl6V08K",
       "endpoints": [
-        "https://github.com/respeak-io/muster/releases/latest/download/latest.json"
+        "https://github.com/respeak-io/episko/releases/latest/download/latest.json"
       ]
     }
   }

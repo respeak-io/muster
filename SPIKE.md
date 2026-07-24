@@ -62,7 +62,7 @@ so it's validated in the running app, not in `-p`.
 ## Run it
 
 ```sh
-cd muster
+cd episko
 npm install          # first time
 npm run tauri dev
 ```

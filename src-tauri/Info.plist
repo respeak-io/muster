@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>Muster launches Claude Code sessions in your project folders and shows their status, cost, and context.</string>
+    <string>Episko launches Claude Code sessions in your project folders and shows their status, cost, and context.</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>Muster launches Claude Code sessions in project folders on your Desktop.</string>
+    <string>Episko launches Claude Code sessions in project folders on your Desktop.</string>
     <key>NSDownloadsFolderUsageDescription</key>
-    <string>Muster launches Claude Code sessions in project folders in your Downloads.</string>
+    <string>Episko launches Claude Code sessions in project folders in your Downloads.</string>
 </dict>
 </plist>

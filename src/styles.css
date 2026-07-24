@@ -1080,7 +1080,7 @@ select.in-ctl { cursor: pointer; }
 .shortpop .sc-chord { display: inline-flex; gap: 3px; }
 .shortpop .sc-or { color: var(--muted-2); font-size: 9px; }
 
-/* ---------- external (non-Muster) sessions ---------- */
+/* ---------- external (non-Episko) sessions ---------- */
 /* sidebar row for a session running in another terminal */
 .srow.extrow { grid-template-columns: 14px 1fr auto auto; }
 .srow.extrow .sbranch { font-style: italic; }

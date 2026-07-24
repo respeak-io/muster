@@ -89,7 +89,7 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Muster ${{ github.ref_name }}"
+          releaseName: "Episko ${{ github.ref_name }}"
           # Install instructions are embedded in every release body so the
           # top-of-list (latest) release always carries them — GitHub can't pin
           # a release, so "always in the newest one" is the equivalent. The first
@@ -100,23 +100,23 @@ jobs:
 
             **macOS (Apple Silicon)**
 
-            1. Download **Muster_*_aarch64.dmg** from the assets below.
-            2. Muster is self-signed (not notarized by Apple), so macOS Gatekeeper blocks the first launch. Clear the quarantine flag once:
+            1. Download **Episko_*_aarch64.dmg** from the assets below.
+            2. Episko is self-signed (not notarized by Apple), so macOS Gatekeeper blocks the first launch. Clear the quarantine flag once:
                ```sh
-               xattr -dr com.apple.quarantine ~/Downloads/Muster_*.dmg
+               xattr -dr com.apple.quarantine ~/Downloads/Episko_*.dmg
                ```
-            3. Open the `.dmg`, drag **Muster** into Applications, and launch it. If it's still blocked:
+            3. Open the `.dmg`, drag **Episko** into Applications, and launch it. If it's still blocked:
                ```sh
-               xattr -dr com.apple.quarantine /Applications/Muster.app
+               xattr -dr com.apple.quarantine /Applications/Episko.app
                ```
             Apple Silicon (M-series) only — Intel Macs aren't supported by this build.
 
             **Windows (x64)**
 
-            1. Download **Muster_*_x64-setup.exe** (or the **.msi**) from the assets below.
-            2. Muster isn't code-signed, so Windows SmartScreen may warn on first run — click **More info → Run anyway**.
+            1. Download **Episko_*_x64-setup.exe** (or the **.msi**) from the assets below.
+            2. Episko isn't code-signed, so Windows SmartScreen may warn on first run — click **More info → Run anyway**.
 
-            Requires `claude` on your `PATH`. Muster keeps itself up to date after install (checks the latest release on launch; never auto-installs).
+            Requires `claude` on your `PATH`. Episko keeps itself up to date after install (checks the latest release on launch; never auto-installs).
           releaseDraft: false
           prerelease: false
           # tauri-action generates and uploads latest.json when the updater is
