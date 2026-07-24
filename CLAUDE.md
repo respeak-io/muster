@@ -217,6 +217,15 @@ One large `main.ts`, no framework. State lives in a `sessions: Map<session_id, S
   re-testing the string. It is orthogonal to `Sess.external`, which means "the
   terminal lives in Ghostty/iTerm rather than an embedded pane" and only ever
   applies to a claude session.
+- **A claude pane's keystrokes are not raw pass-through.** Shell and task panes
+  wire `term.onData` straight to `write_pty`; a claude pane goes through
+  `claudeInput`, which forwards the first `^C` (interrupt) but swallows a repeat
+  inside `INTR_GUARD_MS` — Claude's REPL exits on a fast double `^C`, and a
+  session lost that way leaves a dead pane behind. Ending a session is meant to
+  be explicit (✕, ⌘K → Close, `/exit`). Windows Ctrl+V is handled separately in
+  `winClaudePaste`, via `attachCustomKeyEventHandler` — note xterm keeps only
+  **one** such handler, so a new key rule belongs in that function or in
+  `claudeInput`, never in a second `attachCustomKeyEventHandler` call.
 - **Event wiring**: `listen("pty-output" | "pty-exit" | "telemetry" | "permission" | "tray-select")` at the bottom of the file. Telemetry is routed by `data.session_id?.toLowerCase()` — session ids are matched case-insensitively, so keep them lowercase.
 - `applyHook` maps lifecycle events → a `Phase` state machine (idle/thinking/working/done/error/ended) and attention flags; `applyStatusline` fills model/context%/cost/duration. **Rate limits are account-wide**, held in a single `rl` object and shown identically on every session, not per-session.
 - **Persistence is all `localStorage`**, ~20 keys prefixed `cc-` (favorites, drag order, colours, icons, engine, font size, sort/grouping, frecency, caffeinate, the `cc-usage` daily cost rollup, the `cc-restore` roster, and the task keys `cc-task-{prefs,pins,hidden,onstop,runner,inputs}` + `cc-trusted`). `grep '"cc-'` for the current set.

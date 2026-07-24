@@ -87,6 +87,40 @@ function macShellKeys(id: string): (e: KeyboardEvent) => boolean {
     return true;
   };
 }
+// Ctrl+C must stay an *interrupt*, never an exit. Claude's REPL quits on a second
+// ^C inside its own double-press window, and in an embedded pane that reads as
+// Episko losing a session rather than a terminal doing what terminals do — the
+// pane is left behind as a dead `·` row. So a Claude pane forwards the first ^C
+// (cancel the turn / clear the prompt) and swallows whatever follows inside the
+// guard window; press again a moment later and it interrupts normally. Ending a
+// session stays an explicit act: ✕, ⌘K → Close, or `/exit` typed into Claude.
+// Only claude panes get this — ^C in a shell or task pane is the whole point of
+// those panes, and killing the process there is the expected outcome.
+// The window is deliberately a little longer than Claude's own (~2s): too long
+// merely delays a repeat interrupt, too short lets the exit through.
+const INTR_GUARD_MS = 3000;
+function claudeInput(id: string): (d: string) => void {
+  let lastIntr = 0, warned = false;
+  return (d) => {
+    // Exactly ^C and nothing else: a paste arrives wrapped in bracketed-paste
+    // sequences, so pasted text containing \x03 never lands here as a lone byte.
+    if (d === "\x03") {
+      const now = Date.now();
+      if (now - lastIntr < INTR_GUARD_MS) {
+        // One toast per burst — key repeat would otherwise fire it continuously.
+        if (!warned) {
+          warned = true;
+          toast("Ctrl+C interrupts — use ✕ or /exit to end the session");
+          dlog("info", `guarded repeat ^C · ${id.slice(0, 8)}`);
+        }
+        return;
+      }
+      lastIntr = now;
+      warned = false;
+    }
+    invoke("write_pty", { sessionId: id, data: d });
+  };
+}
 // Windows image paste for Claude panes. Claude Code's only default binding for
 // chat:imagePaste on native Windows is alt+v (ctrl+v joins it only under WSL) —
 // and xterm makes Ctrl+V a dead key on top: it swallows the browser paste and
@@ -694,7 +728,7 @@ async function launch(project: string, workdir: string, opts: { colorKey?: strin
     term.loadAddon(fit);
     loadWebgl(term);
     term.open(pane);
-    term.onData((d) => invoke("write_pty", { sessionId: id, data: d }));
+    term.onData(claudeInput(id)); // ^C interrupts; it never exits the session
     winClaudePaste(id, term, pane);
   }
 
